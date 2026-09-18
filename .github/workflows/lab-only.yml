@@ -13,7 +13,5 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - name: Lab-only forbidden token check
+      - name: forbidden-tokens
         run: bash scripts/check_lab_only.sh

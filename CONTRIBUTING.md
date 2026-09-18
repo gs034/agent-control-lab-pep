@@ -27,4 +27,4 @@ bash scripts/check_lab_only.sh
 python3 scripts/lab_brand_wall.py
 ```
 
-`check_lab_only.sh` requires `rg` (ripgrep). The Python wall prefers `rg` and falls back to a stdlib walk if `rg` is missing.
+The Lab-only keep-out is stdlib Python (`scripts/lab_brand_wall.py`; `scripts/check_lab_only.sh` is a wrapper). Ripgrep is not required.

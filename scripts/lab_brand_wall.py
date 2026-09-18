@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Agent Control Lab contributors
-"""Lab-only keep-out wall.
+"""Lab-only keep-out wall (stdlib only; no ripgrep).
 
 Fails if commercial or bank brand tokens, SKU language, or those source
 paths appear in the checkout, file paths, current branch name, or commit
@@ -56,7 +56,6 @@ _SKIP_DIR_NAMES = frozenset(
         "__pycache__",
         ".pytest_cache",
         ".eggs",
-        "*.egg-info",
         "dist",
         "build",
         "htmlcov",
@@ -69,49 +68,7 @@ def _decode(packed: tuple[str, ...]) -> list[str]:
     return [base64.b64decode(item).decode("ascii") for item in packed]
 
 
-def _which_rg() -> str | None:
-    from shutil import which
-
-    return which("rg")
-
-
-def _rg(root: Path, pattern: str, *, word: bool) -> list[str]:
-    rg = _which_rg()
-    if rg is None:
-        return _python_search(root, pattern, word=word)
-    cmd = [
-        rg,
-        "-n",
-        "-i",
-        "--hidden",
-        "--no-heading",
-        "--color",
-        "never",
-        "--glob",
-        "!.git/**",
-        "--glob",
-        "!.venv/**",
-        "--glob",
-        "!**/.pytest_cache/**",
-        "--glob",
-        "!**/__pycache__/**",
-        "--glob",
-        "!**/*.egg-info/**",
-    ]
-    if word:
-        cmd.append("-w")
-    else:
-        cmd.append("-F")
-    cmd.extend(["--", pattern, str(root)])
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    if proc.returncode not in (0, 1):
-        err = proc.stderr.strip() or f"rg exited {proc.returncode}"
-        raise RuntimeError(err)
-    return [line for line in proc.stdout.splitlines() if line.strip()]
-
-
-def _python_search(root: Path, pattern: str, *, word: bool) -> list[str]:
-    """Stdlib fallback when rg is not on PATH (pytest / slim hosts)."""
+def _search(root: Path, pattern: str, *, word: bool) -> list[str]:
     needle = re.compile(rf"(?i)\b{re.escape(pattern)}\b") if word else re.compile(re.escape(pattern), re.I)
     hits: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -126,9 +83,9 @@ def _python_search(root: Path, pattern: str, *, word: bool) -> list[str]:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
+            rel = path.resolve().relative_to(root.resolve())
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if needle.search(line):
-                    rel = path.resolve().relative_to(root.resolve())
                     hits.append(f"{rel.as_posix()}:{lineno}:{line}")
     return hits
 
@@ -137,13 +94,16 @@ def _path_hits(root: Path) -> list[str]:
     parts = [item.lower() for item in _decode(_PATH_PART)]
     hits: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIR_NAMES and not name.endswith(".egg-info")]
+        dirnames[:] = [
+            name for name in dirnames if name not in _SKIP_DIR_NAMES and not name.endswith(".egg-info")
+        ]
         rel_dir = Path(dirpath).resolve().relative_to(root.resolve())
         chunks = [p.lower() for p in rel_dir.parts]
         for name in filenames:
             rel = rel_dir / name if rel_dir != Path(".") else Path(name)
             segs = chunks + [name.lower()]
-            if any(part in segs or part in str(rel).replace("\\", "/").lower() for part in parts):
+            lowered = str(rel).replace("\\", "/").lower()
+            if any(part in segs or part in lowered for part in parts):
                 hits.append(f"path:{rel.as_posix()}")
     return hits
 
@@ -204,9 +164,9 @@ def _git_ref_hits(root: Path) -> list[str]:
 def scan(root: Path, *, include_git: bool = True) -> list[str]:
     hits: list[str] = []
     for token in _decode(_WORD):
-        hits.extend(_rg(root, token, word=True))
+        hits.extend(_search(root, token, word=True))
     for phrase in _decode(_PHRASE):
-        hits.extend(_rg(root, phrase, word=False))
+        hits.extend(_search(root, phrase, word=False))
     hits.extend(_path_hits(root))
     if include_git:
         hits.extend(_git_ref_hits(root))
