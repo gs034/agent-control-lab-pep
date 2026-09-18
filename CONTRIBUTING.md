@@ -4,7 +4,7 @@ This repository is a public-goods, Apache-2.0 **Agent Control Lab** host/runtime
 
 ## Accept
 
-- Lab-branded PEP, eval fixtures, threat model, and security notes already in this tree.
+- Lab-branded PEP, eval fixtures, ADRs, roadmap, threat model, and security notes already in this tree.
 - Diligence docs that do not invent attack-success metrics or weaken the fail-closed deny path.
 - Apache-2.0 SPDX on first-party Python.
 

@@ -10,6 +10,7 @@ from copy import deepcopy
 from pep.canonical import sha256_prefixed
 from pep.evaluate import evaluate
 from pep.policy import DEMO_POLICY, POLICY_VERSION
+from pep.receipt import FROZEN_RECEIPT_KEYS, validate_receipt
 from pep.reasons import ReasonCode
 from pep.row import (
     ENVELOPE_FILE,
@@ -25,23 +26,7 @@ from pep.row import (
 )
 
 
-REQUIRED_RECEIPT_KEYS = {
-    "brand",
-    "decision",
-    "envelope_hash",
-    "eval_ref",
-    "fail_closed",
-    "judge",
-    "licence",
-    "negative_controls_observed",
-    "pep_id",
-    "policy_version",
-    "reason_code",
-    "reason_detail",
-    "receipt_type",
-    "timestamp",
-    "trust_domain",
-}
+REQUIRED_RECEIPT_KEYS = FROZEN_RECEIPT_KEYS
 
 
 def test_eval_artefacts_exist_on_main_layout():
@@ -50,6 +35,7 @@ def test_eval_artefacts_exist_on_main_layout():
     assert (root / PROSE_FILE).is_file()
     assert (root / EXPECTED_RECEIPT_FILE).is_file()
     assert (root / ROW_DOC).is_file()
+    assert (root / "receipt.schema.json").is_file()
 
 
 def test_official_row_denies_with_expected_receipt_shape():
@@ -81,6 +67,8 @@ def test_official_row_denies_with_expected_receipt_shape():
     assert live["eval_ref"] == expected["eval_ref"]
     assert live["trust_domain"] == expected["trust_domain"]
     assert set(live) == REQUIRED_RECEIPT_KEYS == set(expected)
+    validate_receipt(live)
+    validate_receipt(expected)
     assert live["envelope_hash"].startswith("sha256:")
     assert live["envelope_hash"] == sha256_prefixed(envelope)
     assert DEMO_POLICY.current_digest() == policy_before

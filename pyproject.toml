@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-control-lab-pep"
-version = "0.1.0"
-description = "Agent Control Lab reference host/runtime Policy Enforcement Point stub"
+version = "0.2.0"
+description = "Agent Control Lab reference host/runtime Policy Enforcement Point (v0.2 foundation)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
