@@ -78,7 +78,7 @@ def _which_rg() -> str | None:
 def _rg(root: Path, pattern: str, *, word: bool) -> list[str]:
     rg = _which_rg()
     if rg is None:
-        raise RuntimeError("rg (ripgrep) is required for the Lab brand wall")
+        return _python_search(root, pattern, word=word)
     cmd = [
         rg,
         "-n",
@@ -108,6 +108,29 @@ def _rg(root: Path, pattern: str, *, word: bool) -> list[str]:
         err = proc.stderr.strip() or f"rg exited {proc.returncode}"
         raise RuntimeError(err)
     return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _python_search(root: Path, pattern: str, *, word: bool) -> list[str]:
+    """Stdlib fallback when rg is not on PATH (pytest / slim hosts)."""
+    needle = re.compile(rf"(?i)\b{re.escape(pattern)}\b") if word else re.compile(re.escape(pattern), re.I)
+    hits: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if name not in _SKIP_DIR_NAMES and not name.endswith(".egg-info")
+        ]
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if needle.search(line):
+                    rel = path.resolve().relative_to(root.resolve())
+                    hits.append(f"{rel.as_posix()}:{lineno}:{line}")
+    return hits
 
 
 def _path_hits(root: Path) -> list[str]:

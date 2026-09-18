@@ -26,4 +26,4 @@ pytest
 python3 scripts/lab_brand_wall.py
 ```
 
-The brand wall needs `rg` (ripgrep) on `PATH`.
+The brand wall prefers `rg` (ripgrep) and falls back to a stdlib walk if `rg` is missing.
