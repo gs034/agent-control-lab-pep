@@ -14,7 +14,7 @@ Brand: **Agent Control Lab**. Licence: **Apache-2.0**.
 | Single-use TTL approvals | Operator-issued grants in `ApprovalStore`. Replay, expiry, unknown id, or uncovered tool must not become allow. Approvals cannot extend the catalog. |
 | Tool invoke path | Side-effecting callables (`gated_invoke`) must not run on DENY. |
 | Deny/allow receipt | Frozen v1 schema. Attests `decision`, `reason_code`, `envelope_hash`, judge path, and negative controls. |
-| PEP availability / kill / suspend | Process-local `PepRuntime` modes. Kill and unavailability deny as `kill_active`. Suspend denies as `suspend_active`. Resume cannot clear a kill. |
+| PEP availability / kill / suspend | `PepRuntime` modes, optionally persisted by `HaltStore` (JSON file). Kill and unavailability deny as `kill_active`. Suspend denies as `suspend_active`. Resume cannot clear a kill, including after process restart. |
 
 `eval/malicious_agent_prose.txt` is an asset only as **untrusted data**. It is never policy.
 
@@ -62,8 +62,8 @@ Every control below ends in **DENY + receipt** and, when callers use `gated_invo
 | Capability check | Token (when presented) looked up, unexpired, covers the tool, matches required capability; args must match the tiny schema. | `capability_missing`, `policy_miss` |
 | Single-use TTL approval | Operator-minted grant consumed on first ALLOW. Replay / expiry / unknown / uncovered tool deny. Does not unlock tools outside the catalog. | `approval_invalid`, `approval_expired`, `approval_consumed` |
 | Policy present and readable | Empty store, unreadable spec, or missing schema → deny. | `policy_miss` |
-| Kill / unavailable | `kill()` or `available=false` denies even an otherwise allowlisted envelope. Resume cannot clear a kill. | `kill_active` |
-| Suspend | `suspend()` denies every envelope until `resume()`. | `suspend_active` |
+| Kill / unavailable | `kill()` or `available=false` denies even an otherwise allowlisted envelope. Resume cannot clear a kill. Durable store reloads the same deny after restart. | `kill_active` |
+| Suspend | `suspend()` denies every envelope until `resume()`. Persisted suspend reloads as `suspend_active`. | `suspend_active` |
 | Parse / type failure | Null, bad JSON, malformed ids, non-object args. | `envelope_invalid` |
 | Gate | `gated_invoke` calls the tool only after `allowed()`. Bypass of the helper is outside this trust domain. | (no invoke on DENY) |
 

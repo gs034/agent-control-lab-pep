@@ -1,10 +1,10 @@
 # Agent Control Lab — reference host/runtime PEP stub
 
-This repository is a public-goods, Apache-2.0 **reference Policy Enforcement Point (PEP)** from **Agent Control Lab** (Navigators / philanthropic AI-control). Package **v0.2** is the foundation (single-use TTL approvals, kill/suspend API, frozen receipt schema) on top of the **0.1 stub** existence-proof deny. It is **not** a production product, **not** an LLM/CoT/transcript judge, and **not** a human-in-the-loop enforcement path.
+This repository is a public-goods, Apache-2.0 **reference Policy Enforcement Point (PEP)** from **Agent Control Lab** (Navigators / philanthropic AI-control). Package **v0.3** is EOI **M1**: an evaluator corpus under `eval/corpus/` plus a durable kill/suspend store, on the **v0.2** foundation (single-use TTL approvals, halt API, frozen receipt schema) and the **0.1 stub** existence-proof deny. It is **not** a production product, **not** an LLM/CoT/transcript judge, and **not** a human-in-the-loop enforcement path.
 
 The official eval row lives under `eval/` (Deep Research artefacts). The PEP loads `eval/structured_envelope.example.json` as the sole policy-relevant input. `eval/malicious_agent_prose.txt` is untrusted data and is never policy.
 
-**Architecture.** Callers (agent, optional monitor, HITL UI, or MCP/tool host) submit a structured invoke envelope to `pep.evaluate` / `pep.gated_invoke`. That function boundary *is* the PEP: frozen allowlist, capability tokens, and operator-issued single-use TTL approvals in the `pep` package decide ALLOW or DENY, emit a frozen-schema receipt, and on DENY never enter the tool. Kill and suspend are process-local halt APIs; both fail closed. Model output, monitor scores, and agent prose sit outside this plane and cannot rewrite policy. ADR: [`docs/adr/ADR-0001-lab-pep-architecture.md`](docs/adr/ADR-0001-lab-pep-architecture.md). Roadmap (stub → v0.2 → v1 / EOI M1): [`docs/ROADMAP.md`](docs/ROADMAP.md). Public threat model: [`docs/threat-model.md`](docs/threat-model.md). Reporting: [`SECURITY.md`](SECURITY.md). Contributing / Lab-only keep-out: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+**Architecture.** Callers (agent, optional monitor, HITL UI, or MCP/tool host) submit a structured invoke envelope to `pep.evaluate` / `pep.gated_invoke`. That function boundary *is* the PEP: frozen allowlist, capability tokens, and operator-issued single-use TTL approvals in the `pep` package decide ALLOW or DENY, emit a frozen-schema receipt, and on DENY never enter the tool. Kill and suspend fail closed; optional `HaltStore` persists them across process restart. Model output, monitor scores, and agent prose sit outside this plane and cannot rewrite policy. ADR: [`docs/adr/ADR-0001-lab-pep-architecture.md`](docs/adr/ADR-0001-lab-pep-architecture.md). Roadmap (stub → v0.2 → v0.3 / EOI M1): [`docs/ROADMAP.md`](docs/ROADMAP.md). Public threat model: [`docs/threat-model.md`](docs/threat-model.md). Reporting: [`SECURITY.md`](SECURITY.md). Contributing / Lab-only keep-out: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## What this is
 
@@ -16,14 +16,14 @@ The official eval row lives under `eval/` (Deep Research artefacts). The PEP loa
 
 - **Not an LLM / CoT / transcript judge as enforcement.** There is no model call on the evaluate path (see `pep/evaluate.py` and `tests/test_no_llm_path.py`). A monitor “SAFE” coax is not an allow.
 - **Not production SaaS.** Not a multi-tenant control plane, shipping product, marketplace adapter, live git host, or production UI.
-- **Existence-proof plus v0.2 foundation only.** Demonstrates a host/runtime deny for one attack *class*, plus in-process approval and halt APIs. Not a measured attack-success-rate result, not a vendor-classifier claim, and not a durable (out-of-process) control plane. This tree does not measure attack success.
+- **Existence-proof plus v0.3 / M1 corpus.** Demonstrates a host/runtime deny for named attack *classes*, one catalog-bound ALLOW fixture, and a file-backed halt store. Not a measured attack-success-rate result, not a vendor-classifier claim, and not a production control plane. This tree does not measure attack success.
 
 ## Four PEP lines (demonstrated in code)
 
 1. **Non-goal.** The deny path is deterministic host/runtime policy. It is **not** an LLM/CoT/transcript judge. `evaluate()` does not call a model.
 2. **Separate trust domain.** The `pep` package is the PEP. Agents and optional monitors are callers. In-process import is allowed; `evaluate()` / `gated_invoke()` is the boundary.
 3. **Structured envelopes only.** The PEP consumes the structured envelope. Agent free-text / “please allow” is **untrusted data** and never becomes policy.
-4. **Fail-closed.** Missing policy, unknown tool, expired/missing capability, invalid/expired/consumed approval, PEP unavailable, kill, or suspend, parse failure → **DENY** + receipt; `gated_invoke` does not enter the tool.
+4. **Fail-closed.** Missing policy, unknown tool, expired/missing capability, invalid/expired/consumed approval, PEP unavailable, kill, or suspend, parse failure → **DENY** + receipt; `gated_invoke` does not enter the tool. Halt mode can persist in a JSON file so a restarted process still denies.
 
 ## How to run
 
@@ -61,14 +61,17 @@ Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v
 | `pep/envelope.py` | Lab + flat envelope parse; prose is not policy |
 | `pep/policy.py` | Frozen stub allowlist (`echo.ping` only) |
 | `pep/approval.py` | Single-use TTL approval store (operator-issued grants) |
+| `pep/halt.py` | Durable kill / suspend JSON store (optional; survives restart) |
 | `pep/evaluate.py` | PEP trust domain: `evaluate(envelope) -> Decision`; kill/suspend API |
 | `pep/gate.py` | Never invoke on DENY |
 | `pep/receipt.py` | Frozen v1 receipt (`validate_receipt`) |
-| `pep/row.py` | Loader for `eval/` artefacts |
+| `pep/row.py` | Loader for the official `eval/` row |
+| `pep/corpus.py` | Loader for M1 `eval/corpus/` rows (same `evaluate()` path) |
 | `pep/demo.py` | Prints the live official-row deny receipt |
-| `eval/` | Deep Research row, envelope, prose, expected receipt, frozen receipt schema |
+| `eval/` | Official Deep Research row, envelope, prose, expected receipt, frozen receipt schema |
+| `eval/corpus/` | M1 structured envelopes + expected receipts (deny classes + catalog-bound ALLOW) |
 | `docs/adr/ADR-0001-lab-pep-architecture.md` | Architecture decision: trust domain, grants, fail-closed, halt, receipts |
-| `docs/ROADMAP.md` | stub → v0.2 → v1 mapped to EOI M1 (evaluator corpus) and kill/suspend |
+| `docs/ROADMAP.md` | stub → v0.2 → v0.3 / EOI M1 (evaluator corpus + durable halt) |
 | `docs/threat-model.md` | Public host/runtime PEP threat model and control taxonomy |
 | `SECURITY.md` | Fail-closed default, trust domain, how to report issues |
 | `CONTRIBUTING.md` | Lab-only artefacts; reject commercial/bank paths and brand strings |

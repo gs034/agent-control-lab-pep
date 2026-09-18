@@ -11,6 +11,7 @@ from pep.approval import ApprovalRecord, ApprovalStore
 from pep.envelope import InvokeEnvelope
 from pep.evaluate import Decision, PepRuntime, RuntimeMode, evaluate
 from pep.gate import gated_invoke
+from pep.halt import HaltState, HaltStore
 from pep.reasons import ReasonCode
 from pep.receipt import Receipt, validate_receipt
 from pep.row import evaluate_official_row
@@ -19,6 +20,8 @@ __all__ = [
     "ApprovalRecord",
     "ApprovalStore",
     "Decision",
+    "HaltState",
+    "HaltStore",
     "InvokeEnvelope",
     "PepRuntime",
     "ReasonCode",
@@ -30,4 +33,4 @@ __all__ = [
     "validate_receipt",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

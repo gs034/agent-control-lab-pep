@@ -52,6 +52,10 @@ PROSE_COAX_KEYS = frozenset(
         "new_policy",
         "allow_all",
         "rewrite_policy",
+        "monitor",
+        "monitor_allow",
+        "monitor_safe",
+        "monitor_verdict",
     }
 )
 

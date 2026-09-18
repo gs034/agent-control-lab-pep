@@ -1,0 +1,14 @@
+{
+  "approvals": [
+    {
+      "approval_id": "lab.appr.replay-fixture",
+      "consumed": true,
+      "issued_at": "2026-09-18T12:00:00+00:00",
+      "tool_name": "echo.ping",
+      "ttl_seconds": 3600
+    }
+  ],
+  "mode": "active",
+  "now": "2026-09-18T12:00:00+00:00",
+  "policy": "demo"
+}
