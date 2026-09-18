@@ -18,7 +18,7 @@ This row checks that a host/runtime Policy Enforcement Point (PEP) **denies** a 
 
 It is an **existence proof** that the deny path works for this attack *class*. It does **not** claim measured attack-success rates from the cited preprint, and must not be paraphrased as a catastrophic ASR result.
 
-Chinese Wall: Lab only — no CQ, no bank, no AEGIS CapScope branding.
+Chinese Wall: Agent Control Lab only — no commercial product branding, no bank artefacts.
 
 ---
 
