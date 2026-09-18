@@ -15,24 +15,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
+from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
-from pep.policy import DEMO_POLICY, PolicyStore, args_match_schema, parse_expiry
+from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore, args_match_schema, parse_expiry
 from pep.reasons import ReasonCode
 from pep.receipt import Receipt, issue_receipt
 
 
 @dataclass(frozen=True, slots=True)
 class Decision:
-    verdict: Literal["ALLOW", "DENY"]
     receipt: Receipt
+
+    @property
+    def verdict(self) -> Literal["ALLOW", "DENY"]:
+        return self.receipt.decision
 
     def allowed(self) -> bool:
         return self.verdict == "ALLOW"
 
     def to_dict(self) -> dict[str, Any]:
-        return {"verdict": self.verdict, "receipt": self.receipt.to_dict()}
+        return self.receipt.to_dict()
 
 
 class PepRuntime:
@@ -61,214 +65,181 @@ class PepRuntime:
 
     def evaluate(self, envelope: Any) -> Decision:
         policy = self._policy
-        digest = policy.digest
         unchanged = policy.bytes_unchanged()
+        env_hash = _envelope_hash(envelope)
+        version = policy.version if policy.document else POLICY_VERSION
 
         if (not self.available) or self.kill_active:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.KILL_ACTIVE,),
-                detail="PEP kill active or PEP unavailable; fail-closed deny, no invoke",
-                policy_digest=digest,
-                policy_bytes_unchanged=unchanged,
-                envelope_digest=_try_envelope_digest(envelope),
+            return _deny(
+                ReasonCode.KILL_ACTIVE,
+                "PEP kill active or PEP unavailable; fail-closed deny, no invoke",
+                env_hash,
+                version,
+                unchanged,
             )
-            return Decision("DENY", receipt)
 
         try:
             parsed = parse_envelope(envelope)
         except EnvelopeError as exc:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(exc.reason,),
-                detail=exc.detail,
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=_try_envelope_digest(envelope),
-            )
-            return Decision("DENY", receipt)
+            return _deny(exc.reason, exc.detail, env_hash, version, policy.bytes_unchanged())
         except (TypeError, ValueError) as exc:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.ENVELOPE_INVALID,),
-                detail=f"parse failure: {exc}",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=None,
+            return _deny(
+                ReasonCode.ENVELOPE_INVALID,
+                f"parse failure: {exc}",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
+
+        env_hash = parsed.digest()
 
         if parsed.has_untrusted_prose():
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.AGENT_PROSE_REJECTED,),
-                detail="untrusted agent prose rejected; not consulted as policy",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.AGENT_PROSE_REJECTED,
+                "untrusted agent prose rejected; not consulted as policy",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         if not policy.raw_bytes or not policy.document:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.POLICY_MISS,),
-                detail="no policy loaded; fail-closed deny",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.POLICY_MISS,
+                "no policy loaded; fail-closed deny",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         allowed_tools = policy.allowed_tools()
+        token = parsed.capability_token
+        approval = parsed.approval_id
+
         if parsed.tool_name not in allowed_tools:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.UNKNOWN_TOOL,),
-                detail=f"tool not in policy catalog: {parsed.tool_name}",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            if token is None and approval is None:
+                return _deny(
+                    ReasonCode.TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY,
+                    (
+                        f"Host/runtime PEP denied invoke: tool_name {parsed.tool_name} "
+                        "is outside allowlist; capability_token and approval_id absent. "
+                        "Agent free-text was ignored as policy input."
+                    ),
+                    env_hash,
+                    version,
+                    policy.bytes_unchanged(),
+                )
+            return _deny(
+                ReasonCode.UNKNOWN_TOOL,
+                f"tool not in policy catalog: {parsed.tool_name}",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         spec = allowed_tools[parsed.tool_name]
-        if not isinstance(spec, dict) and not hasattr(spec, "get"):
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.POLICY_MISS,),
-                detail="tool spec unreadable; fail-closed deny",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+        if not hasattr(spec, "get"):
+            return _deny(
+                ReasonCode.POLICY_MISS,
+                "tool spec unreadable; fail-closed deny",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
-
-        callers = policy.allowed_callers()
-        if callers and parsed.caller_identity not in callers:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.POLICY_MISS,),
-                detail=f"caller not in policy allowlist: {parsed.caller_identity}",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
-            )
-            return Decision("DENY", receipt)
 
         required_cap = spec.get("required_capability")
-        token = parsed.capability_token
         if not token:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.CAPABILITY_MISSING,),
-                detail="capability token missing",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.CAPABILITY_MISSING,
+                "capability token missing",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         cap = policy.capability(token)
         if cap is None:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.CAPABILITY_MISSING,),
-                detail="capability token unknown",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.CAPABILITY_MISSING,
+                "capability token unknown",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         expires_at = cap.get("expires_at")
         if not isinstance(expires_at, str):
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.CAPABILITY_MISSING,),
-                detail="capability record missing expires_at; fail-closed",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.CAPABILITY_MISSING,
+                "capability record missing expires_at; fail-closed",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
         try:
             expiry = parse_expiry(expires_at)
         except (TypeError, ValueError):
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.CAPABILITY_MISSING,),
-                detail="capability expiry unparseable; fail-closed",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.CAPABILITY_MISSING,
+                "capability expiry unparseable; fail-closed",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
         if expiry <= datetime.now(timezone.utc):
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.CAPABILITY_MISSING,),
-                detail="capability token expired",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.CAPABILITY_MISSING,
+                "capability token expired",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         cap_tools = cap.get("tools", [])
         if parsed.tool_name not in cap_tools:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.CAPABILITY_MISSING,),
-                detail="capability token does not cover tool",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.CAPABILITY_MISSING,
+                "capability token does not cover tool",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         if required_cap and token != required_cap:
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.POLICY_MISS,),
-                detail="capability token does not match tool policy",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.POLICY_MISS,
+                "capability token does not match tool policy",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         schema = spec.get("args_schema")
-        if not isinstance(schema, dict) and not hasattr(schema, "get"):
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.POLICY_MISS,),
-                detail="args schema missing; fail-closed",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+        if not hasattr(schema, "get"):
+            return _deny(
+                ReasonCode.POLICY_MISS,
+                "args schema missing; fail-closed",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
         if not args_match_schema(parsed.args, schema):
-            receipt = issue_receipt(
-                verdict="DENY",
-                reason_codes=(ReasonCode.POLICY_MISS,),
-                detail="args failed policy schema",
-                policy_digest=digest,
-                policy_bytes_unchanged=policy.bytes_unchanged(),
-                envelope_digest=parsed.digest(),
+            return _deny(
+                ReasonCode.POLICY_MISS,
+                "args failed policy schema",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
             )
-            return Decision("DENY", receipt)
 
         receipt = issue_receipt(
-            verdict="ALLOW",
-            reason_codes=(ReasonCode.ALLOWED,),
-            detail="structured envelope matched static allowlist",
-            policy_digest=digest,
-            policy_bytes_unchanged=policy.bytes_unchanged(),
-            envelope_digest=parsed.digest(),
+            decision="ALLOW",
+            reason_code=ReasonCode.ALLOWED,
+            reason_detail="structured envelope matched static allowlist",
+            envelope_hash=env_hash,
+            policy_version=version,
+            policy_file_unchanged=policy.bytes_unchanged(),
         )
-        return Decision("ALLOW", receipt)
+        return Decision(receipt)
 
 
 _DEFAULT_RUNTIME = PepRuntime()
@@ -280,16 +251,31 @@ def evaluate(envelope: Any, runtime: PepRuntime | None = None) -> Decision:
     return pep.evaluate(envelope)
 
 
-def _try_envelope_digest(envelope: Any) -> str | None:
+def _deny(
+    reason: ReasonCode,
+    detail: str,
+    envelope_hash: str,
+    policy_version: str,
+    unchanged: bool,
+) -> Decision:
+    return Decision(
+        issue_receipt(
+            decision="DENY",
+            reason_code=reason,
+            reason_detail=detail,
+            envelope_hash=envelope_hash,
+            policy_version=policy_version,
+            policy_file_unchanged=unchanged,
+        )
+    )
+
+
+def _envelope_hash(envelope: Any) -> str:
     if isinstance(envelope, InvokeEnvelope):
         return envelope.digest()
-    if isinstance(envelope, dict):
+    if isinstance(envelope, Mapping):
         try:
-            import hashlib
-
-            from pep.canonical import canonical_bytes
-
-            return hashlib.sha256(canonical_bytes(envelope)).hexdigest()
+            return sha256_prefixed(dict(envelope))
         except (TypeError, ValueError):
-            return None
-    return None
+            return "sha256:"
+    return "sha256:"

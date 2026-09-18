@@ -12,7 +12,7 @@ from pep.reasons import ReasonCode
 
 def _valid():
     return {
-        "tool_name": "lab.echo",
+        "tool_name": "echo.ping",
         "args": {"message": "hello"},
         "capability_token": "lab.cap.echo.demo",
         "caller_identity": "lab.demo.agent",
@@ -30,7 +30,7 @@ def test_kill_active_denies_allowlisted_invoke():
 
     decision, result = gated_invoke(_valid(), boom, runtime=runtime)
     assert decision.verdict == "DENY"
-    assert ReasonCode.KILL_ACTIVE in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
     assert result is None
     assert called["n"] == 0
 
@@ -40,8 +40,8 @@ def test_pep_unavailable_is_kill_active():
     runtime.mark_unavailable()
     decision = evaluate(_valid(), runtime=runtime)
     assert decision.verdict == "DENY"
-    assert ReasonCode.KILL_ACTIVE in decision.receipt.reason_codes
-    assert decision.receipt.policy_bytes_unchanged is True
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
+    assert decision.receipt.policy_file_unchanged is True
 
 
 def test_activate_kill_after_construct():
@@ -49,4 +49,4 @@ def test_activate_kill_after_construct():
     runtime.activate_kill()
     decision = evaluate(_valid(), runtime=runtime)
     assert decision.verdict == "DENY"
-    assert ReasonCode.KILL_ACTIVE in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE

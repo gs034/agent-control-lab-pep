@@ -11,19 +11,19 @@ from pep.reasons import ReasonCode
 def test_null_envelope():
     decision = evaluate(None)
     assert decision.verdict == "DENY"
-    assert ReasonCode.ENVELOPE_INVALID in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
 
 
 def test_non_object_envelope():
     decision = evaluate(["lab.echo"])
     assert decision.verdict == "DENY"
-    assert ReasonCode.ENVELOPE_INVALID in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
 
 
 def test_bad_json_bytes():
     decision = evaluate(b"{not-json")
     assert decision.verdict == "DENY"
-    assert ReasonCode.ENVELOPE_INVALID in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
 
 
 def test_args_must_be_object():
@@ -37,7 +37,7 @@ def test_args_must_be_object():
         }
     )
     assert decision.verdict == "DENY"
-    assert ReasonCode.ENVELOPE_INVALID in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
 
 
 def test_unknown_field_is_invalid_not_policy():
@@ -52,7 +52,7 @@ def test_unknown_field_is_invalid_not_policy():
         }
     )
     assert decision.verdict == "DENY"
-    assert ReasonCode.ENVELOPE_INVALID in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
 
 
 def test_malformed_tool_name():
@@ -66,4 +66,4 @@ def test_malformed_tool_name():
         }
     )
     assert decision.verdict == "DENY"
-    assert ReasonCode.ENVELOPE_INVALID in decision.receipt.reason_codes
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
