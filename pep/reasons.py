@@ -16,6 +16,10 @@ class ReasonCode(StrEnum):
     AGENT_PROSE_REJECTED = "agent_prose_rejected"
     POLICY_MISS = "policy_miss"
     KILL_ACTIVE = "kill_active"
+    SUSPEND_ACTIVE = "suspend_active"
+    APPROVAL_INVALID = "approval_invalid"
+    APPROVAL_EXPIRED = "approval_expired"
+    APPROVAL_CONSUMED = "approval_consumed"
     ENVELOPE_INVALID = "envelope_invalid"
     # Exact Deep Research receipt code for the official eval row.
     TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY = "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"

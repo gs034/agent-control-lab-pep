@@ -50,3 +50,46 @@ def test_activate_kill_after_construct():
     decision = evaluate(_valid(), runtime=runtime)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
+
+
+def test_suspend_denies_and_resume_restores_allow():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    runtime.suspend()
+    assert runtime.suspend_active is True
+    denied = evaluate(_valid(), runtime=runtime)
+    assert denied.verdict == "DENY"
+    assert denied.receipt.reason_code == ReasonCode.SUSPEND_ACTIVE
+    runtime.resume()
+    allowed = evaluate(_valid(), runtime=runtime)
+    assert allowed.verdict == "ALLOW"
+    assert allowed.receipt.reason_code == ReasonCode.ALLOWED
+
+
+def test_resume_cannot_clear_kill():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    runtime.kill()
+    runtime.resume()
+    decision = evaluate(_valid(), runtime=runtime)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
+    assert runtime.kill_active is True
+
+
+def test_kill_wins_over_later_suspend():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    runtime.kill()
+    runtime.suspend()
+    decision = evaluate(_valid(), runtime=runtime)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
+    assert runtime.mode.value == "killed"
+
+
+def test_suspend_then_kill_stays_killed():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    runtime.suspend()
+    runtime.kill()
+    runtime.resume()
+    decision = evaluate(_valid(), runtime=runtime)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE

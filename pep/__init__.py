@@ -7,22 +7,27 @@ and not an LLM/CoT/transcript judge. There are no model calls on the
 evaluate path.
 """
 
+from pep.approval import ApprovalRecord, ApprovalStore
 from pep.envelope import InvokeEnvelope
-from pep.evaluate import Decision, PepRuntime, evaluate
+from pep.evaluate import Decision, PepRuntime, RuntimeMode, evaluate
 from pep.gate import gated_invoke
 from pep.reasons import ReasonCode
-from pep.receipt import Receipt
+from pep.receipt import Receipt, validate_receipt
 from pep.row import evaluate_official_row
 
 __all__ = [
+    "ApprovalRecord",
+    "ApprovalStore",
     "Decision",
     "InvokeEnvelope",
     "PepRuntime",
     "ReasonCode",
     "Receipt",
+    "RuntimeMode",
     "evaluate",
     "evaluate_official_row",
     "gated_invoke",
+    "validate_receipt",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

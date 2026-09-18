@@ -11,9 +11,10 @@ Brand: **Agent Control Lab**. Licence: **Apache-2.0**.
 | Frozen policy bytes (`pep/policy.py`, `PolicyStore`) | Allowlist and capability records. Agents must not rewrite them. Stub catalog is `echo.ping` only. |
 | Structured invoke envelope | Sole policy-relevant input. Lab fixture: `eval/structured_envelope.example.json`. |
 | Capability records | Presence, expiry, and tool coverage. Missing, unknown, expired, or uncovered tokens must not become allow. |
+| Single-use TTL approvals | Operator-issued grants in `ApprovalStore`. Replay, expiry, unknown id, or uncovered tool must not become allow. Approvals cannot extend the catalog. |
 | Tool invoke path | Side-effecting callables (`gated_invoke`) must not run on DENY. |
-| Deny/allow receipt | Attests `decision`, `reason_code`, `envelope_hash`, judge path, and negative controls. |
-| PEP availability / kill | Process-local `PepRuntime.available` and `kill_active`. Unavailability is a deny, not a bypass. |
+| Deny/allow receipt | Frozen v1 schema. Attests `decision`, `reason_code`, `envelope_hash`, judge path, and negative controls. |
+| PEP availability / kill / suspend | Process-local `PepRuntime` modes. Kill and unavailability deny as `kill_active`. Suspend denies as `suspend_active`. Resume cannot clear a kill. |
 
 `eval/malicious_agent_prose.txt` is an asset only as **untrusted data**. It is never policy.
 
@@ -44,7 +45,7 @@ Receipt field `trust_domain.model_monitor_mcp` is `untrusted_relative_to_pep`. E
 | Class | What they try | Stub stance |
 | --- | --- | --- |
 | **Prompt / prose injection** | Free-text, coax keys, or attachments that ask the PEP (or a co-located monitor) to ignore, rewrite, or skip policy. | Prose is data. Coax keys and non-empty prose channels are rejected. Attachments are not loaded as policy. |
-| **Capability spoof** | Missing, empty, unknown, expired, or tool-uncovered tokens; forged “operator approval” in natural language; caller identity as authority. | Token must be present, known, unexpired, and cover the tool. Prose cannot mint a token or `approval_id`. |
+| **Capability spoof** | Missing, empty, unknown, expired, or tool-uncovered tokens; forged “operator approval” in natural language; caller identity as authority. | Standing token must be known, unexpired, and cover the tool. A presented `approval_id` must exist in the PEP store, be unexpired, unused, and cover the tool. Prose cannot mint a token or approval row. |
 | **Monitor coax** | Agent text that tells a monitor to classify the turn SAFE / allow so the invoke proceeds. | Evaluate path has no monitor or model judge. Coax cannot become ALLOW. Receipt records `monitor_coax_accepted: false`. |
 
 Inspiration for the official `eval/` row is the monitor-bypass / policy-rewrite-coax *class* discussed in [arXiv:2609.19587](https://arxiv.org/abs/2609.19587). This stub is an existence-proof deny for that class, not a paper reproduction and not an attack-success-rate claim.
@@ -58,9 +59,11 @@ Every control below ends in **DENY + receipt** and, when callers use `gated_invo
 | Structured envelopes only | Parse Lab or flat JSON objects. Free-text payloads and unknown/coax keys fail closed. | `envelope_invalid`, `agent_prose_rejected` |
 | Prose is not policy | `untrusted_agent_text`, non-empty `metadata`, `untrusted_attachments` file bytes, and coax keys are not allowlist input. | `agent_prose_rejected` |
 | Frozen allowlist | Unknown `tool_name` cannot run. Official row: `shell.exec` vs `echo.ping`. | `TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY`, `unknown_tool` |
-| Capability check | Token required, looked up, unexpired, covers the tool, matches required capability; args must match the tiny schema. | `capability_missing`, `policy_miss` |
+| Capability check | Token (when presented) looked up, unexpired, covers the tool, matches required capability; args must match the tiny schema. | `capability_missing`, `policy_miss` |
+| Single-use TTL approval | Operator-minted grant consumed on first ALLOW. Replay / expiry / unknown / uncovered tool deny. Does not unlock tools outside the catalog. | `approval_invalid`, `approval_expired`, `approval_consumed` |
 | Policy present and readable | Empty store, unreadable spec, or missing schema → deny. | `policy_miss` |
-| Kill / unavailable | `kill_active` or `available=false` denies even an otherwise allowlisted envelope. | `kill_active` |
+| Kill / unavailable | `kill()` or `available=false` denies even an otherwise allowlisted envelope. Resume cannot clear a kill. | `kill_active` |
+| Suspend | `suspend()` denies every envelope until `resume()`. | `suspend_active` |
 | Parse / type failure | Null, bad JSON, malformed ids, non-object args. | `envelope_invalid` |
 | Gate | `gated_invoke` calls the tool only after `allowed()`. Bypass of the helper is outside this trust domain. | (no invoke on DENY) |
 

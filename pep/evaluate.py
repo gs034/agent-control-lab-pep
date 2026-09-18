@@ -8,20 +8,30 @@ This module *is* the Policy Enforcement Point. Agents, optional monitors,
 and any HITL UI are callers on the other side of ``evaluate()``. In-process
 import is allowed; the function boundary is the trust boundary. There is
 no LLM, CoT, or transcript judge on this path — policy is a frozen
-allowlist plus capability tokens.
+allowlist plus capability tokens and single-use TTL approvals.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Any, Literal, Mapping
 
+from pep.approval import ApprovalRecord, ApprovalStore
 from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
 from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore, args_match_schema, parse_expiry
 from pep.reasons import ReasonCode
 from pep.receipt import Receipt, issue_receipt
+
+
+class RuntimeMode(StrEnum):
+    """Process-local PEP mode. Kill is irreversible; suspend may resume."""
+
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    KILLED = "killed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +50,7 @@ class Decision:
 
 
 class PepRuntime:
-    """Process-local PEP. Kill / unavailability fail closed to DENY."""
+    """Process-local PEP. Kill, suspend, and unavailability fail closed to DENY."""
 
     def __init__(
         self,
@@ -48,31 +58,105 @@ class PepRuntime:
         *,
         kill_active: bool = False,
         available: bool = True,
+        approvals: ApprovalStore | None = None,
     ) -> None:
         self._policy = policy if policy is not None else DEMO_POLICY
-        self.kill_active = kill_active
+        self._mode = RuntimeMode.KILLED if kill_active else RuntimeMode.ACTIVE
         self.available = available
+        self._approvals = approvals if approvals is not None else ApprovalStore()
 
     @property
     def policy(self) -> PolicyStore:
         return self._policy
 
+    @property
+    def approvals(self) -> ApprovalStore:
+        return self._approvals
+
+    @property
+    def mode(self) -> RuntimeMode:
+        return self._mode
+
+    @property
+    def kill_active(self) -> bool:
+        return self._mode is RuntimeMode.KILLED
+
+    @kill_active.setter
+    def kill_active(self, value: bool) -> None:
+        if value:
+            self._mode = RuntimeMode.KILLED
+
+    @property
+    def suspend_active(self) -> bool:
+        return self._mode is RuntimeMode.SUSPENDED
+
+    def kill(self) -> None:
+        """Irreversible in-process halt. ``resume`` cannot clear a kill."""
+        self._mode = RuntimeMode.KILLED
+
     def activate_kill(self) -> None:
-        self.kill_active = True
+        self.kill()
+
+    def suspend(self) -> None:
+        """Reversible halt. No-op when already killed (kill wins)."""
+        if self._mode is RuntimeMode.KILLED:
+            return
+        self._mode = RuntimeMode.SUSPENDED
+
+    def resume(self) -> None:
+        """Clear suspend only. A killed PEP stays killed."""
+        if self._mode is RuntimeMode.SUSPENDED:
+            self._mode = RuntimeMode.ACTIVE
 
     def mark_unavailable(self) -> None:
         self.available = False
 
-    def evaluate(self, envelope: Any) -> Decision:
+    def issue_approval(
+        self,
+        *,
+        tool_name: str,
+        ttl_seconds: int,
+        approval_id: str | None = None,
+        now: datetime | None = None,
+    ) -> ApprovalRecord:
+        """Mint a single-use TTL approval for an allowlisted tool."""
+        return self._approvals.issue(
+            tools=(tool_name,),
+            ttl_seconds=ttl_seconds,
+            approval_id=approval_id,
+            now=now,
+            catalog=self._policy.allowed_tools(),
+        )
+
+    def evaluate(self, envelope: Any, *, now: datetime | None = None) -> Decision:
+        try:
+            clock = _aware_clock(now)
+        except (TypeError, ValueError):
+            policy = self._policy
+            return _deny(
+                ReasonCode.ENVELOPE_INVALID,
+                "evaluate clock must be timezone-aware; fail-closed deny",
+                _envelope_hash(envelope),
+                policy.version if policy.document else POLICY_VERSION,
+                policy.bytes_unchanged(),
+            )
         policy = self._policy
         unchanged = policy.bytes_unchanged()
         env_hash = _envelope_hash(envelope)
         version = policy.version if policy.document else POLICY_VERSION
 
-        if (not self.available) or self.kill_active:
+        if (not self.available) or self._mode is RuntimeMode.KILLED:
             return _deny(
                 ReasonCode.KILL_ACTIVE,
                 "PEP kill active or PEP unavailable; fail-closed deny, no invoke",
+                env_hash,
+                version,
+                unchanged,
+            )
+        if self._mode is RuntimeMode.SUSPENDED:
+            return _deny(
+                ReasonCode.SUSPEND_ACTIVE,
+                "PEP suspend active; fail-closed deny, no invoke",
                 env_hash,
                 version,
                 unchanged,
@@ -147,67 +231,15 @@ class PepRuntime:
             )
 
         required_cap = spec.get("required_capability")
-        if not token:
+        if token:
+            denied = _capability_deny(policy, parsed, token, required_cap, clock)
+            if denied is not None:
+                reason, detail = denied
+                return _deny(reason, detail, env_hash, version, policy.bytes_unchanged())
+        elif approval is None:
             return _deny(
                 ReasonCode.CAPABILITY_MISSING,
                 "capability token missing",
-                env_hash,
-                version,
-                policy.bytes_unchanged(),
-            )
-
-        cap = policy.capability(token)
-        if cap is None:
-            return _deny(
-                ReasonCode.CAPABILITY_MISSING,
-                "capability token unknown",
-                env_hash,
-                version,
-                policy.bytes_unchanged(),
-            )
-
-        expires_at = cap.get("expires_at")
-        if not isinstance(expires_at, str):
-            return _deny(
-                ReasonCode.CAPABILITY_MISSING,
-                "capability record missing expires_at; fail-closed",
-                env_hash,
-                version,
-                policy.bytes_unchanged(),
-            )
-        try:
-            expiry = parse_expiry(expires_at)
-        except (TypeError, ValueError):
-            return _deny(
-                ReasonCode.CAPABILITY_MISSING,
-                "capability expiry unparseable; fail-closed",
-                env_hash,
-                version,
-                policy.bytes_unchanged(),
-            )
-        if expiry <= datetime.now(timezone.utc):
-            return _deny(
-                ReasonCode.CAPABILITY_MISSING,
-                "capability token expired",
-                env_hash,
-                version,
-                policy.bytes_unchanged(),
-            )
-
-        cap_tools = cap.get("tools", [])
-        if parsed.tool_name not in cap_tools:
-            return _deny(
-                ReasonCode.CAPABILITY_MISSING,
-                "capability token does not cover tool",
-                env_hash,
-                version,
-                policy.bytes_unchanged(),
-            )
-
-        if required_cap and token != required_cap:
-            return _deny(
-                ReasonCode.POLICY_MISS,
-                "capability token does not match tool policy",
                 env_hash,
                 version,
                 policy.bytes_unchanged(),
@@ -231,6 +263,19 @@ class PepRuntime:
                 policy.bytes_unchanged(),
             )
 
+        if approval is not None:
+            consume_reason = self._approvals.try_consume(
+                approval, parsed.tool_name, now=clock
+            )
+            if consume_reason is not None:
+                return _deny(
+                    consume_reason,
+                    f"single-use TTL approval rejected: {consume_reason}",
+                    env_hash,
+                    version,
+                    policy.bytes_unchanged(),
+                )
+
         receipt = issue_receipt(
             decision="ALLOW",
             reason_code=ReasonCode.ALLOWED,
@@ -242,13 +287,45 @@ class PepRuntime:
         return Decision(receipt)
 
 
+def _capability_deny(
+    policy: PolicyStore,
+    parsed: InvokeEnvelope,
+    token: str,
+    required_cap: Any,
+    clock: datetime,
+) -> tuple[ReasonCode, str] | None:
+    cap = policy.capability(token)
+    if cap is None:
+        return ReasonCode.CAPABILITY_MISSING, "capability token unknown"
+    expires_at = cap.get("expires_at")
+    if not isinstance(expires_at, str):
+        return ReasonCode.CAPABILITY_MISSING, "capability record missing expires_at; fail-closed"
+    try:
+        expiry = parse_expiry(expires_at)
+    except (TypeError, ValueError):
+        return ReasonCode.CAPABILITY_MISSING, "capability expiry unparseable; fail-closed"
+    if expiry <= clock:
+        return ReasonCode.CAPABILITY_MISSING, "capability token expired"
+    cap_tools = cap.get("tools", [])
+    if parsed.tool_name not in cap_tools:
+        return ReasonCode.CAPABILITY_MISSING, "capability token does not cover tool"
+    if required_cap and token != required_cap:
+        return ReasonCode.POLICY_MISS, "capability token does not match tool policy"
+    return None
+
+
 _DEFAULT_RUNTIME = PepRuntime()
 
 
-def evaluate(envelope: Any, runtime: PepRuntime | None = None) -> Decision:
+def evaluate(
+    envelope: Any,
+    runtime: PepRuntime | None = None,
+    *,
+    now: datetime | None = None,
+) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""
     pep = runtime if runtime is not None else _DEFAULT_RUNTIME
-    return pep.evaluate(envelope)
+    return pep.evaluate(envelope, now=now)
 
 
 def _deny(
@@ -279,3 +356,10 @@ def _envelope_hash(envelope: Any) -> str:
         except (TypeError, ValueError):
             return "sha256:"
     return "sha256:"
+
+
+def _aware_clock(now: datetime | None) -> datetime:
+    clock = now if now is not None else datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        raise ValueError("evaluate clock must be timezone-aware")
+    return clock.astimezone(timezone.utc)

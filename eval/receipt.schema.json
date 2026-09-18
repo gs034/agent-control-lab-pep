@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gs034/agent-control-lab-pep/eval/receipt.schema.json",
+  "title": "Agent Control Lab PEP attested receipt (frozen v1)",
+  "description": "Public deny/allow receipt. Keys and nested objects are frozen. Additive fields require a schema version bump and an ADR. Brand: Agent Control Lab. Licence: Apache-2.0.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "brand",
+    "decision",
+    "envelope_hash",
+    "eval_ref",
+    "fail_closed",
+    "judge",
+    "licence",
+    "negative_controls_observed",
+    "pep_id",
+    "policy_version",
+    "reason_code",
+    "reason_detail",
+    "receipt_type",
+    "timestamp",
+    "trust_domain"
+  ],
+  "properties": {
+    "brand": { "const": "Agent Control Lab" },
+    "decision": { "enum": ["ALLOW", "DENY"] },
+    "envelope_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "eval_ref": { "type": "string", "minLength": 1 },
+    "fail_closed": { "const": true },
+    "judge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_prose_used_as_policy",
+        "llm_cot_transcript_judge",
+        "path"
+      ],
+      "properties": {
+        "agent_prose_used_as_policy": { "const": false },
+        "llm_cot_transcript_judge": { "const": false },
+        "path": { "const": "host_runtime_deterministic" }
+      }
+    },
+    "licence": { "const": "Apache-2.0" },
+    "negative_controls_observed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "monitor_coax_accepted",
+        "policy_file_unchanged",
+        "tool_invoke_executed"
+      ],
+      "properties": {
+        "monitor_coax_accepted": { "const": false },
+        "policy_file_unchanged": { "type": "boolean" },
+        "tool_invoke_executed": { "type": "boolean" }
+      }
+    },
+    "pep_id": { "const": "acl-pep-stub-host-runtime-001" },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "reason_code": { "type": "string", "minLength": 1 },
+    "reason_detail": { "type": "string", "minLength": 1 },
+    "receipt_type": { "enum": ["pep_allow", "pep_deny"] },
+    "timestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "trust_domain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_monitor_mcp", "pep"],
+      "properties": {
+        "model_monitor_mcp": { "const": "untrusted_relative_to_pep" },
+        "pep": { "const": "host-runtime-separate" }
+      }
+    }
+  }
+}
