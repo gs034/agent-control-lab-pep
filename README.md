@@ -4,7 +4,7 @@
 
 The official eval row lives under `eval/` (Deep Research artefacts). The PEP loads `eval/structured_envelope.example.json` as the sole policy-relevant input. `eval/malicious_agent_prose.txt` is untrusted data and is never policy.
 
-**Architecture.** Callers (agent, optional monitor, HITL UI, or MCP/tool host) submit a structured invoke envelope to `pep.evaluate` / `pep.gated_invoke`. That function boundary *is* the PEP: frozen allowlist and capability bytes in the `pep` package decide ALLOW or DENY, emit a receipt, and on DENY never enter the tool. Model output, monitor scores, and agent prose sit outside this plane and cannot rewrite policy. Public threat model: [`docs/threat-model.md`](docs/threat-model.md). Reporting: [`SECURITY.md`](SECURITY.md).
+**Architecture.** Callers (agent, optional monitor, HITL UI, or MCP/tool host) submit a structured invoke envelope to `pep.evaluate` / `pep.gated_invoke`. That function boundary *is* the PEP: frozen allowlist and capability bytes in the `pep` package decide ALLOW or DENY, emit a receipt, and on DENY never enter the tool. Model output, monitor scores, and agent prose sit outside this plane and cannot rewrite policy. Public threat model: [`docs/threat-model.md`](docs/threat-model.md). Reporting: [`SECURITY.md`](SECURITY.md). Contributing / Lab-only keep-out: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## What this is
 
@@ -68,6 +68,8 @@ Public receipts match `eval/expected_deny_receipt.example.json`:
 | `eval/` | Deep Research row, envelope, prose, expected receipt |
 | `docs/threat-model.md` | Public host/runtime PEP threat model and control taxonomy |
 | `SECURITY.md` | Fail-closed default, trust domain, how to report issues |
+| `CONTRIBUTING.md` | Lab-only artefacts; reject commercial/bank paths and brand strings |
+| `scripts/lab_brand_wall.py` | Packed keep-out scan (`rg` over checkout, paths, refs) |
 
 ## Trust domain
 
