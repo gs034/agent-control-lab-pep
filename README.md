@@ -69,7 +69,8 @@ Public receipts match `eval/expected_deny_receipt.example.json`:
 | `docs/threat-model.md` | Public host/runtime PEP threat model and control taxonomy |
 | `SECURITY.md` | Fail-closed default, trust domain, how to report issues |
 | `CONTRIBUTING.md` | Lab-only artefacts; reject commercial/bank paths and brand strings |
-| `scripts/lab_brand_wall.py` | Packed keep-out scan (`rg` over checkout, paths, refs) |
+| `scripts/check_lab_only.sh` | Lab-only keep-out (`rg` over checkout, paths, refs) |
+| `scripts/lab_brand_wall.py` | Packed keep-out scan (stdlib fallback when `rg` is absent) |
 
 ## Trust domain
 
