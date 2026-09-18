@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Agent Control Lab contributors
-"""Static demo allowlist. Policy is frozen bytes; agents cannot rewrite it."""
+"""Static stub allowlist. Policy is frozen bytes; agents cannot rewrite it.
+
+Allowlist is ``echo.ping`` only (Agent Control Lab public stub). Envelope
+``policy_context`` is fixture metadata, not a policy rewrite channel.
+"""
 
 from __future__ import annotations
 
@@ -12,32 +16,37 @@ from typing import Any, Mapping
 
 from pep.canonical import canonical_bytes
 
+POLICY_ID = "acl-pep-stub-allowlist-v0"
+POLICY_VERSION = "0.1.0-stub"
+
 # Demo catalog only. Not a production control plane.
-# lab.echo is the sole allowlisted tool for the public stub.
-DEMO_POLICY_DOCUMENT: dict[str, Any] = {
-    "policy_id": "agent-control-lab.pep.demo.v0",
-    "version": 1,
-    "allowed_callers": ["lab.demo.agent"],
+STUB_POLICY_DOCUMENT: dict[str, Any] = {
+    "policy_id": POLICY_ID,
+    "policy_version": POLICY_VERSION,
+    "fail_closed": True,
     "allowed_tools": {
-        "lab.echo": {
+        "echo.ping": {
             "required_capability": "lab.cap.echo.demo",
             "args_schema": {
                 "type": "object",
                 "properties": {
                     "message": {"type": "string"},
+                    "argv": {"type": "array"},
+                    "cwd": {"type": "string"},
+                    "network": {"type": "boolean"},
+                    "env_allowlist": {"type": "array"},
                 },
-                "required": ["message"],
                 "additionalProperties": False,
             },
         }
     },
     "capability_tokens": {
         "lab.cap.echo.demo": {
-            "tools": ["lab.echo"],
+            "tools": ["echo.ping"],
             "expires_at": "2099-01-01T00:00:00+00:00",
         },
         "lab.cap.echo.expired": {
-            "tools": ["lab.echo"],
+            "tools": ["echo.ping"],
             "expires_at": "2020-01-01T00:00:00+00:00",
         },
     },
@@ -63,6 +72,11 @@ class PolicyStore:
         raw = b""
         return cls(raw_bytes=raw, digest=hashlib.sha256(raw).hexdigest(), document=MappingProxyType({}))
 
+    @property
+    def version(self) -> str:
+        value = self.document.get("policy_version", POLICY_VERSION)
+        return str(value) if value else POLICY_VERSION
+
     def current_digest(self) -> str:
         return hashlib.sha256(self.raw_bytes).hexdigest()
 
@@ -74,12 +88,6 @@ class PolicyStore:
         if not isinstance(tools, Mapping):
             return MappingProxyType({})
         return tools
-
-    def allowed_callers(self) -> frozenset[str]:
-        callers = self.document.get("allowed_callers", [])
-        if not isinstance(callers, (list, tuple)):
-            return frozenset()
-        return frozenset(str(c) for c in callers)
 
     def capability(self, token: str) -> Mapping[str, Any] | None:
         tokens = self.document.get("capability_tokens", {})
@@ -132,7 +140,7 @@ def args_match_schema(args: Mapping[str, Any], schema: Mapping[str, Any]) -> boo
         "integer": int,
         "boolean": bool,
         "object": Mapping,
-        "array": list,
+        "array": (list, tuple),
     }
     for key, val in args.items():
         spec = properties.get(key)
@@ -150,4 +158,4 @@ def args_match_schema(args: Mapping[str, Any], schema: Mapping[str, Any]) -> boo
     return True
 
 
-DEMO_POLICY = PolicyStore.from_document(DEMO_POLICY_DOCUMENT)
+DEMO_POLICY = PolicyStore.from_document(STUB_POLICY_DOCUMENT)

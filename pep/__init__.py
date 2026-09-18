@@ -12,6 +12,7 @@ from pep.evaluate import Decision, PepRuntime, evaluate
 from pep.gate import gated_invoke
 from pep.reasons import ReasonCode
 from pep.receipt import Receipt
+from pep.row import evaluate_official_row
 
 __all__ = [
     "Decision",
@@ -20,6 +21,7 @@ __all__ = [
     "ReasonCode",
     "Receipt",
     "evaluate",
+    "evaluate_official_row",
     "gated_invoke",
 ]
 

@@ -23,7 +23,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pyyaml>=6.0"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 pep-demo = "pep.demo:main"
@@ -32,10 +32,7 @@ pep-demo = "pep.demo:main"
 Homepage = "https://github.com/gs034/agent-control-lab-pep"
 
 [tool.setuptools.packages.find]
-include = ["pep", "evals"]
-
-[tool.setuptools.package-data]
-evals = ["rows/*.yaml"]
+include = ["pep"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
