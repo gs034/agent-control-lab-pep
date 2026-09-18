@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_python_sources_carry_spdx():
     paths = list((ROOT / "pep").glob("*.py")) + list((ROOT / "evals").rglob("*.py"))
     paths += list((ROOT / "tests").glob("*.py"))
+    paths += list((ROOT / "scripts").glob("*.py"))
     assert paths
     for path in paths:
         text = path.read_text(encoding="utf-8")

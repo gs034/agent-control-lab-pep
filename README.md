@@ -4,18 +4,19 @@
 
 The official eval row lives under `eval/` (Deep Research artefacts). The PEP loads `eval/structured_envelope.example.json` as the sole policy-relevant input. `eval/malicious_agent_prose.txt` is untrusted data and is never policy.
 
+**Architecture.** Callers (agent, optional monitor, HITL UI, or MCP/tool host) submit a structured invoke envelope to `pep.evaluate` / `pep.gated_invoke`. That function boundary *is* the PEP: frozen allowlist and capability bytes in the `pep` package decide ALLOW or DENY, emit a receipt, and on DENY never enter the tool. Model output, monitor scores, and agent prose sit outside this plane and cannot rewrite policy. Public threat model: [`docs/threat-model.md`](docs/threat-model.md). Reporting: [`SECURITY.md`](SECURITY.md). Contributing / Lab-only keep-out: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## What this is
 
 - A diligence-hard **reference host/runtime PEP** you can read in one sitting.
 - A distinct trust domain (`pep`) from any agent or monitor.
 - An existence-proof deny for the monitor-bypass / policy-rewrite-coax *class* inspired by [arXiv:2609.19587](https://arxiv.org/abs/2609.19587). Not a measured reproduction.
 
-## What this is not
+## Non-goals
 
-- Not a production control plane or shipping product.
-- Not “LLM monitor + HITL.” There is no model call on the evaluate path (see `pep/evaluate.py` and `tests/test_no_llm_path.py`).
-- Not a claim about vendor blocking classifiers.
-- Not a measured attack-success-rate result. This stub does not measure attack success.
+- **Not an LLM / CoT / transcript judge as enforcement.** There is no model call on the evaluate path (see `pep/evaluate.py` and `tests/test_no_llm_path.py`). A monitor “SAFE” coax is not an allow.
+- **Not production SaaS.** Not a multi-tenant control plane, shipping product, marketplace adapter, live git host, or production UI.
+- **Existence-proof stub only.** Demonstrates a host/runtime deny for one attack *class*. Not a measured attack-success-rate result and not a vendor-classifier claim. This stub does not measure attack success.
 
 ## Four PEP lines (demonstrated in code)
 
@@ -65,6 +66,11 @@ Public receipts match `eval/expected_deny_receipt.example.json`:
 | `pep/row.py` | Loader for `eval/` artefacts |
 | `pep/demo.py` | Prints the live official-row deny receipt |
 | `eval/` | Deep Research row, envelope, prose, expected receipt |
+| `docs/threat-model.md` | Public host/runtime PEP threat model and control taxonomy |
+| `SECURITY.md` | Fail-closed default, trust domain, how to report issues |
+| `CONTRIBUTING.md` | Lab-only artefacts; reject commercial/bank paths and brand strings |
+| `scripts/check_lab_only.sh` | Wrapper for the Lab-only keep-out (job `forbidden-tokens`) |
+| `scripts/lab_brand_wall.py` | Packed keep-out scan (stdlib Python; no ripgrep) |
 
 ## Trust domain
 

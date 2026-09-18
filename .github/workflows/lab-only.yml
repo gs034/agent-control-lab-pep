@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+name: lab-only
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  forbidden-tokens:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: forbidden-tokens
+        run: bash scripts/check_lab_only.sh
