@@ -1,6 +1,6 @@
 # ADR-0001 — Lab host/runtime PEP architecture
 
-- **Status:** Accepted (v0.2 foundation)
+- **Status:** Accepted (v0.3 / M1 corpus + durable halt)
 - **Date:** 2026-09-18
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
@@ -9,7 +9,7 @@
 
 This repository is a public-goods **host/runtime Policy Enforcement Point (PEP)**. Callers submit a structured invoke envelope. The PEP is the only allow authority for tool entry. The official `eval/` row is an existence-proof **DENY** for the monitor-bypass / policy-rewrite-coax *class* (inspiration: arXiv:2609.19587). It is not a measured attack-success-rate result.
 
-v0.2 freezes the architecture so later evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path (v1) do not relabel this plane as a model or monitor.
+v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same trust boundary.
 
 ## Decision
 
@@ -45,14 +45,14 @@ Missing policy, unknown tool, expired or missing capability, invalid/expired/con
 
 ### Kill and suspend
 
-Process-local runtime modes:
+Runtime modes:
 
 - **active** — evaluate proceeds.
 - **suspend** — every envelope DENY (`suspend_active`). `resume()` returns to active.
-- **kill** — every envelope DENY (`kill_active`). Irreversible in-process; `resume()` cannot clear a kill.
+- **kill** — every envelope DENY (`kill_active`). Irreversible; `resume()` cannot clear a kill.
 - **unavailable** — treated as kill (`kill_active`).
 
-Kill wins over suspend. These APIs are the v0.2 foundation for the v1 durable kill/suspend path.
+Kill wins over suspend. Process-local mode is the default. Optional `HaltStore` (JSON file) persists mode and availability so a new `PepRuntime` on the same path reloads the halt. Corrupt or unreadable store bytes fail closed to kill. Operator API stays capability language: kill, suspend, resume — not a product console.
 
 ### Attested receipts
 
@@ -62,9 +62,9 @@ Every decision emits a receipt that attests `decision`, `reason_code`, `envelope
 
 - Diligence readers can treat `pep/evaluate.py` as the enforcement plane, not a model-graded monitor.
 - Official `eval/` deny (`python -m pep.demo`) stays a fail-closed DENY with the frozen receipt shape (`policy_version` remains `0.1.0-stub` on that allowlist).
-- Package version `0.2.0` names the foundation (approval store, kill/suspend API, frozen receipt), not a production control plane.
-- EOI **M1** (evaluator corpus) adds rows under `eval/`; it does not move allow authority onto a model or monitor.
-- v1 may persist kill/suspend and approvals out of process; the grant and fail-closed rules above stay.
+- Package version `0.3.0` names the M1 corpus plus durable halt store, not a production control plane.
+- EOI **M1** (evaluator corpus) adds rows under `eval/corpus/`; the official demo row stays at `eval/` root. Allow authority does not move onto a model or monitor.
+- Approvals may later persist out of process; the grant and fail-closed rules above stay.
 
 ## Non-goals
 

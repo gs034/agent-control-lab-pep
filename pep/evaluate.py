@@ -21,6 +21,7 @@ from typing import Any, Literal, Mapping
 from pep.approval import ApprovalRecord, ApprovalStore
 from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
+from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore, args_match_schema, parse_expiry
 from pep.reasons import ReasonCode
 from pep.receipt import Receipt, issue_receipt
@@ -50,7 +51,11 @@ class Decision:
 
 
 class PepRuntime:
-    """Process-local PEP. Kill, suspend, and unavailability fail closed to DENY."""
+    """Host/runtime PEP. Kill, suspend, and unavailability fail closed to DENY.
+
+    ``halt_store`` is an optional JSON file so kill / suspend / unavailable
+    survive process restart. Process-local mode remains the default.
+    """
 
     def __init__(
         self,
@@ -59,11 +64,20 @@ class PepRuntime:
         kill_active: bool = False,
         available: bool = True,
         approvals: ApprovalStore | None = None,
+        halt_store: HaltStore | None = None,
     ) -> None:
         self._policy = policy if policy is not None else DEMO_POLICY
-        self._mode = RuntimeMode.KILLED if kill_active else RuntimeMode.ACTIVE
-        self.available = available
+        self._halt_store = halt_store
         self._approvals = approvals if approvals is not None else ApprovalStore()
+        persisted = halt_store.read() if halt_store is not None else HaltState(HaltMode.ACTIVE)
+        self.available = bool(available) and persisted.available
+        if kill_active or persisted.mode is HaltMode.KILLED:
+            self._mode = RuntimeMode.KILLED
+        elif persisted.mode is HaltMode.SUSPENDED:
+            self._mode = RuntimeMode.SUSPENDED
+        else:
+            self._mode = RuntimeMode.ACTIVE
+        self._persist_halt()
 
     @property
     def policy(self) -> PolicyStore:
@@ -72,6 +86,10 @@ class PepRuntime:
     @property
     def approvals(self) -> ApprovalStore:
         return self._approvals
+
+    @property
+    def halt_store(self) -> HaltStore | None:
+        return self._halt_store
 
     @property
     def mode(self) -> RuntimeMode:
@@ -84,15 +102,16 @@ class PepRuntime:
     @kill_active.setter
     def kill_active(self, value: bool) -> None:
         if value:
-            self._mode = RuntimeMode.KILLED
+            self.kill()
 
     @property
     def suspend_active(self) -> bool:
         return self._mode is RuntimeMode.SUSPENDED
 
     def kill(self) -> None:
-        """Irreversible in-process halt. ``resume`` cannot clear a kill."""
+        """Irreversible halt. ``resume`` cannot clear a kill."""
         self._mode = RuntimeMode.KILLED
+        self._persist_halt()
 
     def activate_kill(self) -> None:
         self.kill()
@@ -102,14 +121,34 @@ class PepRuntime:
         if self._mode is RuntimeMode.KILLED:
             return
         self._mode = RuntimeMode.SUSPENDED
+        self._persist_halt()
 
     def resume(self) -> None:
         """Clear suspend only. A killed PEP stays killed."""
         if self._mode is RuntimeMode.SUSPENDED:
             self._mode = RuntimeMode.ACTIVE
+            self._persist_halt()
 
     def mark_unavailable(self) -> None:
         self.available = False
+        self._persist_halt()
+
+    def _persist_halt(self) -> None:
+        store = self._halt_store
+        if store is None:
+            return
+        requested = HaltState(
+            mode=_mode_to_halt(self._mode),
+            available=self.available,
+        )
+        try:
+            written = store.write(requested)
+        except HaltStoreError:
+            # Persist failed. Stay fail-closed in this process (already killed
+            # or suspended in memory). Next process may miss the write.
+            return
+        self._mode = _halt_to_mode(written.mode)
+        self.available = written.available
 
     def issue_approval(
         self,
@@ -312,6 +351,22 @@ def _capability_deny(
     if required_cap and token != required_cap:
         return ReasonCode.POLICY_MISS, "capability token does not match tool policy"
     return None
+
+
+def _mode_to_halt(mode: RuntimeMode) -> HaltMode:
+    if mode is RuntimeMode.KILLED:
+        return HaltMode.KILLED
+    if mode is RuntimeMode.SUSPENDED:
+        return HaltMode.SUSPENDED
+    return HaltMode.ACTIVE
+
+
+def _halt_to_mode(mode: HaltMode) -> RuntimeMode:
+    if mode is HaltMode.KILLED:
+        return RuntimeMode.KILLED
+    if mode is HaltMode.SUSPENDED:
+        return RuntimeMode.SUSPENDED
+    return RuntimeMode.ACTIVE
 
 
 _DEFAULT_RUNTIME = PepRuntime()

@@ -5,9 +5,10 @@
 Artefacts on main (do not invent a parallel layout):
 
 - eval/ACL_PEP_Eval_Row_2609_19587_class_2026-09-18.md
-- eval/structured_envelope.example.json   (sole policy-relevant PEP input)
+- eval/structured_envelope.example.json   (official-row policy-relevant input)
 - eval/malicious_agent_prose.txt          (untrusted data only; never policy)
 - eval/expected_deny_receipt.example.json
+- eval/corpus/                            (M1 rows; same evaluate() path)
 """
 
 from __future__ import annotations

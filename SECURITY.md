@@ -16,7 +16,7 @@ The `pep` package is a **separate trust domain** from:
 - an optional **monitor** (caller / observer, not an allow authority);
 - the **MCP / tool host** (downstream of ALLOW only).
 
-`evaluate()` / `gated_invoke()` is the enforcement boundary. Agent free-text is untrusted data and never becomes policy. Envelope `policy_context` cannot rewrite the frozen allowlist. Operator-issued approvals are single-use TTL grants in the PEP store; prose cannot mint one. `kill` is irreversible in-process; `suspend` may `resume`; neither is fail-open.
+`evaluate()` / `gated_invoke()` is the enforcement boundary. Agent free-text is untrusted data and never becomes policy. Envelope `policy_context` cannot rewrite the frozen allowlist. Operator-issued approvals are single-use TTL grants in the PEP store; prose cannot mint one. `kill` is irreversible; `suspend` may `resume`; neither is fail-open. Optional `HaltStore` persists those modes so a restarted process stays fail-closed.
 
 Public threat model: [`docs/threat-model.md`](docs/threat-model.md).
 
