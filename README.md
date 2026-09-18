@@ -1,6 +1,6 @@
 # Agent Control Lab — reference host/runtime PEP stub
 
-**BLUF:** This repository is a public-goods, Apache-2.0 **reference Policy Enforcement Point (PEP)** stub from **Agent Control Lab** (Navigators / philanthropic AI-control). It is an existence-proof **host/runtime deny path** over structured invoke envelopes. It is **not** a production product, **not** an LLM/CoT/transcript judge, and **not** a human-in-the-loop enforcement path.
+This repository is a public-goods, Apache-2.0 **reference Policy Enforcement Point (PEP)** stub from **Agent Control Lab** (Navigators / philanthropic AI-control). It is an existence-proof **host/runtime deny path** over structured invoke envelopes. It is **not** a production product, **not** an LLM/CoT/transcript judge, and **not** a human-in-the-loop enforcement path.
 
 The official eval row lives under `eval/` (Deep Research artefacts). The PEP loads `eval/structured_envelope.example.json` as the sole policy-relevant input. `eval/malicious_agent_prose.txt` is untrusted data and is never policy.
 
