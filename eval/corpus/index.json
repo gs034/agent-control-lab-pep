@@ -44,6 +44,14 @@
       "runtime": "corpus/kill/runtime.json"
     },
     {
+      "id": "acl-pep-eval-late-effect-fence-001",
+      "class": "late_effect_fence",
+      "expected_decision": "DENY",
+      "envelope": "corpus/late_effect_fence/envelope.json",
+      "expected_receipt": "corpus/late_effect_fence/expected_receipt.json",
+      "runtime": "corpus/late_effect_fence/runtime.json"
+    },
+    {
       "id": "acl-pep-eval-suspend-001",
       "class": "kill_suspend",
       "expected_decision": "DENY",

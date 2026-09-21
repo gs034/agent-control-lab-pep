@@ -14,6 +14,7 @@ to a frozen invoke (tool_name + canonical args).
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -24,7 +25,7 @@ from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore, args_match_schema, parse_expiry
-from pep.reasons import ReasonCode
+from pep.reasons import LATE_EFFECT_FENCE_DETAIL, ReasonCode
 from pep.receipt import Receipt, issue_receipt
 
 
@@ -56,6 +57,10 @@ class PepRuntime:
 
     ``halt_store`` is an optional JSON file so kill / suspend / unavailable
     survive process restart. Process-local mode remains the default.
+
+    ``kill()`` also engages an in-process late-effect fence: a monotonic cut
+    epoch. Admissions taken before the cut must not enter a tool after it.
+    The epoch is process-local. It is not a field in ``HaltStore``.
     """
 
     def __init__(
@@ -67,6 +72,9 @@ class PepRuntime:
         approvals: ApprovalStore | None = None,
         halt_store: HaltStore | None = None,
     ) -> None:
+        self._lock = threading.Lock()
+        self._fence_epoch = 0
+        self._fence_engaged = False
         self._policy = policy if policy is not None else DEMO_POLICY
         self._halt_store = halt_store
         self._approvals = approvals if approvals is not None else ApprovalStore()
@@ -74,6 +82,7 @@ class PepRuntime:
         self.available = bool(available) and persisted.available
         if kill_active or persisted.mode is HaltMode.KILLED:
             self._mode = RuntimeMode.KILLED
+            self._engage_fence_unlocked()
         elif persisted.mode is HaltMode.SUSPENDED:
             self._mode = RuntimeMode.SUSPENDED
         else:
@@ -94,11 +103,25 @@ class PepRuntime:
 
     @property
     def mode(self) -> RuntimeMode:
-        return self._mode
+        with self._lock:
+            return self._mode
+
+    @property
+    def fence_epoch(self) -> int:
+        """Cut generation. ``kill()`` bumps this once when the fence engages."""
+        with self._lock:
+            return self._fence_epoch
+
+    @property
+    def fence_engaged(self) -> bool:
+        """True after a kill cut. Resume cannot clear it."""
+        with self._lock:
+            return self._fence_engaged
 
     @property
     def kill_active(self) -> bool:
-        return self._mode is RuntimeMode.KILLED
+        with self._lock:
+            return self._mode is RuntimeMode.KILLED
 
     @kill_active.setter
     def kill_active(self, value: bool) -> None:
@@ -107,32 +130,69 @@ class PepRuntime:
 
     @property
     def suspend_active(self) -> bool:
-        return self._mode is RuntimeMode.SUSPENDED
+        with self._lock:
+            return self._mode is RuntimeMode.SUSPENDED
 
     def kill(self) -> None:
-        """Irreversible halt. ``resume`` cannot clear a kill."""
-        self._mode = RuntimeMode.KILLED
-        self._persist_halt()
+        """Irreversible halt plus in-process late-effect fence.
+
+        New evaluates deny as ``kill_active``. An admission that completes
+        after this cut denies as ``late_effect_fence`` and does not enter
+        the tool. ``resume`` cannot clear either.
+        """
+        with self._lock:
+            self._engage_fence_unlocked()
+            self._mode = RuntimeMode.KILLED
+            self._persist_halt()
+
+    def _engage_fence_unlocked(self) -> None:
+        if self._fence_engaged:
+            return
+        self._fence_engaged = True
+        self._fence_epoch += 1
+
+    def _observe(self) -> tuple[RuntimeMode, bool, int]:
+        with self._lock:
+            return self._mode, self.available, self._fence_epoch
+
+    def completion_block(self, admitted_epoch: int) -> ReasonCode | None:
+        """Reason to refuse tool entry for an admission, or None to proceed.
+
+        A stale epoch after the kill cut is ``late_effect_fence`` (cut+fence),
+        not merely ``kill_active``. Fresh post-kill evaluates never reach
+        this with an ALLOW decision; they deny at the start of ``evaluate``.
+        """
+        with self._lock:
+            if self._fence_engaged and admitted_epoch != self._fence_epoch:
+                return ReasonCode.LATE_EFFECT_FENCE
+            if (not self.available) or self._mode is RuntimeMode.KILLED:
+                return ReasonCode.KILL_ACTIVE
+            if self._mode is RuntimeMode.SUSPENDED:
+                return ReasonCode.SUSPEND_ACTIVE
+            return None
 
     def activate_kill(self) -> None:
         self.kill()
 
     def suspend(self) -> None:
         """Reversible halt. No-op when already killed (kill wins)."""
-        if self._mode is RuntimeMode.KILLED:
-            return
-        self._mode = RuntimeMode.SUSPENDED
-        self._persist_halt()
+        with self._lock:
+            if self._mode is RuntimeMode.KILLED:
+                return
+            self._mode = RuntimeMode.SUSPENDED
+            self._persist_halt()
 
     def resume(self) -> None:
         """Clear suspend only. A killed PEP stays killed."""
-        if self._mode is RuntimeMode.SUSPENDED:
-            self._mode = RuntimeMode.ACTIVE
-            self._persist_halt()
+        with self._lock:
+            if self._mode is RuntimeMode.SUSPENDED:
+                self._mode = RuntimeMode.ACTIVE
+                self._persist_halt()
 
     def mark_unavailable(self) -> None:
-        self.available = False
-        self._persist_halt()
+        with self._lock:
+            self.available = False
+            self._persist_halt()
 
     def _persist_halt(self) -> None:
         store = self._halt_store
@@ -150,6 +210,10 @@ class PepRuntime:
             return
         self._mode = _halt_to_mode(written.mode)
         self.available = written.available
+        if self._mode is RuntimeMode.KILLED:
+            # Sticky kill learned from the store is the same cut: fence
+            # admissions already taken in this process.
+            self._engage_fence_unlocked()
 
     def issue_approval(
         self,
@@ -187,18 +251,19 @@ class PepRuntime:
         env_hash = _envelope_hash(envelope)
         version = policy.version if policy.document else POLICY_VERSION
 
-        if (not self.available) or self._mode is RuntimeMode.KILLED:
+        observed_mode, observed_available, admitted_epoch = self._observe()
+        if (not observed_available) or observed_mode is RuntimeMode.KILLED:
             return _deny(
                 ReasonCode.KILL_ACTIVE,
-                "PEP kill active or PEP unavailable; fail-closed deny, no invoke",
+                _KILL_DETAIL,
                 env_hash,
                 version,
                 unchanged,
             )
-        if self._mode is RuntimeMode.SUSPENDED:
+        if observed_mode is RuntimeMode.SUSPENDED:
             return _deny(
                 ReasonCode.SUSPEND_ACTIVE,
-                "PEP suspend active; fail-closed deny, no invoke",
+                _SUSPEND_DETAIL,
                 env_hash,
                 version,
                 unchanged,
@@ -318,6 +383,17 @@ class PepRuntime:
                     policy.bytes_unchanged(),
                 )
 
+        # Kill during evaluation must not publish ALLOW. Stale epoch → fence.
+        blocked = self.completion_block(admitted_epoch)
+        if blocked is not None:
+            return _deny(
+                blocked,
+                _reason_detail(blocked),
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
+            )
+
         receipt = issue_receipt(
             decision="ALLOW",
             reason_code=ReasonCode.ALLOWED,
@@ -375,6 +451,11 @@ def _halt_to_mode(mode: HaltMode) -> RuntimeMode:
 _DEFAULT_RUNTIME = PepRuntime()
 
 
+def resolve_runtime(runtime: PepRuntime | None) -> PepRuntime:
+    """Return ``runtime`` or the process-default PEP. One object, so kill fences it."""
+    return runtime if runtime is not None else _DEFAULT_RUNTIME
+
+
 def evaluate(
     envelope: Any,
     runtime: PepRuntime | None = None,
@@ -382,8 +463,32 @@ def evaluate(
     now: datetime | None = None,
 ) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""
-    pep = runtime if runtime is not None else _DEFAULT_RUNTIME
+    pep = resolve_runtime(runtime)
     return pep.evaluate(envelope, now=now)
+
+
+def supersede(decision: Decision, reason: ReasonCode) -> Decision:
+    """Fail-closed replacement for an admission. Same frozen receipt schema."""
+    receipt = decision.receipt
+    return _deny(
+        reason,
+        _reason_detail(reason),
+        receipt.envelope_hash,
+        receipt.policy_version,
+        receipt.policy_file_unchanged,
+    )
+
+
+_KILL_DETAIL = "PEP kill active or PEP unavailable; fail-closed deny, no invoke"
+_SUSPEND_DETAIL = "PEP suspend active; fail-closed deny, no invoke"
+
+
+def _reason_detail(reason: ReasonCode) -> str:
+    if reason is ReasonCode.LATE_EFFECT_FENCE:
+        return LATE_EFFECT_FENCE_DETAIL
+    if reason is ReasonCode.SUSPEND_ACTIVE:
+        return _SUSPEND_DETAIL
+    return _KILL_DETAIL
 
 
 def _deny(
