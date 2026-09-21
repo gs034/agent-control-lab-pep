@@ -61,14 +61,14 @@ Same PEP trust domain. `kill()` must fence late effects, not only flip the halt 
 | Work | Status |
 | --- | --- |
 | `kill()` engages an in-process cut epoch (fence) as well as mode `killed` | In tree |
-| `begin_invoke` / `complete_invoke`; `gated_invoke` re-checks before tool entry | In tree |
+| `begin_invoke` / `complete_invoke`; one-shot entry permit under the runtime lock before `tool()`; replay DENY `admission_consumed` | In tree |
 | Pre-cut admission completed after kill → DENY `late_effect_fence` (`cut+fence` in the detail). No tool entry | In tree |
 | Fresh post-kill evaluate stays `kill_active` | In tree |
 | Corpus row `eval/corpus/late_effect_fence/` and `python -m pep.demo --late-effect-fence` | In tree |
 | Receipt schema stays frozen v1 (no new fields) | Required invariant |
 | Official `python -m pep.demo` DENY unchanged | Required invariant |
 
-Still open on this patch: a tool body already entered is not preempted or rolled back; a process-external callback that skips `complete_invoke` is outside the trust domain; `HaltStore` does not reconstruct another process’s admissions (reload denies new work as `kill_active` only).
+Still open on this patch: once `tool()` has started, that call is not preempted or rolled back; a process-external callback that skips `complete_invoke` is outside the trust domain; `HaltStore` does not reconstruct another process’s admissions (reload denies new work as `kill_active` only).
 
 ## Remaining v1 notes
 

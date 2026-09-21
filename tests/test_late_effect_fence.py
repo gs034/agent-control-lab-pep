@@ -156,6 +156,94 @@ def test_cross_thread_callback_after_kill_is_fenced():
     assert called["n"] == 0
 
 
+def test_kill_between_fence_check_and_tool_entry_denies():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    pending = begin_invoke(_valid(), runtime=runtime)
+    assert pending.decision.verdict == "ALLOW"
+    at_gap = threading.Event()
+    cut_done = threading.Event()
+    called, boom = _boom_factory()
+    box: list[tuple] = []
+
+    def before_commit():
+        at_gap.set()
+        assert cut_done.wait(2)
+
+    def worker():
+        box.append(complete_invoke(pending, boom, _before_commit=before_commit))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert at_gap.wait(2)
+    runtime.kill()
+    cut_done.set()
+    thread.join(2)
+    assert thread.is_alive() is False
+    decision, result = box[0]
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.LATE_EFFECT_FENCE
+    assert "cut+fence" in decision.receipt.reason_detail
+    assert result is None
+    assert called["n"] == 0
+
+
+def test_second_complete_denies_and_enters_at_most_once():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    pending = begin_invoke(_valid(), runtime=runtime)
+    called, boom = _boom_factory()
+    first, first_result = complete_invoke(pending, boom)
+    second, second_result = complete_invoke(pending, boom)
+    assert first.verdict == "ALLOW"
+    assert first_result == "entered"
+    assert second.verdict == "DENY"
+    assert second.receipt.reason_code == ReasonCode.ADMISSION_CONSUMED
+    assert second_result is None
+    assert called["n"] == 1
+    payload = second.to_dict()
+    validate_receipt(payload)
+    assert payload["negative_controls_observed"]["tool_invoke_executed"] is False
+
+
+def test_replay_while_tool_is_running_does_not_enter_again():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    pending = begin_invoke(_valid(), runtime=runtime)
+    in_tool = threading.Event()
+    release_tool = threading.Event()
+    calls = {"n": 0}
+    box: list[tuple] = []
+
+    def tool():
+        calls["n"] += 1
+        in_tool.set()
+        assert release_tool.wait(2)
+        return "entered"
+
+    def worker():
+        box.append(complete_invoke(pending, tool))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert in_tool.wait(2)
+    replay_calls = {"n": 0}
+
+    def replay_tool():
+        replay_calls["n"] += 1
+        return "again"
+
+    second, second_result = complete_invoke(pending, replay_tool)
+    assert second.verdict == "DENY"
+    assert second.receipt.reason_code == ReasonCode.ADMISSION_CONSUMED
+    assert second_result is None
+    assert replay_calls["n"] == 0
+    release_tool.set()
+    thread.join(2)
+    assert thread.is_alive() is False
+    first, first_result = box[0]
+    assert first.verdict == "ALLOW"
+    assert first_result == "entered"
+    assert calls["n"] == 1
+
+
 def test_exercised_demo_prints_fence_deny(capsys):
     decision, invoked = exercise_late_effect_fence()
     assert decision.verdict == "DENY"

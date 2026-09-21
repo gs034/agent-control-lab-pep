@@ -15,6 +15,7 @@ to a frozen invoke (tool_name + canonical args).
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -25,7 +26,7 @@ from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore, args_match_schema, parse_expiry
-from pep.reasons import LATE_EFFECT_FENCE_DETAIL, ReasonCode
+from pep.reasons import ADMISSION_CONSUMED_DETAIL, LATE_EFFECT_FENCE_DETAIL, ReasonCode
 from pep.receipt import Receipt, issue_receipt
 
 
@@ -75,6 +76,8 @@ class PepRuntime:
         self._lock = threading.Lock()
         self._fence_epoch = 0
         self._fence_engaged = False
+        self._next_admission_id = 0
+        self._spent_admissions: set[int] = set()
         self._policy = policy if policy is not None else DEMO_POLICY
         self._halt_store = halt_store
         self._approvals = approvals if approvals is not None else ApprovalStore()
@@ -155,21 +158,77 @@ class PepRuntime:
         with self._lock:
             return self._mode, self.available, self._fence_epoch
 
+    def mint_admission_id(self) -> int:
+        """One-shot id for an in-process admission. Not an allow."""
+        with self._lock:
+            self._next_admission_id += 1
+            return self._next_admission_id
+
+    def _entry_block_unlocked(self, admitted_epoch: int) -> ReasonCode | None:
+        if self._fence_engaged and admitted_epoch != self._fence_epoch:
+            return ReasonCode.LATE_EFFECT_FENCE
+        if (not self.available) or self._mode is RuntimeMode.KILLED:
+            return ReasonCode.KILL_ACTIVE
+        if self._mode is RuntimeMode.SUSPENDED:
+            return ReasonCode.SUSPEND_ACTIVE
+        return None
+
     def completion_block(self, admitted_epoch: int) -> ReasonCode | None:
-        """Reason to refuse tool entry for an admission, or None to proceed.
+        """Non-binding observation. Tool entry uses ``claim_entry`` instead.
 
         A stale epoch after the kill cut is ``late_effect_fence`` (cut+fence),
-        not merely ``kill_active``. Fresh post-kill evaluates never reach
-        this with an ALLOW decision; they deny at the start of ``evaluate``.
+        not merely ``kill_active``. This read releases the lock; it is not a
+        permit to call a tool.
         """
         with self._lock:
-            if self._fence_engaged and admitted_epoch != self._fence_epoch:
-                return ReasonCode.LATE_EFFECT_FENCE
-            if (not self.available) or self._mode is RuntimeMode.KILLED:
-                return ReasonCode.KILL_ACTIVE
-            if self._mode is RuntimeMode.SUSPENDED:
-                return ReasonCode.SUSPEND_ACTIVE
-            return None
+            return self._entry_block_unlocked(admitted_epoch)
+
+    def _claim_entry_unlocked(self, admission_id: int, admitted_epoch: int) -> ReasonCode | None:
+        """Spend the ticket or refuse. Caller holds ``self._lock``."""
+        if admission_id in self._spent_admissions:
+            return ReasonCode.ADMISSION_CONSUMED
+        blocked = self._entry_block_unlocked(admitted_epoch)
+        if blocked is not None:
+            # Suspend is reversible, so the ticket stays open across resume.
+            # Kill, unavailability, and a stale cut epoch spend it.
+            if blocked is not ReasonCode.SUSPEND_ACTIVE:
+                self._spent_admissions.add(admission_id)
+            return blocked
+        self._spent_admissions.add(admission_id)
+        return None
+
+    def claim_entry(
+        self,
+        admission_id: int,
+        admitted_epoch: int,
+        *,
+        _before_commit: Callable[[], None] | None = None,
+    ) -> ReasonCode | None:
+        """Issue a one-shot entry permit, or a fail-closed deny reason.
+
+        Under the runtime lock this either records the admission as entered
+        or refuses it. ``None`` means the permit was stored before the lock
+        was released; the caller may then invoke the tool. ``kill()`` takes
+        the same lock and will not issue a new permit after the cut.
+
+        ``_before_commit``, when passed, runs only after an observation that
+        the fence was open, and only with the lock released. The permit is
+        decided again under the lock after it returns. Production callers
+        omit it. Once the caller has entered ``tool()``, kill does not
+        preempt that call.
+        """
+        if _before_commit is None:
+            with self._lock:
+                return self._claim_entry_unlocked(admission_id, admitted_epoch)
+        with self._lock:
+            if (
+                admission_id in self._spent_admissions
+                or self._entry_block_unlocked(admitted_epoch) is not None
+            ):
+                return self._claim_entry_unlocked(admission_id, admitted_epoch)
+        _before_commit()
+        with self._lock:
+            return self._claim_entry_unlocked(admission_id, admitted_epoch)
 
     def activate_kill(self) -> None:
         self.kill()
@@ -486,6 +545,8 @@ _SUSPEND_DETAIL = "PEP suspend active; fail-closed deny, no invoke"
 def _reason_detail(reason: ReasonCode) -> str:
     if reason is ReasonCode.LATE_EFFECT_FENCE:
         return LATE_EFFECT_FENCE_DETAIL
+    if reason is ReasonCode.ADMISSION_CONSUMED:
+        return ADMISSION_CONSUMED_DETAIL
     if reason is ReasonCode.SUSPEND_ACTIVE:
         return _SUSPEND_DETAIL
     return _KILL_DETAIL

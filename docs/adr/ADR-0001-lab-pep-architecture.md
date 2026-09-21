@@ -63,9 +63,10 @@ Kill wins over suspend. Process-local mode is the default. Optional `HaltStore` 
 | New `evaluate` / `gated_invoke` after the cut | DENY `kill_active`. No tool entry. |
 | `begin_invoke` before the cut, `complete_invoke` after it (queue or callback) | DENY `late_effect_fence`. No tool entry. |
 | `kill()` during `evaluate`, before ALLOW is returned | DENY `late_effect_fence` if the admission epoch is already stale. |
-| `complete_invoke` with no kill | Tool runs only when the admission was ALLOW. |
+| `complete_invoke` with no kill | Tool runs only when the admission was ALLOW and `claim_entry` recorded a one-shot permit under the runtime lock before the call. |
+| Second `complete_invoke` on that same admission | DENY `admission_consumed`. The tool is entered at most once. |
 
-`gated_invoke` is begin then complete, so the check before tool entry is the same fence. `HaltStore` does not store the epoch. A restarted process denies new work as `kill_active`. It does not rebuild another process’s queue.
+`gated_invoke` is begin then complete, so tool entry uses the same permit. The fence check and the permit are one locked transition: `kill()` cannot grant a permit after the cut, and a replay cannot take a second permit. `HaltStore` does not store the epoch or the ticket. A restarted process denies new work as `kill_active`. It does not rebuild another process’s queue.
 
 This is an existence-proof control for the authorization-revocation / quiescence class ([arXiv:2609.21284](https://arxiv.org/abs/2609.21284); not a measured attack-success-rate claim). It does not preempt a tool body that has already been entered, and it does not fence a process-external callback that never re-enters `complete_invoke`.
 

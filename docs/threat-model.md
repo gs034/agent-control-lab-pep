@@ -69,7 +69,7 @@ Every control below ends in **DENY + receipt** and, when callers use `gated_invo
 | Single-use TTL approval | Operator-minted grant consumed on first ALLOW of the frozen invoke. Replay / expiry / unknown / uncovered tool / args substitution deny. Does not unlock tools outside the catalog. | `approval_invalid`, `approval_expired`, `approval_consumed`, `approval_binding_mismatch` |
 | Policy present and readable | Empty store, unreadable spec, or missing schema → deny. | `policy_miss` |
 | Kill / unavailable | `kill()` or `available=false` denies even an otherwise allowlisted envelope. Resume cannot clear a kill. Durable store reloads the same deny after restart. | `kill_active` |
-| Late-effect fence | `kill()` bumps an in-process cut epoch. `begin_invoke` admits without entering a tool. `complete_invoke` (and `gated_invoke`, which is begin then complete) refuses entry when that epoch is stale. Corpus row `acl-pep-eval-late-effect-fence-001` and `python -m pep.demo --late-effect-fence` exercise the deny. | `late_effect_fence` |
+| Late-effect fence | `kill()` bumps an in-process cut epoch and refuses new entry permits. `begin_invoke` admits without entering a tool. `complete_invoke` (and `gated_invoke`) records a one-shot permit under the runtime lock, then calls the tool only if that permit was issued. A stale epoch is DENY `late_effect_fence`. A second complete on the same admission is DENY `admission_consumed`. Corpus row `acl-pep-eval-late-effect-fence-001` and `python -m pep.demo --late-effect-fence` exercise the cut. | `late_effect_fence`, `admission_consumed` |
 | Suspend | `suspend()` denies every envelope until `resume()`. Persisted suspend reloads as `suspend_active`. A suspend between admit and complete does not enter the tool. | `suspend_active` |
 | Parse / type failure | Null, bad JSON, malformed ids, non-object args. | `envelope_invalid` |
 | Gate | `gated_invoke` calls the tool only after `allowed()`. Bypass of the helper is outside this trust domain. | (no invoke on DENY) |
@@ -85,7 +85,7 @@ This document and this repository do **not** claim:
 - Marketplace adapters, live git hosts, or a production UI.
 - Measured attack-success-rate, classifier quality, or paper-figure reproduction.
 - That callers who skip `gated_invoke` / `complete_invoke` are still enforced (they are outside the PEP boundary).
-- Preemption or rollback of a callable that has already been entered when `kill()` arrives. The fence refuses entry; it does not unwind a tool body that is already running.
+- Preemption or rollback of a callable that has already been entered when `kill()` arrives. The entry permit is recorded under the runtime lock before `tool()` is called. Once that call has started, the fence does not unwind it.
 - Process-external provider callbacks that perform the effect without re-entering `complete_invoke`. Another process’s in-memory admissions are not reconstructed. `HaltStore` reload still denies **new** evaluates as `kill_active` only.
 - Root-scoped quiescence across delegated providers, provider-local fences, or a cross-process cut certificate. This stub’s fence is the in-process epoch on `PepRuntime`.
 - Confidentiality of policy bytes against a hostile process that can write the PEP’s memory or disk.
