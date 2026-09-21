@@ -97,3 +97,7 @@ A hostile reviewer reading `pep/evaluate.py` should not be able to relabel this 
 Apache License 2.0. See `LICENSE`. Source files carry `SPDX-License-Identifier: Apache-2.0`.
 
 **Brand:** Agent Control Lab. Public-goods / Navigators / philanthropic AI-control reference. Not a commercial product.
+
+## Diligence history
+
+See [`docs/DILIGENCE-HISTORY.md`](docs/DILIGENCE-HISTORY.md) for disclosed residual historical GitHub PR-ref tokens (tip trees remain Lab-clean).
