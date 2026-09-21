@@ -88,6 +88,7 @@ This document and this repository do **not** claim:
 - Preemption or rollback of a callable that has already been entered when `kill()` arrives. The entry permit is recorded under the runtime lock before `tool()` is called. Once that call has started, the fence does not unwind it.
 - Process-external provider callbacks that perform the effect without re-entering `complete_invoke`. Another process’s in-memory admissions are not reconstructed. `HaltStore` reload still denies **new** evaluates as `kill_active` only.
 - Root-scoped quiescence across delegated providers, provider-local fences, or a cross-process cut certificate. This stub’s fence is the in-process epoch on `PepRuntime`.
+- Reordering approval consume against a later suspend or kill deny. A grant can be spent and the decision still DENY, with no ALLOW. `_spent_admissions` is also unbounded for the life of the process.
 - Confidentiality of policy bytes against a hostile process that can write the PEP’s memory or disk.
 - A complete MCP, model, or monitor threat model — those planes are untrusted *inputs* here, not assets this stub defends as a platform.
 

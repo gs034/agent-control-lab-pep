@@ -293,7 +293,13 @@ class PepRuntime:
             catalog=self._policy.allowed_tools(),
         )
 
-    def evaluate(self, envelope: Any, *, now: datetime | None = None) -> Decision:
+    def evaluate(
+        self,
+        envelope: Any,
+        *,
+        now: datetime | None = None,
+        _before_allow: Callable[[], None] | None = None,
+    ) -> Decision:
         try:
             clock = _aware_clock(now)
         except (TypeError, ValueError):
@@ -442,26 +448,56 @@ class PepRuntime:
                     policy.bytes_unchanged(),
                 )
 
-        # Kill during evaluation must not publish ALLOW. Stale epoch → fence.
-        blocked = self.completion_block(admitted_epoch)
-        if blocked is not None:
-            return _deny(
-                blocked,
-                _reason_detail(blocked),
-                env_hash,
-                version,
-                policy.bytes_unchanged(),
-            )
-
-        receipt = issue_receipt(
-            decision="ALLOW",
-            reason_code=ReasonCode.ALLOWED,
-            reason_detail="structured envelope matched static allowlist",
+        return self._finalize_allow(
+            admitted_epoch,
             envelope_hash=env_hash,
             policy_version=version,
             policy_file_unchanged=policy.bytes_unchanged(),
+            _before_allow=_before_allow,
         )
-        return Decision(receipt)
+
+    def _finalize_allow(
+        self,
+        admitted_epoch: int,
+        *,
+        envelope_hash: str,
+        policy_version: str,
+        policy_file_unchanged: bool,
+        _before_allow: Callable[[], None] | None = None,
+    ) -> Decision:
+        """Publish ALLOW only if the cut is still open, under the runtime lock.
+
+        The fence re-check and the ALLOW ``Decision`` are one critical section.
+        ``kill()`` cannot land between them. ``_before_allow`` yields only after
+        an observation that the cut was open, with the lock released; the
+        decision is taken again under the lock after it returns. An ALLOW
+        object is not a tool-entry permit; ``claim_entry`` still gates that.
+        """
+        if _before_allow is not None:
+            with self._lock:
+                still_open = self._entry_block_unlocked(admitted_epoch) is None
+            if still_open:
+                _before_allow()
+        with self._lock:
+            blocked = self._entry_block_unlocked(admitted_epoch)
+            if blocked is not None:
+                return _deny(
+                    blocked,
+                    _reason_detail(blocked),
+                    envelope_hash,
+                    policy_version,
+                    policy_file_unchanged,
+                )
+            return Decision(
+                issue_receipt(
+                    decision="ALLOW",
+                    reason_code=ReasonCode.ALLOWED,
+                    reason_detail="structured envelope matched static allowlist",
+                    envelope_hash=envelope_hash,
+                    policy_version=policy_version,
+                    policy_file_unchanged=policy_file_unchanged,
+                )
+            )
 
 
 def _capability_deny(
@@ -520,10 +556,11 @@ def evaluate(
     runtime: PepRuntime | None = None,
     *,
     now: datetime | None = None,
+    _before_allow: Callable[[], None] | None = None,
 ) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""
     pep = resolve_runtime(runtime)
-    return pep.evaluate(envelope, now=now)
+    return pep.evaluate(envelope, now=now, _before_allow=_before_allow)
 
 
 def supersede(decision: Decision, reason: ReasonCode) -> Decision:

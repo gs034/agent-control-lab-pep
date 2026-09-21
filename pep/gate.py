@@ -91,6 +91,7 @@ def complete_invoke(
     )
     if blocked is not None:
         return supersede(decision, blocked), None
+    # One-shot ticket was spent in claim_entry before this call. Replay denies.
     return decision, tool()
 
 

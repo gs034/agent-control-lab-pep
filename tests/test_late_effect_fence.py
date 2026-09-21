@@ -156,6 +156,33 @@ def test_cross_thread_callback_after_kill_is_fenced():
     assert called["n"] == 0
 
 
+def test_kill_during_evaluate_before_allow_does_not_publish_allow():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    at_gap = threading.Event()
+    cut_done = threading.Event()
+    box: list[object] = []
+
+    def before_allow():
+        at_gap.set()
+        assert cut_done.wait(2)
+
+    def worker():
+        box.append(runtime.evaluate(_valid(), _before_allow=before_allow))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert at_gap.wait(2)
+    runtime.kill()
+    cut_done.set()
+    thread.join(2)
+    assert thread.is_alive() is False
+    decision = box[0]
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code in {ReasonCode.LATE_EFFECT_FENCE, ReasonCode.KILL_ACTIVE}
+    assert decision.verdict != "ALLOW"
+    validate_receipt(decision.to_dict())
+
+
 def test_kill_between_fence_check_and_tool_entry_denies():
     runtime = PepRuntime(policy=DEMO_POLICY)
     pending = begin_invoke(_valid(), runtime=runtime)
