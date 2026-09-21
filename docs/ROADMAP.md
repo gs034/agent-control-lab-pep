@@ -2,7 +2,7 @@
 
 Brand: **Agent Control Lab**. Licence: **Apache-2.0**. This is a public-goods reference PEP, not a shipping product.
 
-Versions below are **lab milestones**, not a vendor SKU. Package `0.3.1` is a patch on v0.3 / EOI **M1** (approval invoke binding). The official allowlist / eval receipt still attests `policy_version: 0.1.0-stub`.
+Versions below are **lab milestones**, not a vendor SKU. Package `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt still attests `policy_version: 0.1.0-stub`.
 
 ## stub (published 0.1)
 
@@ -54,6 +54,22 @@ Same PEP trust domain. A HITL/TTL approval is not a control if the operation pre
 | Corpus: mutated args DENY; exact bind ALLOW then single-use consume / replay DENY | In tree |
 | Official `python -m pep.demo` DENY unchanged | Required invariant |
 
+## v0.3.2 / late-effect fence (this tree)
+
+Same PEP trust domain. `kill()` must fence late effects, not only flip the halt bit. Existence-proof for the authorization-revocation / quiescence class ([arXiv:2609.21284](https://arxiv.org/abs/2609.21284); not a measured attack-success-rate claim).
+
+| Work | Status |
+| --- | --- |
+| `kill()` engages an in-process cut epoch (fence) as well as mode `killed` | In tree |
+| `begin_invoke` / `complete_invoke`; one-shot entry permit under the runtime lock before `tool()`; replay DENY `admission_consumed` | In tree |
+| Pre-cut admission completed after kill → DENY `late_effect_fence` (`cut+fence` in the detail). No tool entry | In tree |
+| Fresh post-kill evaluate stays `kill_active`. ALLOW is published only under the runtime lock after a fence re-check | In tree |
+| Corpus row `eval/corpus/late_effect_fence/` and `python -m pep.demo --late-effect-fence` | In tree |
+| Receipt schema stays frozen v1 (no new fields) | Required invariant |
+| Official `python -m pep.demo` DENY unchanged | Required invariant |
+
+Still open on this patch: once `tool()` has started, that call is not preempted or rolled back; a process-external callback that skips `complete_invoke` is outside the trust domain; `HaltStore` does not reconstruct another process’s admissions (reload denies new work as `kill_active` only). Also deferred: an approval may be consumed before a later suspend or kill deny, so the grant is spent without ALLOW; `_spent_admissions` is unbounded for a long-lived runtime.
+
 ## Remaining v1 notes
 
 v1 may persist single-use TTL approvals out of process. Catalog extension, marketplace adapters, and production UI remain non-goals.
@@ -63,5 +79,5 @@ v1 may persist single-use TTL approvals out of process. Catalog extension, marke
 1. Deny path is host/runtime policy, not a model judge.
 2. PEP trust domain is independent of model / monitor / MCP host.
 3. Structured envelopes only; agent prose is data.
-4. Fail-closed: miss, expiry, kill, suspend, PEP down → DENY + receipt; no tool entry.
+4. Fail-closed: miss, expiry, kill, late effect after kill, suspend, PEP down → DENY + receipt; no tool entry.
 5. Brand: Agent Control Lab. Apache-2.0. Lab-only keep-out stays green.

@@ -1,6 +1,6 @@
 # ADR-0001 — Lab host/runtime PEP architecture
 
-- **Status:** Accepted (v0.3.1 / approval invoke binding)
+- **Status:** Accepted (v0.3.2 / late-effect fence; v0.3.1 approval invoke binding remains)
 - **Date:** 2026-09-21
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
@@ -9,7 +9,7 @@
 
 This repository is a public-goods **host/runtime Policy Enforcement Point (PEP)**. Callers submit a structured invoke envelope. The PEP is the only allow authority for tool entry. The official `eval/` row is an existence-proof **DENY** for the monitor-bypass / policy-rewrite-coax *class* (inspiration: arXiv:2609.19587). It is not a measured attack-success-rate result.
 
-v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same trust boundary. v0.3.1 keeps that plane and binds single-use TTL approvals to the approved invoke.
+v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same trust boundary. v0.3.1 keeps that plane and binds single-use TTL approvals to the approved invoke. v0.3.2 keeps that plane and fences late effects after `kill()`.
 
 ## Decision
 
@@ -49,10 +49,28 @@ Runtime modes:
 
 - **active** — evaluate proceeds.
 - **suspend** — every envelope DENY (`suspend_active`). `resume()` returns to active.
-- **kill** — every envelope DENY (`kill_active`). Irreversible; `resume()` cannot clear a kill.
-- **unavailable** — treated as kill (`kill_active`).
+- **kill** — every new envelope DENY (`kill_active`). Irreversible; `resume()` cannot clear a kill. The same call engages an in-process late-effect fence (below).
+- **unavailable** — treated as kill (`kill_active`) for a new evaluate. It does not by itself bump the cut epoch.
 
 Kill wins over suspend. Process-local mode is the default. Optional `HaltStore` (JSON file) persists mode and availability so a new `PepRuntime` on the same path reloads the halt. Corrupt or unreadable store bytes fail closed to kill. Operator API stays capability language: kill, suspend, resume — not a product console.
+
+### Late-effect fence (v0.3.2)
+
+`kill()` is a **cut** (mode `killed`, sticky) **and** a **fence** (in-process cut epoch, bumped once). Receipt schema stays frozen v1. The fence signal is `reason_code: late_effect_fence` plus `reason_detail` containing `cut+fence`. That deny is not `kill_active`.
+
+| Moment | Result |
+| --- | --- |
+| New `evaluate` / `gated_invoke` after the cut | DENY `kill_active`. No tool entry. |
+| `begin_invoke` before the cut, `complete_invoke` after it (queue or callback) | DENY `late_effect_fence`. No tool entry. |
+| `kill()` during `evaluate`, before ALLOW is published | DENY `late_effect_fence` (stale epoch) or `kill_active`. The re-check and the ALLOW `Decision` are one locked transition, so a cut in that gap does not publish ALLOW. |
+| `complete_invoke` with no kill | Tool runs only when the admission was ALLOW and `claim_entry` recorded a one-shot permit under the runtime lock before the call. |
+| Second `complete_invoke` on that same admission | DENY `admission_consumed`. The tool is entered at most once. |
+
+`gated_invoke` is begin then complete, so tool entry uses the same permit. The fence check and the permit are one locked transition: `kill()` cannot grant a permit after the cut, and a replay cannot take a second permit. `HaltStore` does not store the epoch or the ticket. A restarted process denies new work as `kill_active`. It does not rebuild another process’s queue.
+
+This is an existence-proof control for the authorization-revocation / quiescence class ([arXiv:2609.21284](https://arxiv.org/abs/2609.21284); not a measured attack-success-rate claim). It does not preempt a tool body that has already been entered, and it does not fence a process-external callback that never re-enters `complete_invoke`. An ALLOW `Decision` held without `claim_entry` / `complete_invoke` is not a tool-entry permit.
+
+Still open, not part of this fence: a single-use approval can be consumed and then a later suspend or kill deny, so the grant is spent without an ALLOW; `_spent_admissions` grows for the life of the runtime.
 
 ### Attested receipts
 
@@ -62,7 +80,7 @@ Every decision emits a receipt that attests `decision`, `reason_code`, `envelope
 
 - Diligence readers can treat `pep/evaluate.py` as the enforcement plane, not a model-graded monitor.
 - Official `eval/` deny (`python -m pep.demo`) stays a fail-closed DENY with the frozen receipt shape (`policy_version` remains `0.1.0-stub` on that allowlist).
-- Package version `0.3.1` names the approval-binding patch on the v0.3 / M1 tree, not a production control plane.
+- Package version `0.3.2` names the late-effect fence on the v0.3.1 / approval-binding tree, not a production control plane. `0.3.1` remains the approval-binding patch.
 - EOI **M1** (evaluator corpus) adds rows under `eval/corpus/`; v0.3.1 adds approval-binding rows on the same path. The official demo row stays at `eval/` root. Allow authority does not move onto a model or monitor.
 - Approvals may later persist out of process; the grant and fail-closed rules above stay.
 

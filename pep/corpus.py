@@ -18,7 +18,7 @@ from typing import Any, Iterator, Literal, Mapping
 
 from pep.approval import ApprovalStore
 from pep.evaluate import Decision, PepRuntime, evaluate
-from pep.gate import gated_invoke
+from pep.gate import begin_invoke, complete_invoke, gated_invoke
 from pep.policy import DEMO_POLICY, PolicyStore
 from pep.row import eval_dir
 
@@ -33,6 +33,7 @@ REQUIRED_DENY_CLASSES = frozenset(
         "kill_suspend",
         "approval_replay_ttl",
         "approval_binding",
+        "late_effect_fence",
     }
 )
 
@@ -134,12 +135,35 @@ def runtime_for_spec(spec: Mapping[str, Any]) -> tuple[PepRuntime, datetime | No
 
 def evaluate_corpus_row(row: CorpusRow) -> Decision:
     runtime, now = runtime_for_spec(row.runtime_spec)
+    finished = _finish_after_kill(row, runtime, now, _refuse_tool)
+    if finished is not None:
+        decision, _result = finished
+        return decision
     return evaluate(row.envelope, runtime=runtime, now=now)
 
 
 def gated_corpus_row(row: CorpusRow, tool) -> tuple[Decision, Any]:
     runtime, now = runtime_for_spec(row.runtime_spec)
+    finished = _finish_after_kill(row, runtime, now, tool)
+    if finished is not None:
+        return finished
     return gated_invoke(row.envelope, tool, runtime=runtime, now=now)
+
+
+def _finish_after_kill(row: CorpusRow, runtime, now, tool):
+    """Admit, then kill, then complete. Models a queued invoke finishing after the cut."""
+    marker = row.runtime_spec.get("complete_after")
+    if marker is None:
+        return None
+    if marker != "kill":
+        raise ValueError(f"unknown corpus complete_after: {marker}")
+    pending = begin_invoke(row.envelope, runtime=runtime, now=now)
+    runtime.kill()
+    return complete_invoke(pending, tool)
+
+
+def _refuse_tool() -> None:
+    raise AssertionError("late-effect fence entered the tool")
 
 
 def _load_row(root: Path, raw: Mapping[str, Any]) -> CorpusRow:

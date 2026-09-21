@@ -6,6 +6,11 @@ Operator API stays capability language: kill, suspend, resume. This module
 is a file-backed mode table, not a product console. Corrupt or unreadable
 bytes fail closed to kill. A persisted kill cannot be overwritten by
 suspend or resume.
+
+The late-effect fence (cut epoch for queued or in-flight admissions) lives
+on ``PepRuntime``, not in this file. Reloading a killed store denies new
+evaluates as ``kill_active``. It does not reconstruct another process's
+admissions.
 """
 
 from __future__ import annotations

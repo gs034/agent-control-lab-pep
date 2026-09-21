@@ -10,7 +10,7 @@ evaluate path.
 from pep.approval import ApprovalRecord, ApprovalStore
 from pep.envelope import InvokeEnvelope
 from pep.evaluate import Decision, PepRuntime, RuntimeMode, evaluate
-from pep.gate import gated_invoke
+from pep.gate import PendingInvoke, begin_invoke, complete_invoke, gated_invoke
 from pep.halt import HaltState, HaltStore
 from pep.reasons import ReasonCode
 from pep.receipt import Receipt, validate_receipt
@@ -23,14 +23,17 @@ __all__ = [
     "HaltState",
     "HaltStore",
     "InvokeEnvelope",
+    "PendingInvoke",
     "PepRuntime",
     "ReasonCode",
     "Receipt",
     "RuntimeMode",
+    "begin_invoke",
+    "complete_invoke",
     "evaluate",
     "evaluate_official_row",
     "gated_invoke",
     "validate_receipt",
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"

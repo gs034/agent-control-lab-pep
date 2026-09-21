@@ -27,3 +27,10 @@ consumes the grant. `policy_context` and untrusted attachments are not part
 of the binding. This is an existence-proof control for the Loopjacking-class
 representation-mismatch pattern (arXiv:2609.21081), not a measured
 attack-success-rate claim.
+
+`late_effect_fence` admits an allowlisted invoke, then `kill()`, then
+completes that admission. The expected receipt is DENY `late_effect_fence`
+(`cut+fence` in the detail), not `kill_active` and not ALLOW. This is an
+existence-proof control for the authorization-revocation / quiescence class
+(arXiv:2609.21284), not a measured attack-success-rate claim. The fence is
+in-process. A callback that never re-enters `complete_invoke` is outside it.
