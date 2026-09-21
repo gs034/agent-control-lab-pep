@@ -8,7 +8,8 @@ This module *is* the Policy Enforcement Point. Agents, optional monitors,
 and any HITL UI are callers on the other side of ``evaluate()``. In-process
 import is allowed; the function boundary is the trust boundary. There is
 no LLM, CoT, or transcript judge on this path — policy is a frozen
-allowlist plus capability tokens and single-use TTL approvals.
+allowlist plus capability tokens and single-use TTL approvals bound
+to a frozen invoke (tool_name + canonical args).
 """
 
 from __future__ import annotations
@@ -154,13 +155,15 @@ class PepRuntime:
         self,
         *,
         tool_name: str,
+        args: Mapping[str, Any],
         ttl_seconds: int,
         approval_id: str | None = None,
         now: datetime | None = None,
     ) -> ApprovalRecord:
-        """Mint a single-use TTL approval for an allowlisted tool."""
+        """Mint a single-use TTL approval bound to one allowlisted invoke."""
         return self._approvals.issue(
             tools=(tool_name,),
+            args=args,
             ttl_seconds=ttl_seconds,
             approval_id=approval_id,
             now=now,
@@ -304,7 +307,7 @@ class PepRuntime:
 
         if approval is not None:
             consume_reason = self._approvals.try_consume(
-                approval, parsed.tool_name, now=clock
+                approval, parsed.tool_name, now=clock, args=parsed.args
             )
             if consume_reason is not None:
                 return _deny(

@@ -13,7 +13,9 @@ from pep.corpus import (
     evaluate_corpus_row,
     gated_corpus_row,
     list_corpus_rows,
+    runtime_for_spec,
 )
+from pep.evaluate import evaluate
 from pep.policy import DEMO_POLICY
 from pep.receipt import FROZEN_RECEIPT_KEYS, validate_receipt
 from pep.row import evaluate_official_row
@@ -84,15 +86,28 @@ def test_corpus_row_matches_expected_receipt(row):
 def test_allow_row_cannot_rewrite_catalog():
     rows = [row for row in list_corpus_rows() if row.expected_decision == "ALLOW"]
     assert rows
+    for row in rows:
+        rewrite = row.envelope.get("policy_context", {}).get("expected_tool_allowlist", [])
+        assert "shell.exec" in rewrite
+        decision = evaluate_corpus_row(row)
+        assert decision.verdict == "ALLOW"
+        assert "shell.exec" not in DEMO_POLICY.allowed_tools()
+        assert "lab.catalog.rewrite" not in DEMO_POLICY.allowed_tools()
+        assert set(DEMO_POLICY.allowed_tools()) == {"echo.ping"}
+        assert DEMO_POLICY.bytes_unchanged()
+
+
+def test_exact_approval_bind_allows_then_replay_consumed():
+    rows = [row for row in list_corpus_rows() if row.row_id == "acl-pep-eval-allow-approval-bound-001"]
+    assert len(rows) == 1
     row = rows[0]
-    rewrite = row.envelope.get("policy_context", {}).get("expected_tool_allowlist", [])
-    assert "shell.exec" in rewrite
-    decision = evaluate_corpus_row(row)
-    assert decision.verdict == "ALLOW"
-    assert "shell.exec" not in DEMO_POLICY.allowed_tools()
-    assert "lab.catalog.rewrite" not in DEMO_POLICY.allowed_tools()
-    assert set(DEMO_POLICY.allowed_tools()) == {"echo.ping"}
-    assert DEMO_POLICY.bytes_unchanged()
+    runtime, now = runtime_for_spec(row.runtime_spec)
+    first = evaluate(row.envelope, runtime=runtime, now=now)
+    replay = evaluate(row.envelope, runtime=runtime, now=now)
+    assert first.verdict == "ALLOW"
+    assert first.receipt.reason_code == "allowed"
+    assert replay.verdict == "DENY"
+    assert replay.receipt.reason_code == "approval_consumed"
 
 
 def test_official_demo_row_still_denies_independently_of_corpus():

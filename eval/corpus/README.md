@@ -17,5 +17,13 @@ Enforcement is `pep.evaluate` / `pep.gated_invoke`. This directory is not a
 second judge, not an LLM/CoT/transcript path, and not a measured
 attack-success-rate claim.
 
-Catalog rewrite is not a grant: the allowlisted ALLOW row still cannot add
+Catalog rewrite is not a grant: the allowlisted ALLOW rows still cannot add
 tools or capabilities via prose or envelope fields.
+
+A single-use TTL approval is bound to the approved invoke (`tool_name` plus
+canonical args). Minting for args A and invoking with mutated args B is
+`approval_binding_mismatch`. Exact match A is catalog-bound ALLOW and
+consumes the grant. `policy_context` and untrusted attachments are not part
+of the binding. This is an existence-proof control for the Loopjacking-class
+representation-mismatch pattern (arXiv:2609.21081), not a measured
+attack-success-rate claim.

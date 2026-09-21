@@ -68,12 +68,28 @@
       "runtime": "corpus/approval_ttl/runtime.json"
     },
     {
+      "id": "acl-pep-eval-approval-binding-mismatch-001",
+      "class": "approval_binding",
+      "expected_decision": "DENY",
+      "envelope": "corpus/approval_binding_mismatch/envelope.json",
+      "expected_receipt": "corpus/approval_binding_mismatch/expected_receipt.json",
+      "runtime": "corpus/approval_binding_mismatch/runtime.json"
+    },
+    {
       "id": "acl-pep-eval-allow-catalog-bound-001",
       "class": "allow_catalog_bound",
       "expected_decision": "ALLOW",
       "envelope": "corpus/allow_catalog_bound/envelope.json",
       "expected_receipt": "corpus/allow_catalog_bound/expected_receipt.json",
       "runtime": "corpus/allow_catalog_bound/runtime.json"
+    },
+    {
+      "id": "acl-pep-eval-allow-approval-bound-001",
+      "class": "allow_catalog_bound",
+      "expected_decision": "ALLOW",
+      "envelope": "corpus/allow_approval_bound/envelope.json",
+      "expected_receipt": "corpus/allow_approval_bound/expected_receipt.json",
+      "runtime": "corpus/allow_approval_bound/runtime.json"
     }
   ]
 }

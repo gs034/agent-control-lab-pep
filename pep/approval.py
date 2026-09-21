@@ -3,20 +3,24 @@
 """Single-use TTL approval grants (process-local; operator-issued).
 
 Approvals are capability grants, not caller identity and not prose.
-They never extend the frozen tool catalog. An approval may authorize
-one use of an already-allowlisted tool before its TTL elapses.
-Replay, expiry, unknown id, or uncovered tool fail closed.
+They never extend the frozen tool catalog. An approval authorizes one
+use of an already-allowlisted invoke (tool_name + canonical args) before
+its TTL elapses. Replay, expiry, unknown id, uncovered tool, or a
+post-mint args substitution fail closed.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Mapping
+from types import MappingProxyType
+from typing import Any, Mapping
 
+from pep.canonical import canonical_dumps, sha256_prefixed
 from pep.reasons import ReasonCode
 
 APPROVAL_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -28,16 +32,49 @@ class ApprovalError(ValueError):
     """Mint-time failure. Evaluate path uses reason codes, not this type."""
 
 
+def freeze_invoke_args(args: Mapping[str, Any]) -> dict[str, Any]:
+    """JSON-round-trip args so mint and consume share one canonical object."""
+    if not isinstance(args, Mapping) or isinstance(args, (str, bytes)):
+        raise ApprovalError("approval args must be a JSON object")
+    try:
+        payload = json.loads(canonical_dumps(dict(args)))
+    except (TypeError, ValueError) as exc:
+        raise ApprovalError(f"approval args not JSON-serializable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ApprovalError("approval args must be a JSON object")
+    return payload
+
+
+def invoke_binding(tool_name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    """Policy-relevant approved invoke. Prose and policy_context are omitted."""
+    if not isinstance(tool_name, str) or not tool_name:
+        raise ApprovalError("approval binding requires a tool id")
+    return {"args": freeze_invoke_args(args), "tool_name": tool_name}
+
+
+def invoke_binding_digest(tool_name: str, args: Mapping[str, Any]) -> str:
+    return sha256_prefixed(invoke_binding(tool_name, args))
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalRecord:
     approval_id: str
     tools: tuple[str, ...]
     expires_at: datetime
+    binding_digest: str
+    frozen_args: Mapping[str, Any]
     single_use: bool = True
     consumed_at: datetime | None = None
 
     def covers(self, tool_name: str) -> bool:
         return tool_name in self.tools
+
+    def matches_binding(self, tool_name: str, args: Mapping[str, Any]) -> bool:
+        try:
+            digest = invoke_binding_digest(tool_name, args)
+        except ApprovalError:
+            return False
+        return self.covers(tool_name) and self.binding_digest == digest
 
     def expired(self, now: datetime) -> bool:
         return self.expires_at <= now
@@ -51,6 +88,7 @@ class ApprovalStore:
 
     Minting is an operator/runtime API. Envelope ``approval_id`` is only a
     reference; the PEP looks up this store. Prose cannot insert a row.
+    Each grant freezes one invoke binding (tool_name + canonical args).
     """
 
     def __init__(self) -> None:
@@ -62,6 +100,7 @@ class ApprovalStore:
         *,
         tools: tuple[str, ...] | list[str],
         ttl_seconds: int,
+        args: Mapping[str, Any],
         approval_id: str | None = None,
         now: datetime | None = None,
         catalog: Mapping[str, object] | None = None,
@@ -76,12 +115,15 @@ class ApprovalStore:
         tool_tuple = tuple(tools)
         if not tool_tuple or any(not isinstance(t, str) or not t for t in tool_tuple):
             raise ApprovalError("approval must cover at least one tool id")
+        if len(tool_tuple) != 1:
+            raise ApprovalError("approval binds exactly one tool invoke")
         if catalog is not None:
             unknown = [t for t in tool_tuple if t not in catalog]
             if unknown:
                 raise ApprovalError(
                     f"cannot mint approval for tools outside catalog: {unknown}"
                 )
+        binding = invoke_binding(tool_tuple[0], args)
         token = approval_id or f"lab.appr.{uuid.uuid4().hex}"
         if not isinstance(token, str) or not APPROVAL_ID_RE.fullmatch(token):
             raise ApprovalError("approval_id is missing or malformed")
@@ -89,6 +131,8 @@ class ApprovalStore:
             approval_id=token,
             tools=tool_tuple,
             expires_at=clock + timedelta(seconds=ttl_seconds),
+            binding_digest=sha256_prefixed(binding),
+            frozen_args=MappingProxyType(binding["args"]),
             single_use=True,
             consumed_at=None,
         )
@@ -107,11 +151,14 @@ class ApprovalStore:
         approval_id: str,
         tool_name: str,
         now: datetime | None = None,
+        *,
+        args: Mapping[str, Any],
     ) -> ReasonCode | None:
         """Atomically consume a valid grant. ``None`` means the grant was taken.
 
         Any other return is a fail-closed deny reason. Single-use is enforced
         under the lock so two concurrent allows cannot share one grant.
+        A tool or args mismatch against the frozen binding does not consume.
         """
         clock = _aware(now)
         with self._lock:
@@ -122,8 +169,8 @@ class ApprovalStore:
                 return ReasonCode.APPROVAL_CONSUMED
             if record.expired(clock):
                 return ReasonCode.APPROVAL_EXPIRED
-            if not record.covers(tool_name):
-                return ReasonCode.APPROVAL_INVALID
+            if not record.matches_binding(tool_name, args):
+                return ReasonCode.APPROVAL_BINDING_MISMATCH
             if not record.single_use:
                 return ReasonCode.APPROVAL_INVALID
             self._records[approval_id] = replace(record, consumed_at=clock)

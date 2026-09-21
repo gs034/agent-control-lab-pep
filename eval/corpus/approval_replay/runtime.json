@@ -2,6 +2,12 @@
   "approvals": [
     {
       "approval_id": "lab.appr.replay-fixture",
+      "args": {
+        "argv": [],
+        "cwd": "/tmp",
+        "env_allowlist": [],
+        "network": false
+      },
       "consumed": true,
       "issued_at": "2026-09-18T12:00:00+00:00",
       "tool_name": "echo.ping",
