@@ -1,7 +1,7 @@
 # ADR-0001 — Lab host/runtime PEP architecture
 
-- **Status:** Accepted (v0.3 / M1 corpus + durable halt)
-- **Date:** 2026-09-18
+- **Status:** Accepted (v0.3.1 / approval invoke binding)
+- **Date:** 2026-09-21
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
 
@@ -9,7 +9,7 @@
 
 This repository is a public-goods **host/runtime Policy Enforcement Point (PEP)**. Callers submit a structured invoke envelope. The PEP is the only allow authority for tool entry. The official `eval/` row is an existence-proof **DENY** for the monitor-bypass / policy-rewrite-coax *class* (inspiration: arXiv:2609.19587). It is not a measured attack-success-rate result.
 
-v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same trust boundary.
+v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same trust boundary. v0.3.1 keeps that plane and binds single-use TTL approvals to the approved invoke.
 
 ## Decision
 
@@ -33,7 +33,7 @@ Allow is a **grant check**, not a judgement:
 
 1. **Frozen catalog.** Only allowlisted tools can run. An approval cannot extend the catalog.
 2. **Standing capability.** A capability token must be known, unexpired, cover the tool, and match the tool’s required capability when present.
-3. **Single-use TTL approval.** An operator-issued `approval_id` is a one-shot grant for an already-catalogued tool. It has a TTL. The first successful ALLOW consumes it. Replay, expiry, unknown id, or uncovered tool → **DENY**.
+3. **Single-use TTL approval.** An operator-issued `approval_id` is a one-shot grant for an already-catalogued **invoke**. Mint freezes `tool_name` plus canonical JSON args (`pep.canonical` / `sha256_prefixed`). The first successful ALLOW of that exact binding consumes it. Replay, expiry, unknown id, uncovered tool, or a post-mint args substitution → **DENY**. `policy_context` and untrusted attachments are not part of the binding. This closes the Loopjacking-class gap where a HITL/TTL approval is not a control if the operation presented for approval is not exactly what later executes (existence-proof threat pattern: [arXiv:2609.21081](https://arxiv.org/abs/2609.21081); not a measured attack-success-rate claim).
 4. **Neither grant.** Allowlisted tool with no capability and no approval → **DENY** (`capability_missing`). Unknown tool with both grants absent → official eval reason `TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY`.
 5. **Presented grant must hold.** A spoofed or stale approval fails closed even if a standing capability would otherwise allow.
 
@@ -41,7 +41,7 @@ Prose cannot insert a capability row or an approval row.
 
 ### Fail-closed
 
-Missing policy, unknown tool, expired or missing capability, invalid/expired/consumed approval, parse failure, PEP unavailable, **kill**, or **suspend** → **DENY + receipt**. `gated_invoke` does not enter the tool. There is no fail-open path.
+Missing policy, unknown tool, expired or missing capability, invalid/expired/consumed/binding-mismatched approval, parse failure, PEP unavailable, **kill**, or **suspend** → **DENY + receipt**. `gated_invoke` does not enter the tool. There is no fail-open path.
 
 ### Kill and suspend
 
@@ -62,8 +62,8 @@ Every decision emits a receipt that attests `decision`, `reason_code`, `envelope
 
 - Diligence readers can treat `pep/evaluate.py` as the enforcement plane, not a model-graded monitor.
 - Official `eval/` deny (`python -m pep.demo`) stays a fail-closed DENY with the frozen receipt shape (`policy_version` remains `0.1.0-stub` on that allowlist).
-- Package version `0.3.0` names the M1 corpus plus durable halt store, not a production control plane.
-- EOI **M1** (evaluator corpus) adds rows under `eval/corpus/`; the official demo row stays at `eval/` root. Allow authority does not move onto a model or monitor.
+- Package version `0.3.1` names the approval-binding patch on the v0.3 / M1 tree, not a production control plane.
+- EOI **M1** (evaluator corpus) adds rows under `eval/corpus/`; v0.3.1 adds approval-binding rows on the same path. The official demo row stays at `eval/` root. Allow authority does not move onto a model or monitor.
 - Approvals may later persist out of process; the grant and fail-closed rules above stay.
 
 ## Non-goals

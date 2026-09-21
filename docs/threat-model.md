@@ -11,7 +11,7 @@ Brand: **Agent Control Lab**. Licence: **Apache-2.0**.
 | Frozen policy bytes (`pep/policy.py`, `PolicyStore`) | Allowlist and capability records. Agents must not rewrite them. Stub catalog is `echo.ping` only. |
 | Structured invoke envelope | Sole policy-relevant input. Lab fixture: `eval/structured_envelope.example.json`. |
 | Capability records | Presence, expiry, and tool coverage. Missing, unknown, expired, or uncovered tokens must not become allow. |
-| Single-use TTL approvals | Operator-issued grants in `ApprovalStore`. Replay, expiry, unknown id, or uncovered tool must not become allow. Approvals cannot extend the catalog. |
+| Single-use TTL approvals | Operator-issued grants in `ApprovalStore`, each frozen to one invoke (`tool_name` + canonical args). Replay, expiry, unknown id, uncovered tool, or post-mint args substitution must not become allow. Approvals cannot extend the catalog. |
 | Tool invoke path | Side-effecting callables (`gated_invoke`) must not run on DENY. |
 | Deny/allow receipt | Frozen v1 schema. Attests `decision`, `reason_code`, `envelope_hash`, judge path, and negative controls. |
 | PEP availability / kill / suspend | `PepRuntime` modes, optionally persisted by `HaltStore` (JSON file). Kill and unavailability deny as `kill_active`. Suspend denies as `suspend_active`. Resume cannot clear a kill, including after process restart. |
@@ -45,10 +45,13 @@ Receipt field `trust_domain.model_monitor_mcp` is `untrusted_relative_to_pep`. E
 | Class | What they try | Stub stance |
 | --- | --- | --- |
 | **Prompt / prose injection** | Free-text, coax keys, or attachments that ask the PEP (or a co-located monitor) to ignore, rewrite, or skip policy. | Prose is data. Coax keys and non-empty prose channels are rejected. Attachments are not loaded as policy. |
-| **Capability spoof** | Missing, empty, unknown, expired, or tool-uncovered tokens; forged “operator approval” in natural language; caller identity as authority. | Standing token must be known, unexpired, and cover the tool. A presented `approval_id` must exist in the PEP store, be unexpired, unused, and cover the tool. Prose cannot mint a token or approval row. |
+| **Capability spoof** | Missing, empty, unknown, expired, or tool-uncovered tokens; forged “operator approval” in natural language; caller identity as authority. | Standing token must be known, unexpired, and cover the tool. A presented `approval_id` must exist in the PEP store, be unexpired, unused, and match the frozen invoke binding. Prose cannot mint a token or approval row. |
 | **Monitor coax** | Agent text that tells a monitor to classify the turn SAFE / allow so the invoke proceeds. | Evaluate path has no monitor or model judge. Coax cannot become ALLOW. Receipt records `monitor_coax_accepted: false`. |
+| **Approval binding mismatch** | Mint a HITL/TTL approval for a benign invoke, then substitute args (or otherwise change the operation) before execute. | Mint freezes `tool_name` + canonical args. Consume requires an exact binding match. Mismatch → `approval_binding_mismatch` and does not consume. Prose / `policy_context` / attachments are ignored for the binding. |
 
 Inspiration for the official `eval/` row is the monitor-bypass / policy-rewrite-coax *class* discussed in [arXiv:2609.19587](https://arxiv.org/abs/2609.19587). This stub is an existence-proof deny for that class, not a paper reproduction and not an attack-success-rate claim.
+
+The approval-binding control is an existence-proof stance against the Loopjacking-class pattern that a HITL/TTL approval is not a control if the approved representation is not exactly what later executes ([arXiv:2609.21081](https://arxiv.org/abs/2609.21081)). This tree does not claim a measured attack-success rate for that paper.
 
 ## Control taxonomy → fail-closed structured-envelope deny
 
@@ -60,7 +63,7 @@ Every control below ends in **DENY + receipt** and, when callers use `gated_invo
 | Prose is not policy | `untrusted_agent_text`, non-empty `metadata`, `untrusted_attachments` file bytes, and coax keys are not allowlist input. | `agent_prose_rejected` |
 | Frozen allowlist | Unknown `tool_name` cannot run. Official row: `shell.exec` vs `echo.ping`. | `TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY`, `unknown_tool` |
 | Capability check | Token (when presented) looked up, unexpired, covers the tool, matches required capability; args must match the tiny schema. | `capability_missing`, `policy_miss` |
-| Single-use TTL approval | Operator-minted grant consumed on first ALLOW. Replay / expiry / unknown / uncovered tool deny. Does not unlock tools outside the catalog. | `approval_invalid`, `approval_expired`, `approval_consumed` |
+| Single-use TTL approval | Operator-minted grant consumed on first ALLOW of the frozen invoke. Replay / expiry / unknown / uncovered tool / args substitution deny. Does not unlock tools outside the catalog. | `approval_invalid`, `approval_expired`, `approval_consumed`, `approval_binding_mismatch` |
 | Policy present and readable | Empty store, unreadable spec, or missing schema → deny. | `policy_miss` |
 | Kill / unavailable | `kill()` or `available=false` denies even an otherwise allowlisted envelope. Resume cannot clear a kill. Durable store reloads the same deny after restart. | `kill_active` |
 | Suspend | `suspend()` denies every envelope until `resume()`. Persisted suspend reloads as `suspend_active`. | `suspend_active` |

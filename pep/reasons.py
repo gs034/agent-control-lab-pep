@@ -20,6 +20,7 @@ class ReasonCode(StrEnum):
     APPROVAL_INVALID = "approval_invalid"
     APPROVAL_EXPIRED = "approval_expired"
     APPROVAL_CONSUMED = "approval_consumed"
+    APPROVAL_BINDING_MISMATCH = "approval_binding_mismatch"
     ENVELOPE_INVALID = "envelope_invalid"
     # Exact Deep Research receipt code for the official eval row.
     TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY = "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"

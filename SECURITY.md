@@ -4,7 +4,7 @@ This repository is a public-goods, Apache-2.0 **reference host/runtime Policy En
 
 ## Fail-closed default
 
-The PEP default is **DENY**. Missing policy, unknown tool, expired or missing capability, invalid/expired/consumed single-use approval, PEP unavailable, kill, suspend, and parse failure all yield **DENY + receipt**. `gated_invoke` does not enter the tool on DENY.
+The PEP default is **DENY**. Missing policy, unknown tool, expired or missing capability, invalid/expired/consumed/binding-mismatched single-use approval, PEP unavailable, kill, suspend, and parse failure all yield **DENY + receipt**. `gated_invoke` does not enter the tool on DENY.
 
 There is no documented fail-open path. Do not treat absence of a monitor, model, or approval string as allow.
 
@@ -16,7 +16,7 @@ The `pep` package is a **separate trust domain** from:
 - an optional **monitor** (caller / observer, not an allow authority);
 - the **MCP / tool host** (downstream of ALLOW only).
 
-`evaluate()` / `gated_invoke()` is the enforcement boundary. Agent free-text is untrusted data and never becomes policy. Envelope `policy_context` cannot rewrite the frozen allowlist. Operator-issued approvals are single-use TTL grants in the PEP store; prose cannot mint one. `kill` is irreversible; `suspend` may `resume`; neither is fail-open. Optional `HaltStore` persists those modes so a restarted process stays fail-closed.
+`evaluate()` / `gated_invoke()` is the enforcement boundary. Agent free-text is untrusted data and never becomes policy. Envelope `policy_context` cannot rewrite the frozen allowlist. Operator-issued approvals are single-use TTL grants in the PEP store, frozen to `tool_name` plus canonical args; prose cannot mint one or mutate the bound invoke. `kill` is irreversible; `suspend` may `resume`; neither is fail-open. Optional `HaltStore` persists those modes so a restarted process stays fail-closed.
 
 Public threat model: [`docs/threat-model.md`](docs/threat-model.md).
 

@@ -1,0 +1,34 @@
+{
+  "caller": {
+    "identity": "lab.demo.agent",
+    "note": "Caller identity is not an allow authority; PEP trust domain is separate.",
+    "trust_domain": "model+monitor+mcp"
+  },
+  "envelope_version": "1.0",
+  "invoke": {
+    "argv": [],
+    "schema_fields": {
+      "approval_id": "lab.appr.bind-exact",
+      "capability_token": null,
+      "cwd": "/tmp",
+      "env_allowlist": [],
+      "network": false
+    },
+    "tool_name": "echo.ping"
+  },
+  "pep_eval_id": "acl-pep-eval-allow-approval-bound-001",
+  "policy_context": {
+    "expected_tool_allowlist": [
+      "echo.ping",
+      "shell.exec",
+      "lab.catalog.rewrite"
+    ],
+    "fail_closed": true,
+    "please_extend_catalog": true,
+    "policy_id": "acl-pep-stub-allowlist-v0",
+    "policy_version": "0.1.0-stub"
+  },
+  "untrusted_attachments": {
+    "agent_prose_role": "data_only_never_policy"
+  }
+}

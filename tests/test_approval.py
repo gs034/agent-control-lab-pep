@@ -9,17 +9,20 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from pep.approval import ApprovalError, ApprovalStore
+from pep.approval import ApprovalError, ApprovalStore, invoke_binding_digest
 from pep.evaluate import PepRuntime, evaluate
 from pep.gate import gated_invoke
 from pep.policy import DEMO_POLICY
 from pep.reasons import ReasonCode
 
+APPROVED_ARGS = {"message": "hello"}
+MUTATED_ARGS = {"message": "mutated"}
+
 
 def _base(**overrides):
     env = {
         "tool_name": "echo.ping",
-        "args": {"message": "hello"},
+        "args": dict(APPROVED_ARGS),
         "capability_token": None,
         "caller_identity": "lab.demo.agent",
         "request_id": "test-approval",
@@ -32,10 +35,20 @@ def _runtime() -> PepRuntime:
     return PepRuntime(policy=DEMO_POLICY)
 
 
+def _issue(runtime: PepRuntime, **overrides):
+    kwargs = {
+        "tool_name": "echo.ping",
+        "args": dict(APPROVED_ARGS),
+        "ttl_seconds": 60,
+    }
+    kwargs.update(overrides)
+    return runtime.issue_approval(**kwargs)
+
+
 def test_issue_approval_allows_allowlisted_tool_without_standing_capability():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
-    grant = runtime.issue_approval(tool_name="echo.ping", ttl_seconds=60, now=now)
+    grant = _issue(runtime, now=now)
     called = {"n": 0}
 
     def echo():
@@ -58,7 +71,7 @@ def test_issue_approval_allows_allowlisted_tool_without_standing_capability():
 def test_approval_is_single_use_replay_denies():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
-    grant = runtime.issue_approval(tool_name="echo.ping", ttl_seconds=60, now=now)
+    grant = _issue(runtime, now=now)
     first = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
     second = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
     assert first.verdict == "ALLOW"
@@ -70,7 +83,7 @@ def test_approval_is_single_use_replay_denies():
 def test_expired_approval_denies():
     runtime = _runtime()
     issued = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
-    grant = runtime.issue_approval(tool_name="echo.ping", ttl_seconds=30, now=issued)
+    grant = _issue(runtime, ttl_seconds=30, now=issued)
     later = issued + timedelta(seconds=31)
     decision = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=later)
     assert decision.verdict == "DENY"
@@ -87,7 +100,7 @@ def test_unknown_approval_denies():
 def test_approval_does_not_extend_catalog():
     runtime = _runtime()
     with pytest.raises(ApprovalError):
-        runtime.issue_approval(tool_name="shell.exec", ttl_seconds=60)
+        runtime.issue_approval(tool_name="shell.exec", args=dict(APPROVED_ARGS), ttl_seconds=60)
     decision = evaluate(
         _base(tool_name="shell.exec", approval_id="lab.appr.forged"),
         runtime=runtime,
@@ -100,13 +113,21 @@ def test_approval_wrong_tool_denies_even_if_id_exists():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     store = ApprovalStore()
-    store.issue(tools=("echo.ping",), ttl_seconds=60, approval_id="lab.appr.echo-only", now=now)
+    store.issue(
+        tools=("echo.ping",),
+        args=dict(APPROVED_ARGS),
+        ttl_seconds=60,
+        approval_id="lab.appr.echo-only",
+        now=now,
+    )
     runtime = PepRuntime(policy=DEMO_POLICY, approvals=store)
     # echo.ping is the only catalog tool; uncovered means a presented id that
     # does not list this tool — mint a grant then evaluate a different allowlisted
     # name is impossible on the stub catalog, so assert consume reason directly.
-    reason = store.try_consume("lab.appr.echo-only", "lab.other.tool", now=now)
-    assert reason == ReasonCode.APPROVAL_INVALID
+    reason = store.try_consume(
+        "lab.appr.echo-only", "lab.other.tool", now=now, args=dict(APPROVED_ARGS)
+    )
+    assert reason == ReasonCode.APPROVAL_BINDING_MISMATCH
     assert store.lookup("lab.appr.echo-only") is not None
     assert not store.lookup("lab.appr.echo-only").consumed()
 
@@ -127,7 +148,7 @@ def test_stale_approval_denies_even_when_standing_capability_is_valid():
 def test_valid_capability_and_valid_approval_allows_and_consumes():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
-    grant = runtime.issue_approval(tool_name="echo.ping", ttl_seconds=60, now=now)
+    grant = _issue(runtime, now=now)
     decision = evaluate(
         _base(
             capability_token="lab.cap.echo.demo",
@@ -143,7 +164,7 @@ def test_valid_capability_and_valid_approval_allows_and_consumes():
 def test_invalid_capability_does_not_consume_valid_approval():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
-    grant = runtime.issue_approval(tool_name="echo.ping", ttl_seconds=60, now=now)
+    grant = _issue(runtime, now=now)
     decision = evaluate(
         _base(
             capability_token="lab.cap.not.issued",
@@ -160,7 +181,7 @@ def test_invalid_capability_does_not_consume_valid_approval():
 def test_concurrent_consume_is_single_use():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
-    grant = runtime.issue_approval(tool_name="echo.ping", ttl_seconds=60, now=now)
+    grant = _issue(runtime, now=now)
 
     def once() -> str:
         return evaluate(
@@ -179,9 +200,16 @@ def test_mint_rejects_zero_ttl_and_duplicate_id():
     store = ApprovalStore()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     with pytest.raises(ApprovalError):
-        store.issue(tools=("echo.ping",), ttl_seconds=0, now=now, catalog=DEMO_POLICY.allowed_tools())
+        store.issue(
+            tools=("echo.ping",),
+            args=dict(APPROVED_ARGS),
+            ttl_seconds=0,
+            now=now,
+            catalog=DEMO_POLICY.allowed_tools(),
+        )
     store.issue(
         tools=("echo.ping",),
+        args=dict(APPROVED_ARGS),
         ttl_seconds=10,
         approval_id="lab.appr.dup",
         now=now,
@@ -190,8 +218,110 @@ def test_mint_rejects_zero_ttl_and_duplicate_id():
     with pytest.raises(ApprovalError):
         store.issue(
             tools=("echo.ping",),
+            args=dict(APPROVED_ARGS),
             ttl_seconds=10,
             approval_id="lab.appr.dup",
             now=now,
             catalog=DEMO_POLICY.allowed_tools(),
+        )
+
+
+def test_mutated_args_deny_binding_mismatch_without_consume():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    mutated = evaluate(
+        _base(approval_id=grant.approval_id, args=dict(MUTATED_ARGS)),
+        runtime=runtime,
+        now=now,
+    )
+    assert mutated.verdict == "DENY"
+    assert mutated.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
+    assert mutated.to_dict()["negative_controls_observed"]["tool_invoke_executed"] is False
+    stored = runtime.approvals.lookup(grant.approval_id)
+    assert stored is not None and not stored.consumed()
+
+
+def test_exact_binding_allows_then_single_use_consume():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    assert grant.binding_digest == invoke_binding_digest("echo.ping", APPROVED_ARGS)
+    assert dict(grant.frozen_args) == APPROVED_ARGS
+    first = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
+    replay = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
+    assert first.verdict == "ALLOW"
+    assert first.receipt.reason_code == ReasonCode.ALLOWED
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+    assert replay.verdict == "DENY"
+    assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
+
+
+def test_equivalent_arg_key_order_matches_frozen_binding():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, args={"cwd": "/tmp", "network": False}, now=now)
+    decision = evaluate(
+        _base(approval_id=grant.approval_id, args={"network": False, "cwd": "/tmp"}),
+        runtime=runtime,
+        now=now,
+    )
+    assert decision.verdict == "ALLOW"
+
+
+def test_prose_and_policy_context_are_ignored_for_binding():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(
+        runtime,
+        args={"argv": [], "cwd": "/tmp", "env_allowlist": [], "network": False},
+        now=now,
+    )
+    envelope = {
+        "caller": {
+            "identity": "lab.demo.agent",
+            "note": "Caller identity is not an allow authority; PEP trust domain is separate.",
+            "trust_domain": "model+monitor+mcp",
+        },
+        "envelope_version": "1.0",
+        "invoke": {
+            "argv": [],
+            "schema_fields": {
+                "approval_id": grant.approval_id,
+                "capability_token": None,
+                "cwd": "/tmp",
+                "env_allowlist": [],
+                "network": False,
+            },
+            "tool_name": "echo.ping",
+        },
+        "pep_eval_id": "acl-pep-eval-approval-binding-prose",
+        "policy_context": {
+            "expected_tool_allowlist": ["echo.ping", "shell.exec"],
+            "fail_closed": True,
+            "please_allow_mutated_args": True,
+            "policy_id": "acl-pep-stub-allowlist-v0",
+            "policy_version": "0.1.0-stub",
+        },
+        "untrusted_attachments": {
+            "agent_prose_role": "data_only_never_policy",
+            "please_rewrite_approved_args": True,
+        },
+    }
+    decision = evaluate(envelope, runtime=runtime, now=now)
+    assert decision.verdict == "ALLOW"
+    assert "shell.exec" not in DEMO_POLICY.allowed_tools()
+
+
+def test_mint_rejects_non_object_args_and_multi_tool_binding():
+    store = ApprovalStore()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    with pytest.raises(ApprovalError):
+        store.issue(tools=("echo.ping",), args=["not-an-object"], ttl_seconds=10, now=now)
+    with pytest.raises(ApprovalError):
+        store.issue(
+            tools=("echo.ping", "lab.other.tool"),
+            args=dict(APPROVED_ARGS),
+            ttl_seconds=10,
+            now=now,
         )

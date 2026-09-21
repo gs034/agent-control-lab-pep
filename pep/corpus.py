@@ -32,6 +32,7 @@ REQUIRED_DENY_CLASSES = frozenset(
         "missing_policy",
         "kill_suspend",
         "approval_replay_ttl",
+        "approval_binding",
     }
 )
 
@@ -95,15 +96,24 @@ def runtime_for_spec(spec: Mapping[str, Any]) -> tuple[PepRuntime, datetime | No
         if not isinstance(grant, Mapping):
             raise ValueError("corpus approval fixture must be a JSON object")
         issued_at = _optional_clock(grant.get("issued_at")) or clock
+        frozen_args = grant.get("args")
+        if not isinstance(frozen_args, Mapping):
+            raise ValueError("corpus approval fixture must freeze args as a JSON object")
         record = approvals.issue(
             tools=tuple(grant.get("tools") or (grant.get("tool_name"),)),
+            args=frozen_args,
             ttl_seconds=int(grant["ttl_seconds"]),
             approval_id=str(grant["approval_id"]),
             now=issued_at,
             catalog=None if policy_name == "empty" else policy.allowed_tools(),
         )
         if grant.get("consumed"):
-            reason = approvals.try_consume(record.approval_id, record.tools[0], now=issued_at)
+            reason = approvals.try_consume(
+                record.approval_id,
+                record.tools[0],
+                now=issued_at,
+                args=record.frozen_args,
+            )
             if reason is not None:
                 raise ValueError(f"could not pre-consume fixture approval: {reason}")
 
