@@ -187,6 +187,22 @@
       "envelope": "corpus/allow_approval_state_bound/envelope.json",
       "expected_receipt": "corpus/allow_approval_state_bound/expected_receipt.json",
       "runtime": "corpus/allow_approval_state_bound/runtime.json"
+    },
+    {
+      "id": "acl-pep-eval-multi-session-plant-001",
+      "class": "multi_session_plant",
+      "expected_decision": "DENY",
+      "envelope": "corpus/multi_session_plant/envelope.json",
+      "expected_receipt": "corpus/multi_session_plant/expected_receipt.json",
+      "runtime": "corpus/multi_session_plant/runtime.json"
+    },
+    {
+      "id": "acl-pep-eval-deferred-tool-001",
+      "class": "deferred_tool",
+      "expected_decision": "DENY",
+      "envelope": "corpus/deferred_tool/envelope.json",
+      "expected_receipt": "corpus/deferred_tool/expected_receipt.json",
+      "runtime": "corpus/deferred_tool/runtime.json"
     }
   ]
 }

@@ -201,7 +201,7 @@ def normalize_state_digest(value: Any) -> str | None:
     """Lower-cased ``sha256:<64 hex>`` or None when absent or malformed."""
     if not isinstance(value, str):
         return None
-    candidate = value.strip().lower()
+    candidate = value.lower()
     return candidate if STATE_DIGEST_RE.fullmatch(candidate) else None
 
 

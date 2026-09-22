@@ -101,6 +101,8 @@ class InvokeEnvelope:
             "request_id": self.request_id,
             "metadata": None if self.metadata is None else dict(self.metadata),
             "untrusted_agent_text": self.untrusted_agent_text,
+            # Emitted only when set so digest() of envelopes built without a
+            # state digest is unchanged from earlier releases.
             **({"state_digest": self.state_digest} if self.state_digest is not None else {}),
         }
 

@@ -9,5 +9,5 @@ different state digest: the target changed between approval and execute.
 `try_consume` returns `approval_state_mismatch` and does not consume the
 grant. Threat pattern: Loopjacking-class post-approval state substitution
 (arXiv:2609.21081, pattern name only). The companion ALLOW row
-`allow_approval_state_bound` shows the same grant consumed when the observed
-digest matches.
+`allow_approval_state_bound` shows an identically bound grant consumed when the
+observed digest matches.

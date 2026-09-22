@@ -1,0 +1,19 @@
+{
+  "approvals": [
+    {
+      "approval_id": "lab.appr.turn-checked",
+      "args": {
+        "argv": [],
+        "cwd": "/tmp",
+        "env_allowlist": [],
+        "network": false
+      },
+      "issued_at": "2026-09-18T12:00:00+00:00",
+      "tool_name": "echo.ping",
+      "ttl_seconds": 60
+    }
+  ],
+  "mode": "active",
+  "now": "2026-09-18T12:30:00+00:00",
+  "policy": "demo"
+}

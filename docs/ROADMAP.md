@@ -81,6 +81,7 @@ Same PEP trust domain. Binding `tool_name` plus canonical args closes the Loopja
 | `try_consume` requires an equal observed digest when one was frozen; missing or different → `approval_state_mismatch`, grant not consumed; args mismatch still reports first | In tree |
 | Grants without a frozen digest ignore any envelope digest (behaviour of every existing row unchanged) | In tree |
 | Corpus: `approval_state_substitution` DENY and `allow_approval_state_bound` ALLOW-then-consume | In tree |
+| Corpus: threat-model classes from the joint measured-corpus seed as rows, no new mechanism: `multi_session_plant` (planted prior-session grant → `approval_invalid`) and `deferred_tool` (effect fires after the checked turn's TTL → `approval_expired`) | In tree |
 | Receipt schema stays frozen v1 (new reason code only) | Required invariant |
 | Official `python -m pep.demo` DENY unchanged | Required invariant |
 

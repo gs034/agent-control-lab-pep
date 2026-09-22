@@ -35,6 +35,15 @@ host-observed digest, and the deny is `approval_state_mismatch` without
 consuming the grant. `allow_approval_state_bound` is the matching ALLOW.
 Grants minted without a state digest behave exactly as before.
 
+Two rows name threat-model classes from the joint measured-corpus seed
+without adding any mechanism. `multi_session_plant`: a prior session's
+transcript claims an operator grant; the store never issued it, so the
+invoke is `approval_invalid`. `deferred_tool`: a dormant instruction fires
+the approved invoke after the checked turn's TTL, so it is
+`approval_expired`. Neither row detects the plant or the dormant
+instruction; both show the action is judged when it fires, against the
+PEP's own state.
+
 `late_effect_fence` admits an allowlisted invoke, then `kill()`, then
 completes that admission. The expected receipt is DENY `late_effect_fence`
 (`cut+fence` in the detail), not `kill_active` and not ALLOW. This is an

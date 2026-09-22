@@ -35,6 +35,9 @@ REQUIRED_DENY_CLASSES = frozenset(
         "approval_binding",
         "approval_state_substitution",
         "late_effect_fence",
+        # Threat-model classes named in the joint measured-corpus seed.
+        "multi_session_plant",
+        "deferred_tool",
         # Eval taxonomy only. Noul labels are not allow or deny authority.
         "noul_taxonomy_coax",
     }

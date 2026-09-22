@@ -411,7 +411,8 @@ def test_prose_cannot_supply_state_digest_for_binding():
         now=now,
     )
     assert coaxed.verdict == "DENY"
-    assert coaxed.receipt.reason_code in {
-        ReasonCode.AGENT_PROSE_REJECTED,
-        ReasonCode.APPROVAL_STATE_MISMATCH,
-    }
+    # The prose channel is rejected before the approval path runs; the
+    # frozen digest is never compared against prose and the grant stays unspent.
+    assert coaxed.receipt.reason_code == ReasonCode.AGENT_PROSE_REJECTED
+    stored = runtime.approvals.lookup(grant.approval_id)
+    assert stored is not None and not stored.consumed()
