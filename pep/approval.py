@@ -36,6 +36,10 @@ class ApprovalError(ValueError):
     """Mint-time failure. Evaluate path uses reason codes, not this type."""
 
 
+class ObserverReentry(ApprovalError):
+    """A state observer called back into the store that is waiting on it."""
+
+
 def freeze_invoke_args(args: Mapping[str, Any]) -> dict[str, Any]:
     """JSON-round-trip args so mint and consume share one canonical object."""
     if not isinstance(args, Mapping) or isinstance(args, (str, bytes)):
@@ -112,6 +116,14 @@ class ApprovalStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: dict[str, ApprovalRecord] = {}
+        # Set on the thread that is running a state observer inside consume().
+        # The lock is not reentrant; a callback into the store would wedge, so
+        # it is refused with a receipt instead.
+        self._observing = threading.local()
+
+    def _refuse_reentry(self) -> None:
+        if getattr(self._observing, "active", False):
+            raise ObserverReentry("state observer re-entered the approval store")
 
     def issue(
         self,
