@@ -49,7 +49,8 @@ def begin_invoke(
     """Admit one invoke. Does not call a tool.
 
     The returned epoch is the cut generation observed before evaluation.
-    A later ``kill()`` makes ``complete_invoke`` fail closed.
+    A later ``kill()`` makes ``complete_invoke`` fail closed. ``state_observer``
+    is passed through to ``evaluate``.
     """
     pep = resolve_runtime(runtime)
     admission_id = pep.mint_admission_id()
@@ -107,9 +108,8 @@ def gated_invoke(
     """Run ``tool`` only after ``evaluate`` returns ALLOW and the fence is open.
 
     On DENY the callable is not entered. Callers that bypass this helper
-    are outside the PEP trust domain. ``state_observer`` lets the host read
-    the target state inside the gate, next to execution, when the approval
-    froze a state digest.
+    are outside the PEP trust domain. ``state_observer`` is passed through
+    to ``evaluate``.
     """
     pending = begin_invoke(envelope, runtime=runtime, now=now, state_observer=state_observer)
     return complete_invoke(pending, tool)

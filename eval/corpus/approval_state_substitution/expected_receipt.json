@@ -18,7 +18,7 @@
   "pep_id": "acl-pep-stub-host-runtime-001",
   "policy_version": "0.1.0-stub",
   "reason_code": "approval_state_mismatch",
-  "reason_detail": "single-use TTL approval rejected: approval_state_mismatch",
+  "reason_detail": "single-use TTL approval rejected: approval_state_mismatch; envelope state digest mismatch",
   "receipt_type": "pep_deny",
   "timestamp": "2026-09-18T12:00:00Z",
   "trust_domain": {

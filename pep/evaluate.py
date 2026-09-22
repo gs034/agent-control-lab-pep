@@ -305,17 +305,17 @@ class PepRuntime:
         envelope: Any,
         *,
         now: datetime | None = None,
-        state_observer: Callable[[], Any] | None = None,
+        state_observer: Callable[[], object] | None = None,
         _before_allow: Callable[[], None] | None = None,
     ) -> Decision:
         """Evaluate one structured envelope.
 
-        ``state_observer`` is a host callable that reads the current digest of
-        the state the invoke acts on. When the referenced approval froze a
-        state digest, the gate calls it here, at consume time, and its return
-        value is the observation; the envelope's ``state_digest`` is used only
-        when no observer is given. An observer that raises or returns
-        something other than a digest is a mismatch.
+        ``state_observer`` is the host's read of the current digest of the
+        state the invoke acts on. When the referenced approval froze a state
+        digest, ``ApprovalStore.consume`` calls it under the store lock after
+        the grant has passed its other checks, and its return is the
+        observation; the envelope's ``state_digest`` is used only when no
+        observer is given. A raising or non-digest observer is a mismatch.
         """
         try:
             clock = _aware_clock(now)
@@ -453,18 +453,21 @@ class PepRuntime:
             )
 
         if approval is not None:
-            observed_state = self._observe_state(approval, parsed.state_digest, state_observer)
-            consume_reason = self._approvals.try_consume(
+            consumed = self._approvals.consume(
                 approval,
                 parsed.tool_name,
                 now=clock,
                 args=parsed.args,
-                state_digest=observed_state,
+                state_digest=parsed.state_digest,
+                observe=state_observer,
             )
-            if consume_reason is not None:
+            if consumed.reason is not None:
+                detail = f"single-use TTL approval rejected: {consumed.reason}"
+                if consumed.detail:
+                    detail = f"{detail}; {consumed.detail}"
                 return _deny(
-                    consume_reason,
-                    f"single-use TTL approval rejected: {consume_reason}",
+                    consumed.reason,
+                    detail,
                     env_hash,
                     version,
                     policy.bytes_unchanged(),
@@ -477,28 +480,6 @@ class PepRuntime:
             policy_file_unchanged=policy.bytes_unchanged(),
             _before_allow=_before_allow,
         )
-
-    def _observe_state(
-        self,
-        approval_id: str,
-        envelope_digest: str | None,
-        state_observer: Callable[[], Any] | None,
-    ) -> str | None:
-        """Host observation of the target state, taken next to execution.
-
-        Only consulted when the grant froze a digest. A failing observer
-        yields ``None``, which ``try_consume`` treats as a mismatch.
-        """
-        if state_observer is None:
-            return envelope_digest
-        record = self._approvals.lookup(approval_id)
-        if record is None or record.state_digest is None:
-            return envelope_digest
-        try:
-            observed = state_observer()
-        except Exception:
-            return None
-        return observed if isinstance(observed, str) else None
 
     def _finalize_allow(
         self,
@@ -600,7 +581,7 @@ def evaluate(
     runtime: PepRuntime | None = None,
     *,
     now: datetime | None = None,
-    state_observer: Callable[[], Any] | None = None,
+    state_observer: Callable[[], object] | None = None,
     _before_allow: Callable[[], None] | None = None,
 ) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""

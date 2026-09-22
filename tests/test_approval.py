@@ -491,6 +491,59 @@ def test_state_observer_runs_through_gated_invoke_and_blocks_tool_entry():
     assert calls == {"tool": 0, "observer": 1}
 
 
+def test_state_observer_not_called_when_grant_fails_an_earlier_check():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    calls = {"n": 0}
+
+    def observer() -> str:
+        calls["n"] += 1
+        return STATE_A
+
+    expired = _issue(runtime, now=now, state_digest=STATE_A, ttl_seconds=60)
+    late = evaluate(
+        _base(approval_id=expired.approval_id),
+        runtime=runtime,
+        now=now + timedelta(minutes=5),
+        state_observer=observer,
+    )
+    assert late.receipt.reason_code == ReasonCode.APPROVAL_EXPIRED
+    spent = _issue(runtime, now=now, state_digest=STATE_A)
+    first = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, now=now, state_observer=observer)
+    assert first.verdict == "ALLOW" and calls["n"] == 1
+    replay = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, now=now, state_observer=observer)
+    assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
+    bound = _issue(runtime, now=now, state_digest=STATE_A)
+    mutated = evaluate(
+        _base(approval_id=bound.approval_id, args=dict(MUTATED_ARGS)),
+        runtime=runtime,
+        now=now,
+        state_observer=observer,
+    )
+    assert mutated.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
+    unknown = evaluate(_base(approval_id="lab.appr.nope"), runtime=runtime, now=now, state_observer=observer)
+    assert unknown.receipt.reason_code == ReasonCode.APPROVAL_INVALID
+    assert calls["n"] == 1
+
+
+def test_state_mismatch_detail_distinguishes_failed_observer_from_mismatch():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+
+    def boom() -> str:
+        raise OSError("target unreadable")
+
+    failed = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=boom)
+    assert failed.receipt.reason_detail.endswith("state observer failed")
+    wrong = evaluate(
+        _base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=lambda: STATE_B
+    )
+    assert wrong.receipt.reason_detail.endswith("state observer mismatch")
+    envelope_only = evaluate(_base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, now=now)
+    assert envelope_only.receipt.reason_detail.endswith("envelope state digest mismatch")
+
+
 def test_state_observer_is_not_consulted_without_a_frozen_digest():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)

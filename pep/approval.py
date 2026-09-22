@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from pep.canonical import canonical_dumps, sha256_prefixed
 from pep.reasons import ReasonCode
@@ -81,7 +81,7 @@ class ApprovalRecord:
             return False
         return self.covers(tool_name) and self.binding_digest == digest
 
-    def matches_state(self, observed_state_digest: str | None) -> bool:
+    def matches_state(self, observed_state_digest: object) -> bool:
         if self.state_digest is None:
             return True
         return normalize_state_digest(observed_state_digest) == self.state_digest
@@ -91,6 +91,14 @@ class ApprovalRecord:
 
     def consumed(self) -> bool:
         return self.consumed_at is not None
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumeResult:
+    """Outcome of one consume attempt. ``reason`` is None when the grant was taken."""
+
+    reason: ReasonCode | None
+    detail: str | None = None
 
 
 class ApprovalStore:
@@ -169,32 +177,62 @@ class ApprovalStore:
         *,
         args: Mapping[str, Any],
         state_digest: str | None = None,
+        observe: Callable[[], object] | None = None,
     ) -> ReasonCode | None:
-        """Atomically consume a valid grant. ``None`` means the grant was taken.
+        """Atomically consume a valid grant. ``None`` means the grant was taken."""
+        return self.consume(
+            approval_id, tool_name, now, args=args, state_digest=state_digest, observe=observe
+        ).reason
 
-        Any other return is a fail-closed deny reason. Single-use is enforced
-        under the lock so two concurrent allows cannot share one grant.
-        A tool or args mismatch against the frozen binding does not consume.
-        When the grant froze a state digest, a missing or different
-        host-observed digest is ``APPROVAL_STATE_MISMATCH`` and does not consume.
+    def consume(
+        self,
+        approval_id: str,
+        tool_name: str,
+        now: datetime | None = None,
+        *,
+        args: Mapping[str, Any],
+        state_digest: str | None = None,
+        observe: Callable[[], object] | None = None,
+    ) -> ConsumeResult:
+        """Atomically consume a valid grant, with the state observation inside.
+
+        Any non-None reason is a fail-closed deny. Single-use is enforced under
+        the lock so two concurrent allows cannot share one grant. A tool or args
+        mismatch against the frozen binding does not consume.
+
+        When the grant froze a state digest, the observation is taken here:
+        ``observe`` (the host's read of the target) runs only after the grant
+        has passed existence, single-use, expiry and binding checks, and its
+        return replaces ``state_digest``. A raising or non-digest observer, or
+        a missing or different digest, is ``APPROVAL_STATE_MISMATCH`` and does
+        not consume. Grants without a frozen digest never call ``observe``.
         """
         clock = _aware(now)
         with self._lock:
             record = self._records.get(approval_id)
             if record is None:
-                return ReasonCode.APPROVAL_INVALID
+                return ConsumeResult(ReasonCode.APPROVAL_INVALID)
             if record.consumed():
-                return ReasonCode.APPROVAL_CONSUMED
+                return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
             if record.expired(clock):
-                return ReasonCode.APPROVAL_EXPIRED
+                return ConsumeResult(ReasonCode.APPROVAL_EXPIRED)
             if not record.matches_binding(tool_name, args):
-                return ReasonCode.APPROVAL_BINDING_MISMATCH
-            if not record.matches_state(state_digest):
-                return ReasonCode.APPROVAL_STATE_MISMATCH
+                return ConsumeResult(ReasonCode.APPROVAL_BINDING_MISMATCH)
+            if record.state_digest is not None:
+                observed: object = state_digest
+                source = "envelope state digest"
+                if observe is not None:
+                    source = "state observer"
+                    try:
+                        observed = observe()
+                    except Exception:
+                        return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, "state observer failed")
+                if not record.matches_state(observed):
+                    return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, f"{source} mismatch")
             if not record.single_use:
-                return ReasonCode.APPROVAL_INVALID
+                return ConsumeResult(ReasonCode.APPROVAL_INVALID)
             self._records[approval_id] = replace(record, consumed_at=clock)
-            return None
+            return ConsumeResult(None)
 
 
 def normalize_state_digest(value: Any) -> str | None:
