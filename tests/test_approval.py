@@ -392,7 +392,7 @@ def test_grant_without_state_digest_ignores_envelope_state_digest():
 
 def test_mint_rejects_malformed_state_digest():
     runtime = _runtime()
-    for bad in ("sha256:abc", "md5:" + "a" * 32, "a" * 64, ""):
+    for bad in ("sha256:abc", "md5:" + "a" * 32, "a" * 64, "", " " + STATE_A, STATE_A + "\n"):
         with pytest.raises(ApprovalError):
             _issue(runtime, state_digest=bad)
 

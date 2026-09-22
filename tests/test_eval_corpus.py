@@ -166,6 +166,25 @@ def test_noul_taxonomy_rows_deny_without_consulting_prose():
         assert "0.99" not in live["reason_detail"]
 
 
+def test_threat_model_rows_deny_without_consulting_prose():
+    """multi_session_plant and deferred_tool: attachments and coax keys are inert."""
+    import copy
+    import dataclasses
+
+    rows = [row for row in list_corpus_rows() if row.deny_class in {"multi_session_plant", "deferred_tool"}]
+    assert {row.deny_class for row in rows} == {"multi_session_plant", "deferred_tool"}
+    for row in rows:
+        with_prose = evaluate_corpus_row(row)
+        stripped = copy.deepcopy(row.envelope)
+        stripped["untrusted_attachments"] = {"agent_prose_role": "data_only_never_policy"}
+        stripped["policy_context"] = {
+            k: v for k, v in stripped["policy_context"].items() if not k.startswith("please_")
+        }
+        bare = evaluate_corpus_row(dataclasses.replace(row, envelope=stripped))
+        assert with_prose.verdict == bare.verdict == "DENY"
+        assert with_prose.receipt.reason_code == bare.receipt.reason_code == row.expected_receipt["reason_code"]
+
+
 def test_official_demo_row_still_denies_independently_of_corpus():
     decision, invoked = evaluate_official_row()
     assert decision.verdict == "DENY"

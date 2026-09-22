@@ -35,7 +35,8 @@ REQUIRED_DENY_CLASSES = frozenset(
         "approval_binding",
         "approval_state_substitution",
         "late_effect_fence",
-        # Threat-model classes named in the joint measured-corpus seed.
+        # Threat-model classes named in the joint-eval measured-corpus v0 seed
+        # (docs/measured-corpus-v0.md in that repo). Rows only; no new mechanism.
         "multi_session_plant",
         "deferred_tool",
         # Eval taxonomy only. Noul labels are not allow or deny authority.
