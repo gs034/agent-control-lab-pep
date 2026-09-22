@@ -84,9 +84,10 @@ def complete_invoke(
     unchanged, so a fresh post-kill evaluate stays ``kill_active``.
 
     When the admission consumed a grant with a frozen state digest and an
-    observer was given, the target is re-observed here, before the permit is
-    claimed; a change is DENY ``approval_state_mismatch`` with the grant
-    already spent. ``_before_commit`` is a yield before that locked transition (tests use it
+    observer was given, the target is re-observed here, after a fence read and
+    before the permit is claimed; a change is DENY ``approval_state_mismatch``
+    with the grant already spent. A cut seen by the fence read denies first and
+    skips the observer. ``_before_commit`` is a yield before that locked transition (tests use it
     to cut in the old check-then-call gap). It is not a permit. The runtime
     re-checks under the lock after it returns. Once ``tool()`` has started,
     this gate does not preempt it.
@@ -94,6 +95,11 @@ def complete_invoke(
     decision = pending.decision
     if not decision.allowed():
         return decision, None
+    # Fence first: no host read after the cut, and kill keeps precedence over a
+    # state mismatch. claim_entry re-decides under the lock below.
+    cut = pending.runtime.entry_blocked(pending.admitted_epoch)
+    if cut is not None:
+        return supersede(decision, cut), None
     if not _state_still_matches(pending):
         # The grant was consumed at admission; a changed target at entry is a
         # fail-closed deny with the grant spent, like a suspend after consume.

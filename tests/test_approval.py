@@ -602,6 +602,29 @@ def test_split_admission_enters_tool_when_state_unchanged_and_raising_observer_d
     assert result is None
 
 
+def test_kill_between_admission_and_entry_denies_fence_first_and_skips_observer():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    target = {"digest": STATE_A}
+    calls = {"observer": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return target["digest"]
+
+    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, state_observer=observer)
+    assert calls["observer"] == 1
+    runtime.kill()
+    target["digest"] = STATE_B
+    decision, result = complete_invoke(pending, lambda: "ran")
+    assert decision.receipt.reason_code == ReasonCode.LATE_EFFECT_FENCE
+    assert result is None
+    assert calls["observer"] == 1  # no host read after the cut
+
+
 def test_split_admission_without_observer_or_frozen_digest_has_no_entry_recheck():
     from pep.gate import begin_invoke, complete_invoke
 

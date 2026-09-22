@@ -200,6 +200,14 @@ class PepRuntime:
         self._spent_admissions.add(admission_id)
         return None
 
+    def entry_blocked(self, admitted_epoch: int) -> ReasonCode | None:
+        """Cheap fence read for callers about to do host work before ``claim_entry``.
+
+        Not a permit. ``claim_entry`` decides again under the lock.
+        """
+        with self._lock:
+            return self._entry_block_unlocked(admitted_epoch)
+
     def claim_entry(
         self,
         admission_id: int,

@@ -226,8 +226,9 @@ class ApprovalStore:
 
         ``observe`` runs with the store lock held, so it must be quick and must
         not call back into this store or into the runtime; a callback into the
-        store is refused as a mismatch (``state observer re-entered store``)
-        rather than deadlocking.
+        store from this thread is refused as a mismatch (``state observer
+        re-entered store``) rather than deadlocking. A callback from another
+        thread the observer spawns is not detected and would block.
         """
         self._refuse_reentry()
         clock = _aware(now)
