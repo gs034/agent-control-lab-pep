@@ -1,6 +1,6 @@
 # ADR-0001 — Lab host/runtime PEP architecture
 
-- **Status:** Accepted (v0.3.2 / late-effect fence; v0.3.1 approval invoke binding remains)
+- **Status:** Accepted (v0.3.3 / approval state digest; v0.3.2 late-effect fence and v0.3.1 approval invoke binding remain)
 - **Date:** 2026-09-21
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
@@ -80,7 +80,7 @@ Every decision emits a receipt that attests `decision`, `reason_code`, `envelope
 
 - Diligence readers can treat `pep/evaluate.py` as the enforcement plane, not a model-graded monitor.
 - Official `eval/` deny (`python -m pep.demo`) stays a fail-closed DENY with the frozen receipt shape (`policy_version` remains `0.1.0-stub` on that allowlist).
-- Package version `0.3.2` names the late-effect fence on the v0.3.1 / approval-binding tree, not a production control plane. `0.3.1` remains the approval-binding patch.
+- Package version `0.3.3` names the optional approval state digest on the v0.3.2 / late-effect-fence tree, not a production control plane. `0.3.2` remains the late-effect fence patch and `0.3.1` the approval-binding patch.
 - EOI **M1** (evaluator corpus) adds rows under `eval/corpus/`; v0.3.1 adds approval-binding rows on the same path. The official demo row stays at `eval/` root. Allow authority does not move onto a model or monitor.
 - Approvals may later persist out of process; the grant and fail-closed rules above stay.
 

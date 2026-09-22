@@ -79,7 +79,7 @@ Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v
 | `eval/` | Official Deep Research row, envelope, prose, expected receipt, frozen receipt schema |
 | `eval/corpus/` | M1 structured envelopes + expected receipts (deny classes + catalog-bound ALLOW + approval binding) |
 | `docs/adr/ADR-0001-lab-pep-architecture.md` | Architecture decision: trust domain, grants, fail-closed, halt, receipts |
-| `docs/ROADMAP.md` | stub → v0.2 → v0.3 / EOI M1 → v0.3.1 approval binding → v0.3.2 late-effect fence |
+| `docs/ROADMAP.md` | stub → v0.2 → v0.3 / EOI M1 → v0.3.1 approval binding → v0.3.2 late-effect fence → v0.3.3 state digest |
 | `docs/threat-model.md` | Public host/runtime PEP threat model and control taxonomy |
 | `docs/DILIGENCE-HISTORY.md` | Residual historical PR refs by SHA/ref (tip stays Lab-clean) |
 | `SECURITY.md` | Fail-closed default, trust domain, how to report issues |
