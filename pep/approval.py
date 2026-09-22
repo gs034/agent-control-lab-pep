@@ -136,6 +136,7 @@ class ApprovalStore:
         catalog: Mapping[str, object] | None = None,
         state_digest: str | None = None,
     ) -> ApprovalRecord:
+        self._refuse_reentry()
         clock = _aware(now)
         frozen_state = normalize_state_digest(state_digest)
         if state_digest is not None and frozen_state is None:
@@ -178,6 +179,7 @@ class ApprovalStore:
         return record
 
     def lookup(self, approval_id: str) -> ApprovalRecord | None:
+        self._refuse_reentry()
         with self._lock:
             return self._records.get(approval_id)
 
@@ -191,7 +193,10 @@ class ApprovalStore:
         state_digest: str | None = None,
         observe: Callable[[], object] | None = None,
     ) -> ReasonCode | None:
-        """Atomically consume a valid grant. ``None`` means the grant was taken."""
+        """Atomically consume a valid grant. ``None`` means the grant was taken.
+
+        Thin wrapper over ``consume`` for callers that need only the reason.
+        """
         return self.consume(
             approval_id, tool_name, now, args=args, state_digest=state_digest, observe=observe
         ).reason
@@ -218,7 +223,13 @@ class ApprovalStore:
         return replaces ``state_digest``. A raising or non-digest observer, or
         a missing or different digest, is ``APPROVAL_STATE_MISMATCH`` and does
         not consume. Grants without a frozen digest never call ``observe``.
+
+        ``observe`` runs with the store lock held, so it must be quick and must
+        not call back into this store or into the runtime; a callback into the
+        store is refused as a mismatch (``state observer re-entered store``)
+        rather than deadlocking.
         """
+        self._refuse_reentry()
         clock = _aware(now)
         with self._lock:
             record = self._records.get(approval_id)
@@ -230,19 +241,26 @@ class ApprovalStore:
                 return ConsumeResult(ReasonCode.APPROVAL_EXPIRED)
             if not record.matches_binding(tool_name, args):
                 return ConsumeResult(ReasonCode.APPROVAL_BINDING_MISMATCH)
+            if not record.single_use:
+                return ConsumeResult(ReasonCode.APPROVAL_INVALID)
             if record.state_digest is not None:
                 observed: object = state_digest
                 source = "envelope state digest"
                 if observe is not None:
                     source = "state observer"
+                    self._observing.active = True
                     try:
                         observed = observe()
+                    except ObserverReentry:
+                        return ConsumeResult(
+                            ReasonCode.APPROVAL_STATE_MISMATCH, "state observer re-entered store"
+                        )
                     except Exception:
                         return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, "state observer failed")
+                    finally:
+                        self._observing.active = False
                 if not record.matches_state(observed):
                     return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, f"{source} mismatch")
-            if not record.single_use:
-                return ConsumeResult(ReasonCode.APPROVAL_INVALID)
             self._records[approval_id] = replace(record, consumed_at=clock)
             return ConsumeResult(None, frozen_state_digest=record.state_digest)
 

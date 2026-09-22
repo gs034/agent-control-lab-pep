@@ -617,6 +617,25 @@ def test_split_admission_without_observer_or_frozen_digest_has_no_entry_recheck(
     assert complete_invoke(pending, lambda: "ran")[1] == "ran"
 
 
+def test_observer_that_reenters_the_store_is_denied_not_deadlocked():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+
+    def reentrant() -> str:
+        runtime.approvals.lookup(grant.approval_id)
+        return STATE_A
+
+    decision = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=reentrant)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert decision.receipt.reason_detail.endswith("state observer re-entered store")
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+    # The guard is per thread and cleared afterwards: a well-behaved observer still works.
+    ok = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=lambda: STATE_A)
+    assert ok.verdict == "ALLOW"
+
+
 def test_state_observer_is_not_consulted_without_a_frozen_digest():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
