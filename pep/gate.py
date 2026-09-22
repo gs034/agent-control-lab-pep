@@ -44,6 +44,7 @@ def begin_invoke(
     runtime: PepRuntime | None = None,
     *,
     now: datetime | None = None,
+    state_observer: Callable[[], object] | None = None,
 ) -> PendingInvoke:
     """Admit one invoke. Does not call a tool.
 
@@ -53,7 +54,7 @@ def begin_invoke(
     pep = resolve_runtime(runtime)
     admission_id = pep.mint_admission_id()
     admitted_epoch = pep.fence_epoch
-    decision = evaluate(envelope, runtime=pep, now=now)
+    decision = evaluate(envelope, runtime=pep, now=now, state_observer=state_observer)
     return PendingInvoke(
         decision=decision,
         admitted_epoch=admitted_epoch,
@@ -101,11 +102,14 @@ def gated_invoke(
     runtime: PepRuntime | None = None,
     *,
     now: datetime | None = None,
+    state_observer: Callable[[], object] | None = None,
 ) -> tuple[Decision, T | None]:
     """Run ``tool`` only after ``evaluate`` returns ALLOW and the fence is open.
 
     On DENY the callable is not entered. Callers that bypass this helper
-    are outside the PEP trust domain.
+    are outside the PEP trust domain. ``state_observer`` lets the host read
+    the target state inside the gate, next to execution, when the approval
+    froze a state digest.
     """
-    pending = begin_invoke(envelope, runtime=runtime, now=now)
+    pending = begin_invoke(envelope, runtime=runtime, now=now, state_observer=state_observer)
     return complete_invoke(pending, tool)

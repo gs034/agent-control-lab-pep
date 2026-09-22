@@ -416,3 +416,93 @@ def test_prose_cannot_supply_state_digest_for_binding():
     assert coaxed.receipt.reason_code == ReasonCode.AGENT_PROSE_REJECTED
     stored = runtime.approvals.lookup(grant.approval_id)
     assert stored is not None and not stored.consumed()
+
+
+def test_state_observer_overrides_envelope_digest_at_consume():
+    """The host observes the target inside the gate, next to execution."""
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    # Envelope still claims A; the host observes B at consume time.
+    swapped = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A),
+        runtime=runtime,
+        now=now,
+        state_observer=lambda: STATE_B,
+    )
+    assert swapped.verdict == "DENY"
+    assert swapped.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+    # Observer confirms A: ALLOW even when the envelope omits the digest.
+    ok = evaluate(
+        _base(approval_id=grant.approval_id),
+        runtime=runtime,
+        now=now,
+        state_observer=lambda: STATE_A,
+    )
+    assert ok.verdict == "ALLOW"
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_state_observer_failure_or_bad_value_is_deny():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+
+    def boom() -> str:
+        raise OSError("target unreadable")
+
+    for observer in (boom, lambda: None, lambda: "not-a-digest", lambda: 42):
+        decision = evaluate(
+            _base(approval_id=grant.approval_id, state_digest=STATE_A),
+            runtime=runtime,
+            now=now,
+            state_observer=observer,
+        )
+        assert decision.verdict == "DENY"
+        assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_state_observer_runs_through_gated_invoke_and_blocks_tool_entry():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    calls = {"tool": 0, "observer": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return STATE_B
+
+    def tool() -> str:
+        calls["tool"] += 1
+        return "ran"
+
+    decision, result = gated_invoke(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A),
+        tool,
+        runtime,
+        now=now,
+        state_observer=observer,
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert result is None
+    assert calls == {"tool": 0, "observer": 1}
+
+
+def test_state_observer_is_not_consulted_without_a_frozen_digest():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    calls = {"observer": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return STATE_B
+
+    decision = evaluate(
+        _base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=observer
+    )
+    assert decision.verdict == "ALLOW"
+    assert calls["observer"] == 0

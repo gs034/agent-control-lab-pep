@@ -305,8 +305,18 @@ class PepRuntime:
         envelope: Any,
         *,
         now: datetime | None = None,
+        state_observer: Callable[[], Any] | None = None,
         _before_allow: Callable[[], None] | None = None,
     ) -> Decision:
+        """Evaluate one structured envelope.
+
+        ``state_observer`` is a host callable that reads the current digest of
+        the state the invoke acts on. When the referenced approval froze a
+        state digest, the gate calls it here, at consume time, and its return
+        value is the observation; the envelope's ``state_digest`` is used only
+        when no observer is given. An observer that raises or returns
+        something other than a digest is a mismatch.
+        """
         try:
             clock = _aware_clock(now)
         except (TypeError, ValueError):
@@ -443,12 +453,13 @@ class PepRuntime:
             )
 
         if approval is not None:
+            observed_state = self._observe_state(approval, parsed.state_digest, state_observer)
             consume_reason = self._approvals.try_consume(
                 approval,
                 parsed.tool_name,
                 now=clock,
                 args=parsed.args,
-                state_digest=parsed.state_digest,
+                state_digest=observed_state,
             )
             if consume_reason is not None:
                 return _deny(
@@ -466,6 +477,28 @@ class PepRuntime:
             policy_file_unchanged=policy.bytes_unchanged(),
             _before_allow=_before_allow,
         )
+
+    def _observe_state(
+        self,
+        approval_id: str,
+        envelope_digest: str | None,
+        state_observer: Callable[[], Any] | None,
+    ) -> str | None:
+        """Host observation of the target state, taken next to execution.
+
+        Only consulted when the grant froze a digest. A failing observer
+        yields ``None``, which ``try_consume`` treats as a mismatch.
+        """
+        if state_observer is None:
+            return envelope_digest
+        record = self._approvals.lookup(approval_id)
+        if record is None or record.state_digest is None:
+            return envelope_digest
+        try:
+            observed = state_observer()
+        except Exception:
+            return None
+        return observed if isinstance(observed, str) else None
 
     def _finalize_allow(
         self,
@@ -567,11 +600,14 @@ def evaluate(
     runtime: PepRuntime | None = None,
     *,
     now: datetime | None = None,
+    state_observer: Callable[[], Any] | None = None,
     _before_allow: Callable[[], None] | None = None,
 ) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""
     pep = resolve_runtime(runtime)
-    return pep.evaluate(envelope, now=now, _before_allow=_before_allow)
+    return pep.evaluate(
+        envelope, now=now, state_observer=state_observer, _before_allow=_before_allow
+    )
 
 
 def supersede(decision: Decision, reason: ReasonCode) -> Decision:
