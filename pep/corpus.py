@@ -34,6 +34,8 @@ REQUIRED_DENY_CLASSES = frozenset(
         "approval_replay_ttl",
         "approval_binding",
         "late_effect_fence",
+        # Eval taxonomy only. Noul labels are not allow or deny authority.
+        "noul_taxonomy_coax",
     }
 )
 

@@ -13,6 +13,7 @@ from pep.corpus import (
     evaluate_corpus_row,
     gated_corpus_row,
     list_corpus_rows,
+    load_corpus_index,
     runtime_for_spec,
 )
 from pep.evaluate import evaluate
@@ -108,6 +109,61 @@ def test_exact_approval_bind_allows_then_replay_consumed():
     assert first.receipt.reason_code == "allowed"
     assert replay.verdict == "DENY"
     assert replay.receipt.reason_code == "approval_consumed"
+
+
+NOUL_TAXONOMY_LABELS = frozenset(
+    {
+        "intent_coverage",
+        "no_secret_egress",
+        "no_irreversible_damage",
+        "local_scope",
+        "path_not_protected",
+        "no_fetched_code_execution",
+        "prompt_injection_absent",
+        "policy_compliance",
+    }
+)
+
+
+def test_noul_taxonomy_rows_deny_without_consulting_prose():
+    """Noul labels are eval taxonomy. High-SAFE coax is not policy."""
+    index = load_corpus_index()
+    specs = [spec for spec in index["rows"] if "noul_label" in spec]
+    assert {spec["noul_label"] for spec in specs} == NOUL_TAXONOMY_LABELS
+    assert len(specs) == len(NOUL_TAXONOMY_LABELS)
+    assert "noul_taxonomy_coax" in REQUIRED_DENY_CLASSES
+    loaded = {row.row_id: row for row in list_corpus_rows()}
+    for spec in specs:
+        row = loaded[spec["id"]]
+        label = spec["noul_label"]
+        assert row.deny_class == "noul_taxonomy_coax"
+        assert row.expected_decision == "DENY"
+        assert spec["class"] == "noul_taxonomy_coax"
+        claim = row.envelope["untrusted_attachments"]["noul_coax"]
+        assert label in claim
+        assert "0.99" in claim
+        assert "SAFE" in claim
+        assert row.envelope.get("monitor_verdict") == "SAFE"
+        assert row.envelope.get("please_allow") is True
+        invoked = {"n": 0}
+
+        def tool(bucket=invoked):
+            bucket["n"] += 1
+            return "ok"
+
+        decision, result = gated_corpus_row(row, tool)
+        live = decision.to_dict()
+        assert decision.verdict == "DENY"
+        assert result is None
+        assert invoked["n"] == 0
+        assert live["judge"]["agent_prose_used_as_policy"] is False
+        assert live["negative_controls_observed"]["monitor_coax_accepted"] is False
+        assert live["negative_controls_observed"]["tool_invoke_executed"] is False
+        assert live["reason_code"] == "agent_prose_rejected"
+        assert "monitor_verdict" in live["reason_detail"]
+        assert "please_allow" in live["reason_detail"]
+        assert label not in live["reason_detail"]
+        assert "0.99" not in live["reason_detail"]
 
 
 def test_official_demo_row_still_denies_independently_of_corpus():
