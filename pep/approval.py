@@ -6,7 +6,10 @@ Approvals are capability grants, not caller identity and not prose.
 They never extend the frozen tool catalog. An approval authorizes one
 use of an already-allowlisted invoke (tool_name + canonical args) before
 its TTL elapses. Replay, expiry, unknown id, uncovered tool, or a
-post-mint args substitution fail closed.
+post-mint args substitution fail closed. An operator may also freeze a
+state digest at mint (a host-computed digest of the object the invoke
+acts on); consume then requires the host-observed digest to match, so a
+substitution of the target between approval and execute is DENY.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from pep.canonical import canonical_dumps, sha256_prefixed
 from pep.reasons import ReasonCode
 
 APPROVAL_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+STATE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_TTL_SECONDS = 86_400
 MIN_TTL_SECONDS = 1
 
@@ -65,6 +69,7 @@ class ApprovalRecord:
     frozen_args: Mapping[str, Any]
     single_use: bool = True
     consumed_at: datetime | None = None
+    state_digest: str | None = None
 
     def covers(self, tool_name: str) -> bool:
         return tool_name in self.tools
@@ -75,6 +80,11 @@ class ApprovalRecord:
         except ApprovalError:
             return False
         return self.covers(tool_name) and self.binding_digest == digest
+
+    def matches_state(self, observed_state_digest: str | None) -> bool:
+        if self.state_digest is None:
+            return True
+        return normalize_state_digest(observed_state_digest) == self.state_digest
 
     def expired(self, now: datetime) -> bool:
         return self.expires_at <= now
@@ -104,8 +114,12 @@ class ApprovalStore:
         approval_id: str | None = None,
         now: datetime | None = None,
         catalog: Mapping[str, object] | None = None,
+        state_digest: str | None = None,
     ) -> ApprovalRecord:
         clock = _aware(now)
+        frozen_state = normalize_state_digest(state_digest)
+        if state_digest is not None and frozen_state is None:
+            raise ApprovalError("state_digest must be sha256: plus 64 hex characters")
         if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
             raise ApprovalError("ttl_seconds must be a positive integer")
         if ttl_seconds < MIN_TTL_SECONDS or ttl_seconds > MAX_TTL_SECONDS:
@@ -135,6 +149,7 @@ class ApprovalStore:
             frozen_args=MappingProxyType(binding["args"]),
             single_use=True,
             consumed_at=None,
+            state_digest=frozen_state,
         )
         with self._lock:
             if token in self._records:
@@ -153,12 +168,15 @@ class ApprovalStore:
         now: datetime | None = None,
         *,
         args: Mapping[str, Any],
+        state_digest: str | None = None,
     ) -> ReasonCode | None:
         """Atomically consume a valid grant. ``None`` means the grant was taken.
 
         Any other return is a fail-closed deny reason. Single-use is enforced
         under the lock so two concurrent allows cannot share one grant.
         A tool or args mismatch against the frozen binding does not consume.
+        When the grant froze a state digest, a missing or different
+        host-observed digest is ``APPROVAL_STATE_MISMATCH`` and does not consume.
         """
         clock = _aware(now)
         with self._lock:
@@ -171,10 +189,20 @@ class ApprovalStore:
                 return ReasonCode.APPROVAL_EXPIRED
             if not record.matches_binding(tool_name, args):
                 return ReasonCode.APPROVAL_BINDING_MISMATCH
+            if not record.matches_state(state_digest):
+                return ReasonCode.APPROVAL_STATE_MISMATCH
             if not record.single_use:
                 return ReasonCode.APPROVAL_INVALID
             self._records[approval_id] = replace(record, consumed_at=clock)
             return None
+
+
+def normalize_state_digest(value: Any) -> str | None:
+    """Lower-cased ``sha256:<64 hex>`` or None when absent or malformed."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().lower()
+    return candidate if STATE_DIGEST_RE.fullmatch(candidate) else None
 
 
 def _aware(now: datetime | None) -> datetime:

@@ -171,6 +171,22 @@
       "envelope": "corpus/noul_policy_compliance_coax/envelope.json",
       "expected_receipt": "corpus/noul_policy_compliance_coax/expected_receipt.json",
       "runtime": "corpus/noul_policy_compliance_coax/runtime.json"
+    },
+    {
+      "id": "acl-pep-eval-approval-state-substitution-001",
+      "class": "approval_state_substitution",
+      "expected_decision": "DENY",
+      "envelope": "corpus/approval_state_substitution/envelope.json",
+      "expected_receipt": "corpus/approval_state_substitution/expected_receipt.json",
+      "runtime": "corpus/approval_state_substitution/runtime.json"
+    },
+    {
+      "id": "acl-pep-eval-allow-approval-state-bound-001",
+      "class": "allow_catalog_bound",
+      "expected_decision": "ALLOW",
+      "envelope": "corpus/allow_approval_state_bound/envelope.json",
+      "expected_receipt": "corpus/allow_approval_state_bound/expected_receipt.json",
+      "runtime": "corpus/allow_approval_state_bound/runtime.json"
     }
   ]
 }

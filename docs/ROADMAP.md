@@ -2,7 +2,7 @@
 
 Brand: **Agent Control Lab**. Licence: **Apache-2.0**. This is a public-goods reference PEP, not a shipping product.
 
-Versions below are **lab milestones**, not a vendor SKU. Package `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt still attests `policy_version: 0.1.0-stub`.
+Versions below are **lab milestones**, not a vendor SKU. Package `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt still attests `policy_version: 0.1.0-stub`.
 
 ## stub (published 0.1)
 
@@ -69,6 +69,22 @@ Same PEP trust domain. `kill()` must fence late effects, not only flip the halt 
 | Official `python -m pep.demo` DENY unchanged | Required invariant |
 
 Still open on this patch: once `tool()` has started, that call is not preempted or rolled back; a process-external callback that skips `complete_invoke` is outside the trust domain; `HaltStore` does not reconstruct another process’s admissions (reload denies new work as `kill_active` only). Also deferred: an approval may be consumed before a later suspend or kill deny, so the grant is spent without ALLOW; `_spent_admissions` is unbounded for a long-lived runtime.
+
+## v0.3.3 / approval state digest (this tree)
+
+Same PEP trust domain. Binding `tool_name` plus canonical args closes the Loopjacking-class representation mismatch, not its second failure mode: the approved operation is unchanged but the object it acts on is swapped between approval and execute (post-approval state substitution; [arXiv:2609.21081](https://arxiv.org/abs/2609.21081) as a pattern name; not a measured ASR claim).
+
+| Work | Status |
+| --- | --- |
+| `issue_approval(..., state_digest=)` freezes a host-computed `sha256:` digest of the target state on `ApprovalRecord` (optional) | In tree |
+| Envelope `schema_fields.state_digest` (Lab form) / `state_digest` (flat form) carries the host-observed digest; it is not part of args and prose cannot supply it | In tree |
+| `try_consume` requires an equal observed digest when one was frozen; missing or different → `approval_state_mismatch`, grant not consumed; args mismatch still reports first | In tree |
+| Grants without a frozen digest ignore any envelope digest (behaviour of every existing row unchanged) | In tree |
+| Corpus: `approval_state_substitution` DENY and `allow_approval_state_bound` ALLOW-then-consume | In tree |
+| Receipt schema stays frozen v1 (new reason code only) | Required invariant |
+| Official `python -m pep.demo` DENY unchanged | Required invariant |
+
+Still open: the digest is host-computed and host-observed; the PEP does not read the target itself, so a host that computes the digest over the wrong object, or that omits it where the operator froze one, is outside this control (the omission case fails closed). What counts as "the state" is the operator's definition at mint time, not the PEP's.
 
 ## Remaining v1 notes
 

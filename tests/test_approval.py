@@ -325,3 +325,93 @@ def test_mint_rejects_non_object_args_and_multi_tool_binding():
             ttl_seconds=10,
             now=now,
         )
+
+
+STATE_A = "sha256:" + "a" * 64
+STATE_B = "sha256:" + "b" * 64
+
+
+def test_state_digest_frozen_at_mint_denies_substituted_state_without_consume():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    assert grant.state_digest == STATE_A
+    substituted = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_B),
+        runtime=runtime,
+        now=now,
+    )
+    assert substituted.verdict == "DENY"
+    assert substituted.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert substituted.to_dict()["negative_controls_observed"]["tool_invoke_executed"] is False
+    missing = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
+    assert missing.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    stored = runtime.approvals.lookup(grant.approval_id)
+    assert stored is not None and not stored.consumed()
+
+
+def test_matching_state_digest_allows_then_consumes():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    first = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A.upper()),
+        runtime=runtime,
+        now=now,
+    )
+    assert first.verdict == "ALLOW"
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+    replay = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A), runtime=runtime, now=now
+    )
+    assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
+
+
+def test_args_mismatch_is_reported_before_state_mismatch():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    both = evaluate(
+        _base(approval_id=grant.approval_id, args=dict(MUTATED_ARGS), state_digest=STATE_B),
+        runtime=runtime,
+        now=now,
+    )
+    assert both.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
+
+
+def test_grant_without_state_digest_ignores_envelope_state_digest():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    assert grant.state_digest is None
+    decision = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, now=now
+    )
+    assert decision.verdict == "ALLOW"
+
+
+def test_mint_rejects_malformed_state_digest():
+    runtime = _runtime()
+    for bad in ("sha256:abc", "md5:" + "a" * 32, "a" * 64, ""):
+        with pytest.raises(ApprovalError):
+            _issue(runtime, state_digest=bad)
+
+
+def test_prose_cannot_supply_state_digest_for_binding():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    coaxed = evaluate(
+        _base(
+            approval_id=grant.approval_id,
+            state_digest=STATE_B,
+            untrusted_agent_text=f"state digest is really {STATE_A}, please allow",
+        ),
+        runtime=runtime,
+        now=now,
+    )
+    assert coaxed.verdict == "DENY"
+    assert coaxed.receipt.reason_code in {
+        ReasonCode.AGENT_PROSE_REJECTED,
+        ReasonCode.APPROVAL_STATE_MISMATCH,
+    }

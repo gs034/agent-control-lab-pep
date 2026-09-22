@@ -28,6 +28,13 @@ of the binding. This is an existence-proof control for the Loopjacking-class
 representation-mismatch pattern (arXiv:2609.21081), not a measured
 attack-success-rate claim.
 
+The same paper's second failure mode, post-approval state substitution, is
+row `approval_state_substitution`: the operator freezes a host-computed
+`state_digest` at mint, the invoke arrives with exact args but a different
+host-observed digest, and the deny is `approval_state_mismatch` without
+consuming the grant. `allow_approval_state_bound` is the matching ALLOW.
+Grants minted without a state digest behave exactly as before.
+
 `late_effect_fence` admits an allowlisted invoke, then `kill()`, then
 completes that admission. The expected receipt is DENY `late_effect_fence`
 (`cut+fence` in the detail), not `kill_active` and not ALLOW. This is an

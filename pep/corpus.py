@@ -33,6 +33,7 @@ REQUIRED_DENY_CLASSES = frozenset(
         "kill_suspend",
         "approval_replay_ttl",
         "approval_binding",
+        "approval_state_substitution",
         "late_effect_fence",
         # Eval taxonomy only. Noul labels are not allow or deny authority.
         "noul_taxonomy_coax",
@@ -109,6 +110,7 @@ def runtime_for_spec(spec: Mapping[str, Any]) -> tuple[PepRuntime, datetime | No
             approval_id=str(grant["approval_id"]),
             now=issued_at,
             catalog=None if policy_name == "empty" else policy.allowed_tools(),
+            state_digest=grant.get("state_digest"),
         )
         if grant.get("consumed"):
             reason = approvals.try_consume(

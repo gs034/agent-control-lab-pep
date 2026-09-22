@@ -282,8 +282,14 @@ class PepRuntime:
         ttl_seconds: int,
         approval_id: str | None = None,
         now: datetime | None = None,
+        state_digest: str | None = None,
     ) -> ApprovalRecord:
-        """Mint a single-use TTL approval bound to one allowlisted invoke."""
+        """Mint a single-use TTL approval bound to one allowlisted invoke.
+
+        ``state_digest`` optionally freezes a host-computed digest of the state
+        the invoke acts on; consume then requires the host-observed digest to
+        match.
+        """
         return self._approvals.issue(
             tools=(tool_name,),
             args=args,
@@ -291,6 +297,7 @@ class PepRuntime:
             approval_id=approval_id,
             now=now,
             catalog=self._policy.allowed_tools(),
+            state_digest=state_digest,
         )
 
     def evaluate(
@@ -437,7 +444,11 @@ class PepRuntime:
 
         if approval is not None:
             consume_reason = self._approvals.try_consume(
-                approval, parsed.tool_name, now=clock, args=parsed.args
+                approval,
+                parsed.tool_name,
+                now=clock,
+                args=parsed.args,
+                state_digest=parsed.state_digest,
             )
             if consume_reason is not None:
                 return _deny(

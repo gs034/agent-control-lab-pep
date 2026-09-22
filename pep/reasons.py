@@ -25,6 +25,9 @@ class ReasonCode(StrEnum):
     APPROVAL_EXPIRED = "approval_expired"
     APPROVAL_CONSUMED = "approval_consumed"
     APPROVAL_BINDING_MISMATCH = "approval_binding_mismatch"
+    # Approved invoke unchanged, but the host-observed state the invoke acts on
+    # differs from the state digest frozen at mint (post-approval substitution).
+    APPROVAL_STATE_MISMATCH = "approval_state_mismatch"
     ENVELOPE_INVALID = "envelope_invalid"
     # Exact Deep Research receipt code for the official eval row.
     TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY = "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"
