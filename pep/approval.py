@@ -82,9 +82,7 @@ class ApprovalRecord:
         return self.covers(tool_name) and self.binding_digest == digest
 
     def matches_state(self, observed_state_digest: object) -> bool:
-        if self.state_digest is None:
-            return True
-        return normalize_state_digest(observed_state_digest) == self.state_digest
+        return state_matches(self.state_digest, observed_state_digest)
 
     def expired(self, now: datetime) -> bool:
         return self.expires_at <= now
@@ -99,6 +97,8 @@ class ConsumeResult:
 
     reason: ReasonCode | None
     detail: str | None = None
+    # Digest frozen on the consumed grant, so the gate can re-observe at entry.
+    frozen_state_digest: str | None = None
 
 
 class ApprovalStore:
@@ -232,7 +232,12 @@ class ApprovalStore:
             if not record.single_use:
                 return ConsumeResult(ReasonCode.APPROVAL_INVALID)
             self._records[approval_id] = replace(record, consumed_at=clock)
-            return ConsumeResult(None)
+            return ConsumeResult(None, frozen_state_digest=record.state_digest)
+
+
+def state_matches(frozen: str | None, observed: Any) -> bool:
+    """True when no digest was frozen, or the observation normalises to it."""
+    return frozen is None or normalize_state_digest(observed) == frozen
 
 
 def normalize_state_digest(value: Any) -> str | None:

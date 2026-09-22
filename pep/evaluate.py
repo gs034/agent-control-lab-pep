@@ -41,6 +41,9 @@ class RuntimeMode(StrEnum):
 @dataclass(frozen=True, slots=True)
 class Decision:
     receipt: Receipt
+    # Not part of the frozen receipt. Set on an ALLOW that consumed a grant
+    # with a frozen state digest, so the gate can re-observe at tool entry.
+    frozen_state_digest: str | None = None
 
     @property
     def verdict(self) -> Literal["ALLOW", "DENY"]:
@@ -452,6 +455,7 @@ class PepRuntime:
                 policy.bytes_unchanged(),
             )
 
+        frozen_state: str | None = None
         if approval is not None:
             consumed = self._approvals.consume(
                 approval,
@@ -461,6 +465,7 @@ class PepRuntime:
                 state_digest=parsed.state_digest,
                 observe=state_observer,
             )
+            frozen_state = consumed.frozen_state_digest
             if consumed.reason is not None:
                 detail = f"single-use TTL approval rejected: {consumed.reason}"
                 if consumed.detail:
@@ -478,6 +483,7 @@ class PepRuntime:
             envelope_hash=env_hash,
             policy_version=version,
             policy_file_unchanged=policy.bytes_unchanged(),
+            frozen_state_digest=frozen_state,
             _before_allow=_before_allow,
         )
 
@@ -488,6 +494,7 @@ class PepRuntime:
         envelope_hash: str,
         policy_version: str,
         policy_file_unchanged: bool,
+        frozen_state_digest: str | None = None,
         _before_allow: Callable[[], None] | None = None,
     ) -> Decision:
         """Publish ALLOW only if the cut is still open, under the runtime lock.
@@ -521,7 +528,8 @@ class PepRuntime:
                     envelope_hash=envelope_hash,
                     policy_version=policy_version,
                     policy_file_unchanged=policy_file_unchanged,
-                )
+                ),
+                frozen_state_digest=frozen_state_digest,
             )
 
 
@@ -604,10 +612,16 @@ def supersede(decision: Decision, reason: ReasonCode) -> Decision:
 
 
 _KILL_DETAIL = "PEP kill active or PEP unavailable; fail-closed deny, no invoke"
+_STATE_REOBSERVE_DETAIL = (
+    "state re-observed at tool entry differs from the approved digest; "
+    "fail-closed deny, no tool entry (grant already spent)"
+)
 _SUSPEND_DETAIL = "PEP suspend active; fail-closed deny, no invoke"
 
 
 def _reason_detail(reason: ReasonCode) -> str:
+    if reason is ReasonCode.APPROVAL_STATE_MISMATCH:
+        return _STATE_REOBSERVE_DETAIL
     if reason is ReasonCode.LATE_EFFECT_FENCE:
         return LATE_EFFECT_FENCE_DETAIL
     if reason is ReasonCode.ADMISSION_CONSUMED:

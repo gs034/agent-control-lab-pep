@@ -19,7 +19,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeVar
 
+from pep.approval import state_matches
 from pep.evaluate import Decision, PepRuntime, evaluate, resolve_runtime, supersede
+from pep.reasons import ReasonCode
 
 T = TypeVar("T")
 
@@ -37,6 +39,7 @@ class PendingInvoke:
     admitted_epoch: int
     runtime: PepRuntime
     admission_id: int
+    state_observer: Callable[[], object] | None = None
 
 
 def begin_invoke(
@@ -50,7 +53,8 @@ def begin_invoke(
 
     The returned epoch is the cut generation observed before evaluation.
     A later ``kill()`` makes ``complete_invoke`` fail closed. ``state_observer``
-    is passed through to ``evaluate``.
+    is passed to ``evaluate`` and kept on the admission so ``complete_invoke``
+    can re-observe the target at tool entry.
     """
     pep = resolve_runtime(runtime)
     admission_id = pep.mint_admission_id()
@@ -61,6 +65,7 @@ def begin_invoke(
         admitted_epoch=admitted_epoch,
         runtime=pep,
         admission_id=admission_id,
+        state_observer=state_observer,
     )
 
 
@@ -78,7 +83,10 @@ def complete_invoke(
     ``admission_consumed``. A decision that is already DENY is returned
     unchanged, so a fresh post-kill evaluate stays ``kill_active``.
 
-    ``_before_commit`` is a yield before that locked transition (tests use it
+    When the admission consumed a grant with a frozen state digest and an
+    observer was given, the target is re-observed here, before the permit is
+    claimed; a change is DENY ``approval_state_mismatch`` with the grant
+    already spent. ``_before_commit`` is a yield before that locked transition (tests use it
     to cut in the old check-then-call gap). It is not a permit. The runtime
     re-checks under the lock after it returns. Once ``tool()`` has started,
     this gate does not preempt it.
@@ -86,6 +94,10 @@ def complete_invoke(
     decision = pending.decision
     if not decision.allowed():
         return decision, None
+    if not _state_still_matches(pending):
+        # The grant was consumed at admission; a changed target at entry is a
+        # fail-closed deny with the grant spent, like a suspend after consume.
+        return supersede(decision, ReasonCode.APPROVAL_STATE_MISMATCH), None
     blocked = pending.runtime.claim_entry(
         pending.admission_id,
         pending.admitted_epoch,
@@ -95,6 +107,22 @@ def complete_invoke(
         return supersede(decision, blocked), None
     # One-shot ticket was spent in claim_entry before this call. Replay denies.
     return decision, tool()
+
+
+def _state_still_matches(pending: PendingInvoke) -> bool:
+    """Re-observe the target at entry when the admission consumed a frozen digest.
+
+    Without an observer there is nothing to re-read and the admission-time
+    check stands. A raising observer is a mismatch.
+    """
+    frozen = pending.decision.frozen_state_digest
+    if frozen is None or pending.state_observer is None:
+        return True
+    try:
+        observed = pending.state_observer()
+    except Exception:
+        return False
+    return state_matches(frozen, observed)
 
 
 def gated_invoke(

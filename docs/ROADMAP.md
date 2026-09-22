@@ -79,6 +79,7 @@ Same PEP trust domain. Binding `tool_name` plus canonical args closes the Loopja
 | `issue_approval(..., state_digest=)` freezes a host-computed `sha256:` digest of the target state on `ApprovalRecord` (optional) | In tree |
 | Envelope `schema_fields.state_digest` (Lab form) / `state_digest` (flat form) carries the host-observed digest; it is not part of args and prose cannot supply it | In tree |
 | `state_observer` callable on `evaluate` / `begin_invoke` / `gated_invoke`: `ApprovalStore.consume` calls it under the store lock after existence, single-use, expiry and binding checks pass; it overrides the envelope field, is never called for grants without a frozen digest or for grants that fail an earlier check, and a raise or non-digest return is a mismatch (receipt detail says `state observer failed` or `... mismatch`) | In tree |
+| `begin_invoke` keeps the observer on the `PendingInvoke`; `complete_invoke` re-observes at tool entry when the admission consumed a frozen digest, and a changed target is DENY `approval_state_mismatch` with the grant already spent (same shape as a suspend after consume) | In tree |
 | `try_consume` requires an equal observed digest when one was frozen; missing or different → `approval_state_mismatch`, grant not consumed; args mismatch still reports first | In tree |
 | Grants without a frozen digest ignore any envelope digest (behaviour of every existing row unchanged) | In tree |
 | Corpus: `approval_state_substitution` DENY and `allow_approval_state_bound` ALLOW-then-consume | In tree |
@@ -86,7 +87,7 @@ Same PEP trust domain. Binding `tool_name` plus canonical args closes the Loopja
 | Receipt schema stays frozen v1 (new reason code only) | Required invariant |
 | Official `python -m pep.demo` DENY unchanged | Required invariant |
 
-Still open: the digest is host-computed. With the observer the read happens inside the approval store's consume step, after the grant has passed its other checks, which narrows the window between check and use to the gate's admit-then-complete span; without it the envelope value is whatever the host wrote when it built the envelope. In both cases the PEP does not read the target and cannot verify that the host's observer digests the right object; a host that lies is outside the trust domain like a caller that skips `gated_invoke`. What counts as "the state" is the operator's definition at mint time, not the PEP's.
+Still open: the digest is host-computed. With the observer the read happens inside the approval store's consume step, after the grant has passed its other checks, and again at tool entry in `complete_invoke`, which narrows the window between check and use to the re-observation itself; without it the envelope value is whatever the host wrote when it built the envelope. In both cases the PEP does not read the target and cannot verify that the host's observer digests the right object; a host that lies is outside the trust domain like a caller that skips `gated_invoke`. What counts as "the state" is the operator's definition at mint time, not the PEP's.
 
 ## Remaining v1 notes
 

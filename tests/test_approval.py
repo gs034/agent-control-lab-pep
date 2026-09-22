@@ -544,6 +544,79 @@ def test_state_mismatch_detail_distinguishes_failed_observer_from_mismatch():
     assert envelope_only.receipt.reason_detail.endswith("envelope state digest mismatch")
 
 
+def test_split_admission_reobserves_state_at_entry_and_denies_a_changed_target():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    target = {"digest": STATE_A}
+    calls = {"observer": 0, "tool": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return target["digest"]
+
+    def tool() -> str:
+        calls["tool"] += 1
+        return "ran"
+
+    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, state_observer=observer)
+    assert pending.decision.verdict == "ALLOW"
+    assert pending.decision.frozen_state_digest == STATE_A
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+    target["digest"] = STATE_B  # target swapped between admission and entry
+    decision, result = complete_invoke(pending, tool)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert "re-observed at tool entry" in decision.receipt.reason_detail
+    assert result is None
+    assert calls == {"observer": 2, "tool": 0}
+    assert "frozen_state_digest" not in decision.to_dict()
+
+
+def test_split_admission_enters_tool_when_state_unchanged_and_raising_observer_denies():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    pending = begin_invoke(
+        _base(approval_id=grant.approval_id), runtime, now=now, state_observer=lambda: STATE_A
+    )
+    decision, result = complete_invoke(pending, lambda: "ran")
+    assert decision.verdict == "ALLOW" and result == "ran"
+
+    flaky = {"n": 0}
+
+    def observer() -> str:
+        flaky["n"] += 1
+        if flaky["n"] == 1:
+            return STATE_A
+        raise OSError("target unreadable at entry")
+
+    second = _issue(runtime, now=now, state_digest=STATE_A)
+    pending = begin_invoke(_base(approval_id=second.approval_id), runtime, now=now, state_observer=observer)
+    decision, result = complete_invoke(pending, lambda: "ran")
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert result is None
+
+
+def test_split_admission_without_observer_or_frozen_digest_has_no_entry_recheck():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    plain = _issue(runtime, now=now)
+    pending = begin_invoke(_base(approval_id=plain.approval_id), runtime, now=now, state_observer=lambda: STATE_B)
+    assert pending.decision.frozen_state_digest is None
+    assert complete_invoke(pending, lambda: "ran")[1] == "ran"
+    frozen = _issue(runtime, now=now, state_digest=STATE_A)
+    pending = begin_invoke(_base(approval_id=frozen.approval_id, state_digest=STATE_A), runtime, now=now)
+    assert pending.decision.frozen_state_digest == STATE_A
+    assert complete_invoke(pending, lambda: "ran")[1] == "ran"
+
+
 def test_state_observer_is_not_consulted_without_a_frozen_digest():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
