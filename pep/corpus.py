@@ -122,6 +122,7 @@ def runtime_for_spec(spec: Mapping[str, Any]) -> tuple[PepRuntime, datetime | No
                 record.tools[0],
                 now=issued_at,
                 args=record.frozen_args,
+                state_digest=record.state_digest,
             )
             if reason is not None:
                 raise ValueError(f"could not pre-consume fixture approval: {reason}")

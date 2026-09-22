@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from pep.canonical import sha256_prefixed
@@ -190,3 +192,13 @@ def test_official_demo_row_still_denies_independently_of_corpus():
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"
     assert invoked is False
+
+
+def test_runtime_spec_pre_consumes_a_state_bound_grant():
+    replay_row = next(row for row in list_corpus_rows() if row.row_id == "acl-pep-eval-approval-replay-001")
+    spec = json.loads(json.dumps(replay_row.runtime_spec))
+    spec["approvals"][0]["state_digest"] = "sha256:" + "ab" * 32
+    runtime, now = runtime_for_spec(spec)
+    decision = evaluate(replay_row.envelope, runtime=runtime, now=now)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == "approval_consumed"
