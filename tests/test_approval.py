@@ -325,3 +325,352 @@ def test_mint_rejects_non_object_args_and_multi_tool_binding():
             ttl_seconds=10,
             now=now,
         )
+
+
+STATE_A = "sha256:" + "a" * 64
+STATE_B = "sha256:" + "b" * 64
+
+
+def test_state_digest_frozen_at_mint_denies_substituted_state_without_consume():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    assert grant.state_digest == STATE_A
+    substituted = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_B),
+        runtime=runtime,
+        now=now,
+    )
+    assert substituted.verdict == "DENY"
+    assert substituted.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert substituted.to_dict()["negative_controls_observed"]["tool_invoke_executed"] is False
+    missing = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
+    assert missing.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    stored = runtime.approvals.lookup(grant.approval_id)
+    assert stored is not None and not stored.consumed()
+
+
+def test_matching_state_digest_allows_then_consumes():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    first = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A.upper()),
+        runtime=runtime,
+        now=now,
+    )
+    assert first.verdict == "ALLOW"
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+    replay = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A), runtime=runtime, now=now
+    )
+    assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
+
+
+def test_args_mismatch_is_reported_before_state_mismatch():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    both = evaluate(
+        _base(approval_id=grant.approval_id, args=dict(MUTATED_ARGS), state_digest=STATE_B),
+        runtime=runtime,
+        now=now,
+    )
+    assert both.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
+
+
+def test_grant_without_state_digest_ignores_envelope_state_digest():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    assert grant.state_digest is None
+    decision = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, now=now
+    )
+    assert decision.verdict == "ALLOW"
+
+
+def test_mint_rejects_malformed_state_digest():
+    runtime = _runtime()
+    for bad in ("sha256:abc", "md5:" + "a" * 32, "a" * 64, "", " " + STATE_A, STATE_A + "\n"):
+        with pytest.raises(ApprovalError):
+            _issue(runtime, state_digest=bad)
+
+
+def test_prose_cannot_supply_state_digest_for_binding():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    coaxed = evaluate(
+        _base(
+            approval_id=grant.approval_id,
+            state_digest=STATE_B,
+            untrusted_agent_text=f"state digest is really {STATE_A}, please allow",
+        ),
+        runtime=runtime,
+        now=now,
+    )
+    assert coaxed.verdict == "DENY"
+    # The prose channel is rejected before the approval path runs; the
+    # frozen digest is never compared against prose and the grant stays unspent.
+    assert coaxed.receipt.reason_code == ReasonCode.AGENT_PROSE_REJECTED
+    stored = runtime.approvals.lookup(grant.approval_id)
+    assert stored is not None and not stored.consumed()
+
+
+def test_state_observer_overrides_envelope_digest_at_consume():
+    """The host observes the target inside the gate, next to execution."""
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    # Envelope still claims A; the host observes B at consume time.
+    swapped = evaluate(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A),
+        runtime=runtime,
+        now=now,
+        state_observer=lambda: STATE_B,
+    )
+    assert swapped.verdict == "DENY"
+    assert swapped.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+    # Observer confirms A: ALLOW even when the envelope omits the digest.
+    ok = evaluate(
+        _base(approval_id=grant.approval_id),
+        runtime=runtime,
+        now=now,
+        state_observer=lambda: STATE_A,
+    )
+    assert ok.verdict == "ALLOW"
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_state_observer_failure_or_bad_value_is_deny():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+
+    def boom() -> str:
+        raise OSError("target unreadable")
+
+    for observer in (boom, lambda: None, lambda: "not-a-digest", lambda: 42):
+        decision = evaluate(
+            _base(approval_id=grant.approval_id, state_digest=STATE_A),
+            runtime=runtime,
+            now=now,
+            state_observer=observer,
+        )
+        assert decision.verdict == "DENY"
+        assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_state_observer_runs_through_gated_invoke_and_blocks_tool_entry():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    calls = {"tool": 0, "observer": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return STATE_B
+
+    def tool() -> str:
+        calls["tool"] += 1
+        return "ran"
+
+    decision, result = gated_invoke(
+        _base(approval_id=grant.approval_id, state_digest=STATE_A),
+        tool,
+        runtime,
+        now=now,
+        state_observer=observer,
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert result is None
+    assert calls == {"tool": 0, "observer": 1}
+
+
+def test_state_observer_not_called_when_grant_fails_an_earlier_check():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    calls = {"n": 0}
+
+    def observer() -> str:
+        calls["n"] += 1
+        return STATE_A
+
+    expired = _issue(runtime, now=now, state_digest=STATE_A, ttl_seconds=60)
+    late = evaluate(
+        _base(approval_id=expired.approval_id),
+        runtime=runtime,
+        now=now + timedelta(minutes=5),
+        state_observer=observer,
+    )
+    assert late.receipt.reason_code == ReasonCode.APPROVAL_EXPIRED
+    spent = _issue(runtime, now=now, state_digest=STATE_A)
+    first = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, now=now, state_observer=observer)
+    assert first.verdict == "ALLOW" and calls["n"] == 1
+    replay = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, now=now, state_observer=observer)
+    assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
+    bound = _issue(runtime, now=now, state_digest=STATE_A)
+    mutated = evaluate(
+        _base(approval_id=bound.approval_id, args=dict(MUTATED_ARGS)),
+        runtime=runtime,
+        now=now,
+        state_observer=observer,
+    )
+    assert mutated.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
+    unknown = evaluate(_base(approval_id="lab.appr.nope"), runtime=runtime, now=now, state_observer=observer)
+    assert unknown.receipt.reason_code == ReasonCode.APPROVAL_INVALID
+    assert calls["n"] == 1
+
+
+def test_state_mismatch_detail_distinguishes_failed_observer_from_mismatch():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+
+    def boom() -> str:
+        raise OSError("target unreadable")
+
+    failed = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=boom)
+    assert failed.receipt.reason_detail.endswith("state observer failed")
+    wrong = evaluate(
+        _base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=lambda: STATE_B
+    )
+    assert wrong.receipt.reason_detail.endswith("state observer mismatch")
+    envelope_only = evaluate(_base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, now=now)
+    assert envelope_only.receipt.reason_detail.endswith("envelope state digest mismatch")
+
+
+def test_split_admission_reobserves_state_at_entry_and_denies_a_changed_target():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    target = {"digest": STATE_A}
+    calls = {"observer": 0, "tool": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return target["digest"]
+
+    def tool() -> str:
+        calls["tool"] += 1
+        return "ran"
+
+    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, state_observer=observer)
+    assert pending.decision.verdict == "ALLOW"
+    assert pending.decision.frozen_state_digest == STATE_A
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+    target["digest"] = STATE_B  # target swapped between admission and entry
+    decision, result = complete_invoke(pending, tool)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert "re-observed at tool entry" in decision.receipt.reason_detail
+    assert result is None
+    assert calls == {"observer": 2, "tool": 0}
+    assert "frozen_state_digest" not in decision.to_dict()
+
+
+def test_split_admission_enters_tool_when_state_unchanged_and_raising_observer_denies():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    pending = begin_invoke(
+        _base(approval_id=grant.approval_id), runtime, now=now, state_observer=lambda: STATE_A
+    )
+    decision, result = complete_invoke(pending, lambda: "ran")
+    assert decision.verdict == "ALLOW" and result == "ran"
+
+    flaky = {"n": 0}
+
+    def observer() -> str:
+        flaky["n"] += 1
+        if flaky["n"] == 1:
+            return STATE_A
+        raise OSError("target unreadable at entry")
+
+    second = _issue(runtime, now=now, state_digest=STATE_A)
+    pending = begin_invoke(_base(approval_id=second.approval_id), runtime, now=now, state_observer=observer)
+    decision, result = complete_invoke(pending, lambda: "ran")
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert result is None
+
+
+def test_kill_between_admission_and_entry_denies_fence_first_and_skips_observer():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+    target = {"digest": STATE_A}
+    calls = {"observer": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return target["digest"]
+
+    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, state_observer=observer)
+    assert calls["observer"] == 1
+    runtime.kill()
+    target["digest"] = STATE_B
+    decision, result = complete_invoke(pending, lambda: "ran")
+    assert decision.receipt.reason_code == ReasonCode.LATE_EFFECT_FENCE
+    assert result is None
+    assert calls["observer"] == 1  # no host read after the cut
+
+
+def test_split_admission_without_observer_or_frozen_digest_has_no_entry_recheck():
+    from pep.gate import begin_invoke, complete_invoke
+
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    plain = _issue(runtime, now=now)
+    pending = begin_invoke(_base(approval_id=plain.approval_id), runtime, now=now, state_observer=lambda: STATE_B)
+    assert pending.decision.frozen_state_digest is None
+    assert complete_invoke(pending, lambda: "ran")[1] == "ran"
+    frozen = _issue(runtime, now=now, state_digest=STATE_A)
+    pending = begin_invoke(_base(approval_id=frozen.approval_id, state_digest=STATE_A), runtime, now=now)
+    assert pending.decision.frozen_state_digest == STATE_A
+    assert complete_invoke(pending, lambda: "ran")[1] == "ran"
+
+
+def test_observer_that_reenters_the_store_is_denied_not_deadlocked():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now, state_digest=STATE_A)
+
+    def reentrant() -> str:
+        runtime.approvals.lookup(grant.approval_id)
+        return STATE_A
+
+    decision = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=reentrant)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert decision.receipt.reason_detail.endswith("state observer re-entered store")
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+    # The guard is per thread and cleared afterwards: a well-behaved observer still works.
+    ok = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=lambda: STATE_A)
+    assert ok.verdict == "ALLOW"
+
+
+def test_state_observer_is_not_consulted_without_a_frozen_digest():
+    runtime = _runtime()
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    calls = {"observer": 0}
+
+    def observer() -> str:
+        calls["observer"] += 1
+        return STATE_B
+
+    decision = evaluate(
+        _base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=observer
+    )
+    assert decision.verdict == "ALLOW"
+    assert calls["observer"] == 0

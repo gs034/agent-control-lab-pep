@@ -6,7 +6,10 @@ Approvals are capability grants, not caller identity and not prose.
 They never extend the frozen tool catalog. An approval authorizes one
 use of an already-allowlisted invoke (tool_name + canonical args) before
 its TTL elapses. Replay, expiry, unknown id, uncovered tool, or a
-post-mint args substitution fail closed.
+post-mint args substitution fail closed. An operator may also freeze a
+state digest at mint (a host-computed digest of the object the invoke
+acts on); consume then requires the host-observed digest to match, so a
+substitution of the target between approval and execute is DENY.
 """
 
 from __future__ import annotations
@@ -18,18 +21,23 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from pep.canonical import canonical_dumps, sha256_prefixed
 from pep.reasons import ReasonCode
 
 APPROVAL_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+STATE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_TTL_SECONDS = 86_400
 MIN_TTL_SECONDS = 1
 
 
 class ApprovalError(ValueError):
     """Mint-time failure. Evaluate path uses reason codes, not this type."""
+
+
+class ObserverReentry(ApprovalError):
+    """A state observer called back into the store that is waiting on it."""
 
 
 def freeze_invoke_args(args: Mapping[str, Any]) -> dict[str, Any]:
@@ -65,6 +73,7 @@ class ApprovalRecord:
     frozen_args: Mapping[str, Any]
     single_use: bool = True
     consumed_at: datetime | None = None
+    state_digest: str | None = None
 
     def covers(self, tool_name: str) -> bool:
         return tool_name in self.tools
@@ -76,11 +85,24 @@ class ApprovalRecord:
             return False
         return self.covers(tool_name) and self.binding_digest == digest
 
+    def matches_state(self, observed_state_digest: object) -> bool:
+        return state_matches(self.state_digest, observed_state_digest)
+
     def expired(self, now: datetime) -> bool:
         return self.expires_at <= now
 
     def consumed(self) -> bool:
         return self.consumed_at is not None
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumeResult:
+    """Outcome of one consume attempt. ``reason`` is None when the grant was taken."""
+
+    reason: ReasonCode | None
+    detail: str | None = None
+    # Digest frozen on the consumed grant, so the gate can re-observe at entry.
+    frozen_state_digest: str | None = None
 
 
 class ApprovalStore:
@@ -94,6 +116,14 @@ class ApprovalStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: dict[str, ApprovalRecord] = {}
+        # Set on the thread that is running a state observer inside consume().
+        # The lock is not reentrant; a callback into the store would wedge, so
+        # it is refused with a receipt instead.
+        self._observing = threading.local()
+
+    def _refuse_reentry(self) -> None:
+        if getattr(self._observing, "active", False):
+            raise ObserverReentry("state observer re-entered the approval store")
 
     def issue(
         self,
@@ -104,8 +134,13 @@ class ApprovalStore:
         approval_id: str | None = None,
         now: datetime | None = None,
         catalog: Mapping[str, object] | None = None,
+        state_digest: str | None = None,
     ) -> ApprovalRecord:
+        self._refuse_reentry()
         clock = _aware(now)
+        frozen_state = normalize_state_digest(state_digest)
+        if state_digest is not None and frozen_state is None:
+            raise ApprovalError("state_digest must be sha256: plus 64 hex characters")
         if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
             raise ApprovalError("ttl_seconds must be a positive integer")
         if ttl_seconds < MIN_TTL_SECONDS or ttl_seconds > MAX_TTL_SECONDS:
@@ -135,6 +170,7 @@ class ApprovalStore:
             frozen_args=MappingProxyType(binding["args"]),
             single_use=True,
             consumed_at=None,
+            state_digest=frozen_state,
         )
         with self._lock:
             if token in self._records:
@@ -143,6 +179,7 @@ class ApprovalStore:
         return record
 
     def lookup(self, approval_id: str) -> ApprovalRecord | None:
+        self._refuse_reentry()
         with self._lock:
             return self._records.get(approval_id)
 
@@ -153,28 +190,93 @@ class ApprovalStore:
         now: datetime | None = None,
         *,
         args: Mapping[str, Any],
+        state_digest: str | None = None,
+        observe: Callable[[], object] | None = None,
     ) -> ReasonCode | None:
         """Atomically consume a valid grant. ``None`` means the grant was taken.
 
-        Any other return is a fail-closed deny reason. Single-use is enforced
-        under the lock so two concurrent allows cannot share one grant.
-        A tool or args mismatch against the frozen binding does not consume.
+        Thin wrapper over ``consume`` for callers that need only the reason.
         """
+        return self.consume(
+            approval_id, tool_name, now, args=args, state_digest=state_digest, observe=observe
+        ).reason
+
+    def consume(
+        self,
+        approval_id: str,
+        tool_name: str,
+        now: datetime | None = None,
+        *,
+        args: Mapping[str, Any],
+        state_digest: str | None = None,
+        observe: Callable[[], object] | None = None,
+    ) -> ConsumeResult:
+        """Atomically consume a valid grant, with the state observation inside.
+
+        Any non-None reason is a fail-closed deny. Single-use is enforced under
+        the lock so two concurrent allows cannot share one grant. A tool or args
+        mismatch against the frozen binding does not consume.
+
+        When the grant froze a state digest, the observation is taken here:
+        ``observe`` (the host's read of the target) runs only after the grant
+        has passed existence, single-use, expiry and binding checks, and its
+        return replaces ``state_digest``. A raising or non-digest observer, or
+        a missing or different digest, is ``APPROVAL_STATE_MISMATCH`` and does
+        not consume. Grants without a frozen digest never call ``observe``.
+
+        ``observe`` runs with the store lock held, so it must be quick and must
+        not call back into this store or into the runtime; a callback into the
+        store from this thread is refused as a mismatch (``state observer
+        re-entered store``) rather than deadlocking. A callback from another
+        thread the observer spawns is not detected and would block.
+        """
+        self._refuse_reentry()
         clock = _aware(now)
         with self._lock:
             record = self._records.get(approval_id)
             if record is None:
-                return ReasonCode.APPROVAL_INVALID
+                return ConsumeResult(ReasonCode.APPROVAL_INVALID)
             if record.consumed():
-                return ReasonCode.APPROVAL_CONSUMED
+                return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
             if record.expired(clock):
-                return ReasonCode.APPROVAL_EXPIRED
+                return ConsumeResult(ReasonCode.APPROVAL_EXPIRED)
             if not record.matches_binding(tool_name, args):
-                return ReasonCode.APPROVAL_BINDING_MISMATCH
+                return ConsumeResult(ReasonCode.APPROVAL_BINDING_MISMATCH)
             if not record.single_use:
-                return ReasonCode.APPROVAL_INVALID
+                return ConsumeResult(ReasonCode.APPROVAL_INVALID)
+            if record.state_digest is not None:
+                observed: object = state_digest
+                source = "envelope state digest"
+                if observe is not None:
+                    source = "state observer"
+                    self._observing.active = True
+                    try:
+                        observed = observe()
+                    except ObserverReentry:
+                        return ConsumeResult(
+                            ReasonCode.APPROVAL_STATE_MISMATCH, "state observer re-entered store"
+                        )
+                    except Exception:
+                        return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, "state observer failed")
+                    finally:
+                        self._observing.active = False
+                if not record.matches_state(observed):
+                    return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, f"{source} mismatch")
             self._records[approval_id] = replace(record, consumed_at=clock)
-            return None
+            return ConsumeResult(None, frozen_state_digest=record.state_digest)
+
+
+def state_matches(frozen: str | None, observed: Any) -> bool:
+    """True when no digest was frozen, or the observation normalises to it."""
+    return frozen is None or normalize_state_digest(observed) == frozen
+
+
+def normalize_state_digest(value: Any) -> str | None:
+    """Lower-cased ``sha256:<64 hex>`` or None when absent or malformed."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.lower()
+    return candidate if STATE_DIGEST_RE.fullmatch(candidate) else None
 
 
 def _aware(now: datetime | None) -> datetime:

@@ -23,6 +23,7 @@ FLAT_KEYS = frozenset(
         "request_id",
         "metadata",
         "untrusted_agent_text",
+        "state_digest",
     }
 )
 
@@ -82,6 +83,9 @@ class InvokeEnvelope:
     metadata: Mapping[str, Any] | None = None
     untrusted_agent_text: str | None = None
     source: Mapping[str, Any] | None = None
+    # Host-observed digest of the state the invoke acts on. Supplied by the
+    # host, compared to the digest frozen at approval mint. Not agent prose.
+    state_digest: str | None = None
 
     def digest(self) -> str:
         payload: Any = dict(self.source) if self.source is not None else self.to_dict()
@@ -97,6 +101,9 @@ class InvokeEnvelope:
             "request_id": self.request_id,
             "metadata": None if self.metadata is None else dict(self.metadata),
             "untrusted_agent_text": self.untrusted_agent_text,
+            # Emitted only when set so digest() of envelopes built without a
+            # state digest is unchanged from earlier releases.
+            **({"state_digest": self.state_digest} if self.state_digest is not None else {}),
         }
 
     def has_untrusted_prose(self) -> bool:
@@ -183,6 +190,7 @@ def _parse_lab_envelope(raw: Mapping[str, Any]) -> InvokeEnvelope:
 
     token = _optional_string(schema.get("capability_token"), "capability_token")
     approval = _optional_string(schema.get("approval_id"), "approval_id")
+    state_digest = _optional_string(schema.get("state_digest"), "state_digest")
 
     args: dict[str, Any] = {}
     if "argv" in invoke:
@@ -222,6 +230,7 @@ def _parse_lab_envelope(raw: Mapping[str, Any]) -> InvokeEnvelope:
         caller_identity=identity,
         request_id=request_id,
         source=dict(raw),
+        state_digest=state_digest,
     )
 
 
@@ -255,6 +264,7 @@ def _parse_flat_envelope(raw: Mapping[str, Any]) -> InvokeEnvelope:
 
     token = _optional_string(raw.get("capability_token"), "capability_token")
     approval = _optional_string(raw.get("approval_id"), "approval_id")
+    state_digest = _optional_string(raw.get("state_digest"), "state_digest")
 
     caller = raw.get("caller_identity")
     if not isinstance(caller, str) or not IDENTITY_RE.fullmatch(caller):
@@ -294,6 +304,7 @@ def _parse_flat_envelope(raw: Mapping[str, Any]) -> InvokeEnvelope:
         metadata=None if not metadata else dict(metadata),
         untrusted_agent_text=untrusted,
         source=dict(raw),
+        state_digest=state_digest,
     )
 
 

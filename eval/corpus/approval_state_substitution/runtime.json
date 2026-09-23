@@ -1,0 +1,20 @@
+{
+  "approvals": [
+    {
+      "approval_id": "lab.appr.state-a",
+      "args": {
+        "argv": [],
+        "cwd": "/tmp",
+        "env_allowlist": [],
+        "network": false
+      },
+      "issued_at": "2026-09-18T12:00:00+00:00",
+      "state_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tool_name": "echo.ping",
+      "ttl_seconds": 3600
+    }
+  ],
+  "mode": "active",
+  "now": "2026-09-18T12:00:00+00:00",
+  "policy": "demo"
+}

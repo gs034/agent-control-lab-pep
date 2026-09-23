@@ -2,7 +2,7 @@
 
 Brand: **Agent Control Lab**. Licence: **Apache-2.0**. This is a public-goods reference PEP, not a shipping product.
 
-Versions below are **lab milestones**, not a vendor SKU. Package `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt still attests `policy_version: 0.1.0-stub`.
+Versions below are **lab milestones**, not a vendor SKU. Package `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt still attests `policy_version: 0.1.0-stub`.
 
 ## stub (published 0.1)
 
@@ -69,6 +69,25 @@ Same PEP trust domain. `kill()` must fence late effects, not only flip the halt 
 | Official `python -m pep.demo` DENY unchanged | Required invariant |
 
 Still open on this patch: once `tool()` has started, that call is not preempted or rolled back; a process-external callback that skips `complete_invoke` is outside the trust domain; `HaltStore` does not reconstruct another process’s admissions (reload denies new work as `kill_active` only). Also deferred: an approval may be consumed before a later suspend or kill deny, so the grant is spent without ALLOW; `_spent_admissions` is unbounded for a long-lived runtime.
+
+## v0.3.3 / approval state digest (this tree)
+
+Same PEP trust domain. Binding `tool_name` plus canonical args closes the Loopjacking-class representation mismatch, not its second failure mode: the approved operation is unchanged but the object it acts on is swapped between approval and execute (post-approval state substitution; [arXiv:2609.21081](https://arxiv.org/abs/2609.21081) as a pattern name; not a measured ASR claim).
+
+| Work | Status |
+| --- | --- |
+| `issue_approval(..., state_digest=)` freezes a host-computed `sha256:` digest of the target state on `ApprovalRecord` (optional) | In tree |
+| Envelope `schema_fields.state_digest` (Lab form) / `state_digest` (flat form) carries the host-observed digest; it is not part of args and prose cannot supply it | In tree |
+| `state_observer` callable on `evaluate` / `begin_invoke` / `gated_invoke`: `ApprovalStore.consume` calls it under the store lock after existence, single-use, expiry and binding checks pass; it overrides the envelope field, is never called for grants without a frozen digest or for grants that fail an earlier check, and a raise or non-digest return is a mismatch (receipt detail says `state observer failed` or `... mismatch`). The observer runs with the store lock held: it must be quick and must not call back into the store or runtime; a callback into the store is refused as `state observer re-entered store` rather than deadlocking | In tree |
+| `begin_invoke` keeps the observer on the `PendingInvoke`; `complete_invoke` reads the fence first (a cut denies `late_effect_fence` and skips the observer), then re-observes at tool entry when the admission consumed a frozen digest, and a changed target is DENY `approval_state_mismatch` with the grant already spent (same shape as a suspend after consume) | In tree |
+| `try_consume` requires an equal observed digest when one was frozen; missing or different → `approval_state_mismatch`, grant not consumed; args mismatch still reports first | In tree |
+| Grants without a frozen digest ignore any envelope digest (behaviour of every existing row unchanged) | In tree |
+| Corpus: `approval_state_substitution` DENY and `allow_approval_state_bound` ALLOW-then-consume | In tree |
+| Corpus: threat-model classes named in the joint-eval [measured-corpus v0 seed](https://github.com/gs034/agent-control-lab-joint-eval/blob/main/docs/measured-corpus-v0.md) as rows, no new mechanism: `multi_session_plant` (planted prior-session grant → `approval_invalid`) and `deferred_tool` (effect fires after the checked turn's TTL → `approval_expired`) | In tree |
+| Receipt schema stays frozen v1 (new reason code only) | Required invariant |
+| Official `python -m pep.demo` DENY unchanged | Required invariant |
+
+Still open: the digest is host-computed. With the observer the read happens inside the approval store's consume step, after the grant has passed its other checks, and again at tool entry in `complete_invoke`, which narrows the window between check and use to the re-observation itself; without it the envelope value is whatever the host wrote when it built the envelope. In both cases the PEP does not read the target and cannot verify that the host's observer digests the right object; a host that lies is outside the trust domain like a caller that skips `gated_invoke`. What counts as "the state" is the operator's definition at mint time, not the PEP's.
 
 ## Remaining v1 notes
 

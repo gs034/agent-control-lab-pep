@@ -41,6 +41,9 @@ class RuntimeMode(StrEnum):
 @dataclass(frozen=True, slots=True)
 class Decision:
     receipt: Receipt
+    # Not part of the frozen receipt. Set on an ALLOW that consumed a grant
+    # with a frozen state digest, so the gate can re-observe at tool entry.
+    frozen_state_digest: str | None = None
 
     @property
     def verdict(self) -> Literal["ALLOW", "DENY"]:
@@ -197,6 +200,14 @@ class PepRuntime:
         self._spent_admissions.add(admission_id)
         return None
 
+    def entry_blocked(self, admitted_epoch: int) -> ReasonCode | None:
+        """Cheap fence read for callers about to do host work before ``claim_entry``.
+
+        Not a permit. ``claim_entry`` decides again under the lock.
+        """
+        with self._lock:
+            return self._entry_block_unlocked(admitted_epoch)
+
     def claim_entry(
         self,
         admission_id: int,
@@ -282,8 +293,14 @@ class PepRuntime:
         ttl_seconds: int,
         approval_id: str | None = None,
         now: datetime | None = None,
+        state_digest: str | None = None,
     ) -> ApprovalRecord:
-        """Mint a single-use TTL approval bound to one allowlisted invoke."""
+        """Mint a single-use TTL approval bound to one allowlisted invoke.
+
+        ``state_digest`` optionally freezes a host-computed digest of the state
+        the invoke acts on; consume then requires the host-observed digest to
+        match.
+        """
         return self._approvals.issue(
             tools=(tool_name,),
             args=args,
@@ -291,6 +308,7 @@ class PepRuntime:
             approval_id=approval_id,
             now=now,
             catalog=self._policy.allowed_tools(),
+            state_digest=state_digest,
         )
 
     def evaluate(
@@ -298,8 +316,18 @@ class PepRuntime:
         envelope: Any,
         *,
         now: datetime | None = None,
+        state_observer: Callable[[], object] | None = None,
         _before_allow: Callable[[], None] | None = None,
     ) -> Decision:
+        """Evaluate one structured envelope.
+
+        ``state_observer`` is the host's read of the current digest of the
+        state the invoke acts on. When the referenced approval froze a state
+        digest, ``ApprovalStore.consume`` calls it under the store lock after
+        the grant has passed its other checks, and its return is the
+        observation; the envelope's ``state_digest`` is used only when no
+        observer is given. A raising or non-digest observer is a mismatch.
+        """
         try:
             clock = _aware_clock(now)
         except (TypeError, ValueError):
@@ -435,14 +463,24 @@ class PepRuntime:
                 policy.bytes_unchanged(),
             )
 
+        frozen_state: str | None = None
         if approval is not None:
-            consume_reason = self._approvals.try_consume(
-                approval, parsed.tool_name, now=clock, args=parsed.args
+            consumed = self._approvals.consume(
+                approval,
+                parsed.tool_name,
+                now=clock,
+                args=parsed.args,
+                state_digest=parsed.state_digest,
+                observe=state_observer,
             )
-            if consume_reason is not None:
+            frozen_state = consumed.frozen_state_digest
+            if consumed.reason is not None:
+                detail = f"single-use TTL approval rejected: {consumed.reason}"
+                if consumed.detail:
+                    detail = f"{detail}; {consumed.detail}"
                 return _deny(
-                    consume_reason,
-                    f"single-use TTL approval rejected: {consume_reason}",
+                    consumed.reason,
+                    detail,
                     env_hash,
                     version,
                     policy.bytes_unchanged(),
@@ -453,6 +491,7 @@ class PepRuntime:
             envelope_hash=env_hash,
             policy_version=version,
             policy_file_unchanged=policy.bytes_unchanged(),
+            frozen_state_digest=frozen_state,
             _before_allow=_before_allow,
         )
 
@@ -463,6 +502,7 @@ class PepRuntime:
         envelope_hash: str,
         policy_version: str,
         policy_file_unchanged: bool,
+        frozen_state_digest: str | None = None,
         _before_allow: Callable[[], None] | None = None,
     ) -> Decision:
         """Publish ALLOW only if the cut is still open, under the runtime lock.
@@ -496,7 +536,8 @@ class PepRuntime:
                     envelope_hash=envelope_hash,
                     policy_version=policy_version,
                     policy_file_unchanged=policy_file_unchanged,
-                )
+                ),
+                frozen_state_digest=frozen_state_digest,
             )
 
 
@@ -556,11 +597,14 @@ def evaluate(
     runtime: PepRuntime | None = None,
     *,
     now: datetime | None = None,
+    state_observer: Callable[[], object] | None = None,
     _before_allow: Callable[[], None] | None = None,
 ) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""
     pep = resolve_runtime(runtime)
-    return pep.evaluate(envelope, now=now, _before_allow=_before_allow)
+    return pep.evaluate(
+        envelope, now=now, state_observer=state_observer, _before_allow=_before_allow
+    )
 
 
 def supersede(decision: Decision, reason: ReasonCode) -> Decision:
@@ -576,10 +620,16 @@ def supersede(decision: Decision, reason: ReasonCode) -> Decision:
 
 
 _KILL_DETAIL = "PEP kill active or PEP unavailable; fail-closed deny, no invoke"
+_STATE_REOBSERVE_DETAIL = (
+    "state re-observed at tool entry differs from the approved digest; "
+    "fail-closed deny, no tool entry (grant already spent)"
+)
 _SUSPEND_DETAIL = "PEP suspend active; fail-closed deny, no invoke"
 
 
 def _reason_detail(reason: ReasonCode) -> str:
+    if reason is ReasonCode.APPROVAL_STATE_MISMATCH:
+        return _STATE_REOBSERVE_DETAIL
     if reason is ReasonCode.LATE_EFFECT_FENCE:
         return LATE_EFFECT_FENCE_DETAIL
     if reason is ReasonCode.ADMISSION_CONSUMED:

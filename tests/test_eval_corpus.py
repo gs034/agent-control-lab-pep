@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from pep.canonical import sha256_prefixed
@@ -166,8 +168,37 @@ def test_noul_taxonomy_rows_deny_without_consulting_prose():
         assert "0.99" not in live["reason_detail"]
 
 
+def test_threat_model_rows_deny_without_consulting_prose():
+    """multi_session_plant and deferred_tool: attachments and coax keys are inert."""
+    import copy
+    import dataclasses
+
+    rows = [row for row in list_corpus_rows() if row.deny_class in {"multi_session_plant", "deferred_tool"}]
+    assert {row.deny_class for row in rows} == {"multi_session_plant", "deferred_tool"}
+    for row in rows:
+        with_prose = evaluate_corpus_row(row)
+        stripped = copy.deepcopy(row.envelope)
+        stripped["untrusted_attachments"] = {"agent_prose_role": "data_only_never_policy"}
+        stripped["policy_context"] = {
+            k: v for k, v in stripped["policy_context"].items() if not k.startswith("please_")
+        }
+        bare = evaluate_corpus_row(dataclasses.replace(row, envelope=stripped))
+        assert with_prose.verdict == bare.verdict == "DENY"
+        assert with_prose.receipt.reason_code == bare.receipt.reason_code == row.expected_receipt["reason_code"]
+
+
 def test_official_demo_row_still_denies_independently_of_corpus():
     decision, invoked = evaluate_official_row()
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"
     assert invoked is False
+
+
+def test_runtime_spec_pre_consumes_a_state_bound_grant():
+    replay_row = next(row for row in list_corpus_rows() if row.row_id == "acl-pep-eval-approval-replay-001")
+    spec = json.loads(json.dumps(replay_row.runtime_spec))
+    spec["approvals"][0]["state_digest"] = "sha256:" + "ab" * 32
+    runtime, now = runtime_for_spec(spec)
+    decision = evaluate(replay_row.envelope, runtime=runtime, now=now)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == "approval_consumed"
