@@ -2,11 +2,13 @@
 # Copyright 2026 Agent Control Lab contributors
 """Single-use TTL approval grants (process-local; operator-issued).
 
-Approvals are capability grants, not caller identity and not prose.
-They never extend the frozen tool catalog. An approval authorizes one
-use of an already-allowlisted invoke (tool_name + canonical args) before
-its TTL elapses. Replay, expiry, unknown id, uncovered tool, or a
-post-mint args substitution fail closed. An operator may also freeze a
+Approvals are capability grants, not prose. They never extend the frozen
+tool catalog. An approval authorizes one use of an already-allowlisted
+invoke (tool_name + canonical args) before its TTL elapses, by the one
+principal it was bound to at mint (ADR-0002). The host attests that
+principal at consume; an envelope identity string is never authority.
+Replay, expiry, unknown id, uncovered tool, a post-mint args substitution,
+or a missing, wrong or disagreeing principal fail closed. An operator may also freeze a
 state digest at mint (a host-computed digest of the object the invoke
 acts on); consume then requires the host-observed digest to match, so a
 substitution of the target between approval and execute is DENY.

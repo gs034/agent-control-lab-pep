@@ -327,8 +327,8 @@ class PepRuntime:
 
         ``principal`` is the host-attested caller (ADR-0002): the identity the
         host assigned to this caller session, passed by the host and never
-        read from the envelope. A principal-bound approval needs it; a
-        malformed value is ``envelope_invalid``.
+        read from the envelope. Every approval needs it; a malformed value
+        is ``envelope_invalid``.
 
         ``state_observer`` is the host's read of the current digest of the
         state the invoke acts on. When the referenced approval froze a state

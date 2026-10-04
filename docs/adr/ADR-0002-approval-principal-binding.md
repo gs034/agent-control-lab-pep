@@ -12,12 +12,12 @@
 
 ADR-0001 makes an operator-issued `approval_id` a single-use, TTL-bound grant for one exact invoke: `tool_name` plus canonical args, with an optional host-observed state digest. It does not say who may spend the grant.
 
-On this tree the grant is a bearer capability:
-- `ApprovalRecord` has no principal field.
-- `ApprovalStore.consume` takes no identity argument (`pep/approval.py`).
-- The module docstring says approvals "are capability grants, not caller identity".
+Before this change (pep 0.3.3, commit `ffd048a`), the grant was a bearer capability:
+- `ApprovalRecord` had no principal field.
+- `ApprovalStore.consume` took no identity argument (`pep/approval.py`).
+- The module docstring said approvals "are capability grants, not caller identity".
 
-`tests/test_approval_laundering_classes.py::test_delegation_is_bearer_residual` shows the consequence:
+`tests/test_approval_laundering_classes.py::test_delegation_is_bearer_residual` (as of commit `506f5ee`; it was renamed `test_delegation_to_a_second_principal_denies_without_spending_the_grant` in 0.4.0) showed the consequence:
 1. A second caller presents the same `approval_id` with the exact invoke.
 2. That caller gets ALLOW, and the tool runs.
 3. The original caller then gets DENY `approval_consumed`.
@@ -38,7 +38,7 @@ An approval is bound, at mint, to one **principal**. Only a call whose principal
    - `evaluate`, `begin_invoke`, `gated_invoke` and `ApprovalStore.consume` / `try_consume` take `principal: str | None = None`, supplied by the host.
    - This is the same trust channel as `state_observer`: a function argument from the code that owns the caller's session, never an envelope field.
    - **Mapping.** The host principal is the identity the host has assigned to that caller session, in `IDENTITY_RE` format; for example, a host that runs one demo agent assigns it `lab.demo.agent`. A host that runs several callers must give each its own identity, so a sub-agent or second session gets a different principal from its parent.
-   - A host principal that does not match `IDENTITY_RE` is `envelope_invalid` before any grant is touched.
+   - On the `evaluate` / `begin_invoke` / `gated_invoke` route, a host principal that does not match `IDENTITY_RE` is `envelope_invalid` before any grant is touched. A direct `consume` / `try_consume` call treats it as a principal mismatch.
 3. **Consume.** Inside `ApprovalStore.consume`, under the store lock:
    - **Order.** Look up the `approval_id`. An unknown id stays `approval_invalid`. **The principal check comes next, immediately after the lookup and before the consumed, expired, binding, single-use-flag and state checks.** A wrong or unattested caller therefore learns only that the id exists, and nothing about whether the grant is spent, expired or bound to other args. Approval ids are random (`lab.appr.<uuid4>`) unless an operator names them.
    - **No attested principal.** If the host passed no principal, the result is DENY `approval_principal_mismatch`, with detail "no attested principal".
@@ -82,9 +82,9 @@ An approval is bound, at mint, to one **principal**. Only a call whose principal
 - `pep/gate.py`: `begin_invoke` and `gated_invoke` pass `principal=` through.
 - `pep/reasons.py`: `APPROVAL_PRINCIPAL_MISMATCH`.
 - `pep/corpus.py`, which needs a principal source (for example, a runtime-spec field):
-  - the mint at line 110;
-  - the fixture pre-consume `try_consume` at line 120, which raises if consume denies;
-  - the `evaluate`, `gated_invoke` and `begin_invoke` calls at lines 151, 159 and 169.
+  - the fixture mint;
+  - the fixture pre-consume `try_consume`, which raises if consume denies;
+  - the `evaluate`, `gated_invoke` and `begin_invoke` calls in the row runners.
 - Existing approval tests and `eval/corpus/` rows: every mint and every approval-path evaluate gains a principal.
 - `docs/threat-model.md`:
   - replace the delegation non-goal bullet;
@@ -111,7 +111,7 @@ Each repository updates its declared pins in the same change as its code.
 
 Re-run `tests/test_approval_laundering_classes.py` before and after the change, at named commits.
 
-| Case | Before (this tree) | Required after |
+| Case | Before (0.3.3) | Required after |
 | --- | --- | --- |
 | Delegation: second principal, same `approval_id`, exact invoke | ALLOW; grant spent | DENY `approval_principal_mismatch`; grant **not** consumed; the owner's next call is ALLOW |
 | Host passes no principal, issued `approval_id` (any grant state) | n/a | DENY `approval_principal_mismatch`; not consumed |
@@ -134,7 +134,7 @@ Further acceptance criteria:
 - The delegation non-goal bullet in `docs/threat-model.md` is replaced.
 - Each phase diff gets an independent, cross-family review.
 
-**Rollback:** revert the 0.4.0 commit and restore the previous pins in joint-eval and console. Approvals are process-local, so no persisted state needs migrating.
+**Rollback:** revert the ADR-0002 implementation commits (`edde7ae`, `6c21669`, `a5fbc41`, `61b183d` and any follow-up review fixes) and restore the previous pins in joint-eval and console. Approvals are process-local, so no persisted state needs migrating.
 
 **What success would establish:** on this tree, an approval can be spent only through a host route that attests its principal, and a wrong caller can neither spend it nor learn its state.
 

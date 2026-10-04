@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -205,3 +206,12 @@ def test_runtime_spec_pre_consumes_a_state_bound_grant():
     )
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == "approval_consumed"
+
+
+def test_runtime_spec_rejects_non_string_principal():
+    replay_row = next(row for row in list_corpus_rows() if row.row_id == "acl-pep-eval-approval-replay-001")
+    spec = json.loads(json.dumps(replay_row.runtime_spec))
+    spec["principal"] = 7
+    row = replace(replay_row, runtime_spec=spec)
+    with pytest.raises(ValueError):
+        evaluate_corpus_row(row)

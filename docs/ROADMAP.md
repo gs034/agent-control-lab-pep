@@ -70,7 +70,7 @@ Same PEP trust domain. `kill()` must fence late effects, not only flip the halt 
 
 Still open on this patch: once `tool()` has started, that call is not preempted or rolled back; a process-external callback that skips `complete_invoke` is outside the trust domain; `HaltStore` does not reconstruct another process’s admissions (reload denies new work as `kill_active` only). Also deferred: an approval may be consumed before a later suspend or kill deny, so the grant is spent without ALLOW; `_spent_admissions` is unbounded for a long-lived runtime.
 
-## v0.3.3 / approval state digest
+## v0.3.3 / approval state digest (this tree)
 
 Same PEP trust domain. Binding `tool_name` plus canonical args closes the Loopjacking-class representation mismatch, not its second failure mode: the approved operation is unchanged but the object it acts on is swapped between approval and execute (post-approval state substitution; [arXiv:2609.21081](https://arxiv.org/abs/2609.21081) as a pattern name; not a measured ASR claim).
 
@@ -96,7 +96,7 @@ Same PEP trust domain. [ADR-0002](adr/ADR-0002-approval-principal-binding.md) cl
 | Work | Status |
 | --- | --- |
 | `issue_approval(..., principal=)` is required; mint without a valid principal raises `ApprovalError` | In tree |
-| Host-attested `principal=` on `evaluate` / `begin_invoke` / `gated_invoke` / `consume` / `try_consume`. It is never read from the envelope, and a malformed value is `envelope_invalid` | In tree |
+| Host-attested `principal=` on `evaluate` / `begin_invoke` / `gated_invoke` / `consume` / `try_consume`. It is never read from the envelope. On the `evaluate` route a malformed value is `envelope_invalid`; a direct `consume` call treats it as a mismatch | In tree |
 | Principal check under the store lock, straight after the lookup. A missing or wrong principal, or an envelope identity that disagrees, is `approval_principal_mismatch`, does not consume, and the detail names no identity | In tree |
 | Corpus fixtures name the grant principal and the attested principal; envelopes and expected receipts are unchanged | In tree |
 | Receipt schema stays frozen v1 (new reason code only) | Required invariant |

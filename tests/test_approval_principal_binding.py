@@ -376,6 +376,21 @@ def test_mint_without_principal_raises():
         _runtime().approvals.issue(tools=("echo.ping",), args=dict(ARGS), ttl_seconds=60, now=NOW)
 
 
+def test_record_without_a_principal_fails_closed():
+    """A record built without a principal (not through issue) never authorises."""
+    from dataclasses import replace
+
+    runtime = _runtime()
+    grant = _grant(runtime)
+    store = runtime.approvals
+    with store._lock:
+        store._records[grant.approval_id] = replace(grant, principal=None)
+    for attested in (OWNER, None):
+        decision = evaluate(_envelope(grant.approval_id), runtime=runtime, now=NOW, principal=attested)
+        _assert_mismatch(decision)
+    assert not _consumed(runtime, grant.approval_id)
+
+
 def test_try_consume_passes_principal_through():
     runtime = _runtime()
     grant = _grant(runtime)
