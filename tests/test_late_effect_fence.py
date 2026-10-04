@@ -13,6 +13,9 @@ from pep.policy import DEMO_POLICY
 from pep.reasons import LATE_EFFECT_FENCE_DETAIL, ReasonCode
 from pep.receipt import FROZEN_RECEIPT_KEYS, validate_receipt
 
+# ADR-0003: the principal the test host attests; a listed holder of lab.cap.echo.demo.
+HOST = "lab.demo.agent"
+
 
 def _valid():
     return {
@@ -37,7 +40,7 @@ def _boom_factory():
 def test_queued_invoke_after_kill_is_fence_deny_not_allow():
     runtime = PepRuntime(policy=DEMO_POLICY)
     assert runtime.fence_engaged is False
-    queued = begin_invoke(_valid(), runtime=runtime)
+    queued = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     assert queued.decision.verdict == "ALLOW"
     assert queued.admitted_epoch == 0
     called, boom = _boom_factory()
@@ -60,7 +63,7 @@ def test_queued_invoke_after_kill_is_fence_deny_not_allow():
 
 def test_provider_callback_after_kill_is_fence_deny():
     runtime = PepRuntime(policy=DEMO_POLICY)
-    pending = begin_invoke(_valid(), runtime=runtime)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     called, boom = _boom_factory()
     runtime.kill()
 
@@ -76,24 +79,24 @@ def test_provider_callback_after_kill_is_fence_deny():
 
 def test_post_cut_invoke_stays_kill_active_and_pre_cut_stays_fence():
     runtime = PepRuntime(policy=DEMO_POLICY)
-    queued = begin_invoke(_valid(), runtime=runtime)
+    queued = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     called, boom = _boom_factory()
     runtime.kill()
     late, late_result = complete_invoke(queued, boom)
-    fresh, fresh_result = gated_invoke(_valid(), boom, runtime=runtime)
+    fresh, fresh_result = gated_invoke(_valid(), boom, runtime=runtime, principal=HOST)
     assert late.receipt.reason_code == ReasonCode.LATE_EFFECT_FENCE
     assert fresh.verdict == "DENY"
     assert fresh.receipt.reason_code == ReasonCode.KILL_ACTIVE
     assert late_result is None
     assert fresh_result is None
     assert called["n"] == 0
-    direct = evaluate(_valid(), runtime=runtime)
+    direct = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert direct.receipt.reason_code == ReasonCode.KILL_ACTIVE
 
 
 def test_complete_without_kill_still_invokes():
     runtime = PepRuntime(policy=DEMO_POLICY)
-    pending = begin_invoke(_valid(), runtime=runtime)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     called, boom = _boom_factory()
     decision, result = complete_invoke(pending, boom)
     assert decision.verdict == "ALLOW"
@@ -115,7 +118,7 @@ def test_second_kill_does_not_move_the_cut_epoch():
 
 def test_suspend_between_admit_and_complete_does_not_invoke():
     runtime = PepRuntime(policy=DEMO_POLICY)
-    pending = begin_invoke(_valid(), runtime=runtime)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     called, boom = _boom_factory()
     runtime.suspend()
     decision, result = complete_invoke(pending, boom)
@@ -133,7 +136,7 @@ def test_cross_thread_callback_after_kill_is_fenced():
     called, boom = _boom_factory()
 
     def worker():
-        pending = begin_invoke(_valid(), runtime=runtime)
+        pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
         outcome["admitted"] = pending.decision.verdict
         admitted.set()
         assert release.wait(2)
@@ -167,7 +170,7 @@ def test_kill_during_evaluate_before_allow_does_not_publish_allow():
         assert cut_done.wait(2)
 
     def worker():
-        box.append(runtime.evaluate(_valid(), _before_allow=before_allow))
+        box.append(runtime.evaluate(_valid(), _before_allow=before_allow, principal=HOST))
 
     thread = threading.Thread(target=worker)
     thread.start()
@@ -185,7 +188,7 @@ def test_kill_during_evaluate_before_allow_does_not_publish_allow():
 
 def test_kill_between_fence_check_and_tool_entry_denies():
     runtime = PepRuntime(policy=DEMO_POLICY)
-    pending = begin_invoke(_valid(), runtime=runtime)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     assert pending.decision.verdict == "ALLOW"
     at_gap = threading.Event()
     cut_done = threading.Event()
@@ -216,7 +219,7 @@ def test_kill_between_fence_check_and_tool_entry_denies():
 
 def test_second_complete_denies_and_enters_at_most_once():
     runtime = PepRuntime(policy=DEMO_POLICY)
-    pending = begin_invoke(_valid(), runtime=runtime)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     called, boom = _boom_factory()
     first, first_result = complete_invoke(pending, boom)
     second, second_result = complete_invoke(pending, boom)
@@ -233,7 +236,7 @@ def test_second_complete_denies_and_enters_at_most_once():
 
 def test_replay_while_tool_is_running_does_not_enter_again():
     runtime = PepRuntime(policy=DEMO_POLICY)
-    pending = begin_invoke(_valid(), runtime=runtime)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
     in_tool = threading.Event()
     release_tool = threading.Event()
     calls = {"n": 0}

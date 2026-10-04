@@ -21,6 +21,9 @@ from pep.receipt import (
 from pep.reasons import ReasonCode
 from pep.row import eval_dir, load_expected_deny_receipt, load_structured_envelope
 
+# ADR-0003: the principal the test host attests; a listed holder of lab.cap.echo.demo.
+HOST = "lab.demo.agent"
+
 
 def test_receipt_schema_version_is_frozen_v1():
     assert RECEIPT_SCHEMA_VERSION == "1"
@@ -41,7 +44,7 @@ def test_expected_deny_receipt_matches_frozen_schema():
 
 
 def test_live_official_deny_matches_frozen_schema():
-    live = evaluate(load_structured_envelope()).to_dict()
+    live = evaluate(load_structured_envelope(), principal=HOST).to_dict()
     validate_receipt(live)
     assert set(live) == FROZEN_RECEIPT_KEYS
     assert live["decision"] == "DENY"
@@ -56,7 +59,7 @@ def test_live_allow_matches_frozen_schema():
             "caller_identity": "lab.demo.agent",
             "request_id": "test-receipt-allow",
         }
-    ).to_dict()
+    , principal=HOST).to_dict()
     validate_receipt(live)
     assert live["decision"] == "ALLOW"
     assert live["receipt_type"] == "pep_allow"

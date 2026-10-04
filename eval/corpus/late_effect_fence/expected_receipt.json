@@ -1,7 +1,7 @@
 {
   "brand": "Agent Control Lab",
   "decision": "DENY",
-  "envelope_hash": "sha256:66601f3a49258fed49d914b83ac4d8b60884c649cdaa1783f00e6297a2bf6c88",
+  "envelope_hash": "sha256:9b9ff575956b04510452be96afa42a67a5b606bfe030331ae5bde3c8e2565543",
   "eval_ref": "ACL_PEP_Eval_Row_2609_19587_class_2026-09-18",
   "fail_closed": true,
   "judge": {
@@ -16,7 +16,7 @@
     "tool_invoke_executed": false
   },
   "pep_id": "acl-pep-stub-host-runtime-001",
-  "policy_version": "0.1.0-stub",
+  "policy_version": "0.2.0-stub",
   "reason_code": "late_effect_fence",
   "reason_detail": "kill cut+fence engaged; in-flight or queued invoke fail-closed deny, no tool entry",
   "receipt_type": "pep_deny",

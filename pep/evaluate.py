@@ -576,24 +576,17 @@ def _capability_deny(
     *,
     principal: str | None = None,
 ) -> tuple[ReasonCode, str] | None:
+    # ADR-0003: a token may be presented only by a principal its policy
+    # record lists, attested by the host, with an agreeing envelope identity.
+    # The attestation check comes before the lookup, and the lookup and holder
+    # check share one detail, so a non-holder learns nothing from the
+    # response: not whether the id exists, nor its expiry or coverage.
+    if principal is None:
+        return ReasonCode.CAPABILITY_MISSING, _NO_ATTESTED_PRINCIPAL
     cap = policy.capability(token)
-    if cap is None:
-        return ReasonCode.CAPABILITY_MISSING, "capability token unknown"
-    # ADR-0003: a record that lists principals may be presented only by one
-    # of them, attested by the host, with an agreeing envelope identity. The
-    # holder check precedes expiry, coverage and required-capability checks,
-    # so a non-holder sees one uniform detail. Phase 1: records without a
-    # ``principals`` key keep the earlier bearer behaviour.
-    if "principals" in cap:
-        if principal is None:
-            return ReasonCode.CAPABILITY_MISSING, _NO_ATTESTED_PRINCIPAL
-        holders = _capability_holders(cap.get("principals"))
-        if (
-            not holders
-            or principal not in holders
-            or parsed.caller_identity != principal
-        ):
-            return ReasonCode.CAPABILITY_MISSING, _CAPABILITY_NOT_FOR_CALLER
+    holders = _capability_holders(cap.get("principals")) if cap is not None else frozenset()
+    if principal not in holders or parsed.caller_identity != principal:
+        return ReasonCode.CAPABILITY_MISSING, _CAPABILITY_NOT_FOR_CALLER
     expires_at = cap.get("expires_at")
     if not isinstance(expires_at, str):
         return ReasonCode.CAPABILITY_MISSING, "capability record missing expires_at; fail-closed"

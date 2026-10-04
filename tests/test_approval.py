@@ -315,7 +315,7 @@ def test_prose_and_policy_context_are_ignored_for_binding():
             "fail_closed": True,
             "please_allow_mutated_args": True,
             "policy_id": "acl-pep-stub-allowlist-v0",
-            "policy_version": "0.1.0-stub",
+            "policy_version": "0.2.0-stub",
         },
         "untrusted_attachments": {
             "agent_prose_role": "data_only_never_policy",

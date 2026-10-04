@@ -36,30 +36,29 @@ def _token(tools, *, principals=(OWNER,), expires_at=_FUTURE, **extra):
     return record
 
 
-POLICY = PolicyStore.from_document(
-    {
-        "policy_id": "lab.pep.test.adr0003",
-        "policy_version": "test",
-        "fail_closed": True,
-        "allowed_tools": {
-            "echo.ping": {"required_capability": "lab.cap.echo.demo", "args_schema": _ARGS_SCHEMA},
-            "echo.other": {"required_capability": "lab.cap.other", "args_schema": _ARGS_SCHEMA},
-            "echo.legacy": {"required_capability": "lab.cap.legacy", "args_schema": _ARGS_SCHEMA},
-        },
-        "capability_tokens": {
-            "lab.cap.echo.demo": _token(["echo.ping"]),
-            "lab.cap.echo.expired": _token(["echo.ping"], expires_at="2020-01-01T00:00:00+00:00"),
-            "lab.cap.other": _token(["echo.other"]),
-            "lab.cap.both": _token(["echo.ping", "echo.other"]),
-            "lab.cap.badexp": _token(["echo.ping"], expires_at="not-a-date"),
-            "lab.cap.p.empty": _token(["echo.ping"], principals=[]),
-            "lab.cap.p.string": _token(["echo.ping"], principals=OWNER),
-            "lab.cap.p.bad": _token(["echo.ping"], principals=["Bad Id"]),
-            "lab.cap.p.int": _token(["echo.ping"], principals=[7]),
-            "lab.cap.legacy": _token(["echo.legacy"], principals=None),
-        },
-    }
-)
+POLICY_DOC = {
+    "policy_id": "lab.pep.test.adr0003",
+    "policy_version": "test",
+    "fail_closed": True,
+    "allowed_tools": {
+        "echo.ping": {"required_capability": "lab.cap.echo.demo", "args_schema": _ARGS_SCHEMA},
+        "echo.other": {"required_capability": "lab.cap.other", "args_schema": _ARGS_SCHEMA},
+        "echo.legacy": {"required_capability": "lab.cap.legacy", "args_schema": _ARGS_SCHEMA},
+    },
+    "capability_tokens": {
+        "lab.cap.echo.demo": _token(["echo.ping"]),
+        "lab.cap.echo.expired": _token(["echo.ping"], expires_at="2020-01-01T00:00:00+00:00"),
+        "lab.cap.other": _token(["echo.other"]),
+        "lab.cap.both": _token(["echo.ping", "echo.other"]),
+        "lab.cap.badexp": _token(["echo.ping"], expires_at="not-a-date"),
+        "lab.cap.p.empty": _token(["echo.ping"], principals=[]),
+        "lab.cap.p.string": _token(["echo.ping"], principals=OWNER),
+        "lab.cap.p.bad": _token(["echo.ping"], principals=["Bad Id"]),
+        "lab.cap.p.int": _token(["echo.ping"], principals=[7]),
+        "lab.cap.legacy": _token(["echo.legacy"], principals=None),
+    },
+}
+POLICY = PolicyStore.from_document(POLICY_DOC)
 
 
 def _runtime() -> PepRuntime:
@@ -171,7 +170,46 @@ def test_holder_token_with_own_approval_allows():
     assert runtime.approvals.lookup(grant.approval_id).consumed()
 
 
-def test_phase1_record_without_principals_is_still_bearer():
-    """Phase 1 transition only (ADR-0003). Phase 2 makes ``principals`` required and removes this test."""
-    decision = _run(_envelope("lab.cap.legacy", tool="echo.legacy", identity=OTHER), principal=OTHER)
-    assert decision.verdict == "ALLOW"
+def test_record_without_principals_authorises_nobody():
+    """ADR-0003 phase 2: ``principals`` is required; a record without it is unusable."""
+    _assert_uniform(
+        _run(_envelope("lab.cap.legacy", tool="echo.legacy", identity=OTHER), principal=OTHER), "lab.cap.legacy"
+    )
+    _assert_uniform(_run(_envelope("lab.cap.legacy", tool="echo.legacy")), "lab.cap.legacy")
+
+
+def test_unknown_token_and_non_holder_share_one_detail():
+    unknown = _run(_envelope("lab.cap.not.issued"))
+    non_holder = _run(_envelope("lab.cap.echo.demo", identity=OTHER), principal=OTHER)
+    _assert_uniform(unknown, "lab.cap.not.issued")
+    _assert_uniform(non_holder, "lab.cap.echo.demo")
+    assert unknown.receipt.reason_detail == non_holder.receipt.reason_detail
+
+
+def test_lab_shape_envelope_is_bound_the_same_way():
+    lab = {
+        "caller": {"identity": OWNER},
+        "envelope_version": "1.0",
+        "invoke": {
+            "tool_name": "echo.ping",
+            "argv": [],
+            "schema_fields": {"capability_token": "lab.cap.echo.demo"},
+        },
+        "pep_eval_id": "acl-pep-capability-principal-lab",
+    }
+    other = {**lab, "caller": {"identity": OTHER}}
+    lab_policy = PolicyStore.from_document(
+        {
+            **POLICY_DOC,
+            "allowed_tools": {
+                "echo.ping": {
+                    "required_capability": "lab.cap.echo.demo",
+                    "args_schema": {"type": "object", "properties": {"argv": {"type": "array"}}, "additionalProperties": False},
+                }
+            },
+        }
+    )
+    runtime = PepRuntime(policy=lab_policy)
+    assert evaluate(lab, runtime=runtime, now=NOW, principal=OWNER).verdict == "ALLOW"
+    _assert_uniform(evaluate(other, runtime=runtime, now=NOW, principal=OWNER), "lab.cap.echo.demo")
+    _assert_uniform(evaluate(other, runtime=runtime, now=NOW, principal=OTHER), "lab.cap.echo.demo")

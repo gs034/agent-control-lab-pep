@@ -17,7 +17,7 @@ from typing import Any, Mapping
 from pep.canonical import canonical_bytes
 
 POLICY_ID = "acl-pep-stub-allowlist-v0"
-POLICY_VERSION = "0.1.0-stub"
+POLICY_VERSION = "0.2.0-stub"
 
 # Demo catalog only. Not a production control plane.
 STUB_POLICY_DOCUMENT: dict[str, Any] = {
@@ -44,10 +44,12 @@ STUB_POLICY_DOCUMENT: dict[str, Any] = {
         "lab.cap.echo.demo": {
             "tools": ["echo.ping"],
             "expires_at": "2099-01-01T00:00:00+00:00",
+            "principals": ["lab.demo.agent"],
         },
         "lab.cap.echo.expired": {
             "tools": ["echo.ping"],
             "expires_at": "2020-01-01T00:00:00+00:00",
+            "principals": ["lab.demo.agent"],
         },
     },
 }

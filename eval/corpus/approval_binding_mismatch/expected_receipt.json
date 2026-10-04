@@ -1,7 +1,7 @@
 {
   "brand": "Agent Control Lab",
   "decision": "DENY",
-  "envelope_hash": "sha256:34a9fa6be56c83168f1ab5ac8fa6e39a501e2f6aa39b305595b2c46a4ba856f3",
+  "envelope_hash": "sha256:9fa68d1775fb8e84330e220992da52079d4dafca645baee30bf1debce633e460",
   "eval_ref": "ACL_PEP_Eval_Row_2609_19587_class_2026-09-18",
   "fail_closed": true,
   "judge": {
@@ -16,7 +16,7 @@
     "tool_invoke_executed": false
   },
   "pep_id": "acl-pep-stub-host-runtime-001",
-  "policy_version": "0.1.0-stub",
+  "policy_version": "0.2.0-stub",
   "reason_code": "approval_binding_mismatch",
   "reason_detail": "single-use TTL approval rejected: approval_binding_mismatch",
   "receipt_type": "pep_deny",

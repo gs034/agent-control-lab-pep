@@ -1,7 +1,7 @@
 {
   "brand": "Agent Control Lab",
   "decision": "DENY",
-  "envelope_hash": "sha256:eeff2120bf4a6d2c49100245083269a185d07fbb5384c6c80e7e33f2f79863fe",
+  "envelope_hash": "sha256:9086b277f971b7ae76fe262033c259fde24dde957c6170d144839b2b77949332",
   "eval_ref": "ACL_PEP_Eval_Row_2609_19587_class_2026-09-18",
   "fail_closed": true,
   "judge": {
@@ -16,9 +16,9 @@
     "tool_invoke_executed": false
   },
   "pep_id": "acl-pep-stub-host-runtime-001",
-  "policy_version": "0.1.0-stub",
+  "policy_version": "0.2.0-stub",
   "reason_code": "capability_missing",
-  "reason_detail": "capability token unknown",
+  "reason_detail": "capability token not valid for this caller",
   "receipt_type": "pep_deny",
   "timestamp": "2026-09-18T12:00:00Z",
   "trust_domain": {

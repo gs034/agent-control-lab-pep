@@ -39,7 +39,8 @@ def exercise_late_effect_fence() -> tuple[Decision, bool]:
         entered["n"] += 1
         return "entered"
 
-    pending = begin_invoke(_allowlisted_probe(), runtime=runtime)
+    # The demo host attests the probe caller, a listed holder (ADR-0003).
+    pending = begin_invoke(_allowlisted_probe(), runtime=runtime, principal="lab.demo.agent")
     if pending.decision.verdict != "ALLOW":
         return pending.decision, entered["n"] > 0
     runtime.kill()

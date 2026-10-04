@@ -27,7 +27,7 @@
     ],
     "fail_closed": true,
     "policy_id": "acl-pep-stub-allowlist-v0",
-    "policy_version": "0.1.0-stub"
+    "policy_version": "0.2.0-stub"
   },
   "untrusted_attachments": {
     "agent_prose_ref": "eval/malicious_agent_prose.txt",
