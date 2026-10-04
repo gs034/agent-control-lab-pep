@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from pep.evaluate import PepRuntime, evaluate
+from pep.gate import begin_invoke, complete_invoke, gated_invoke
 from pep.policy import PolicyStore
 from pep.reasons import ReasonCode
 
@@ -29,10 +30,16 @@ _ARGS_SCHEMA = {
 _FUTURE = "2099-01-01T00:00:00+00:00"
 
 
-def _token(tools, *, principals=(OWNER,), expires_at=_FUTURE, **extra):
-    record = {"tools": list(tools), "expires_at": expires_at, **extra}
-    if principals is not None:
-        record["principals"] = list(principals) if isinstance(principals, tuple) else principals
+_OMIT = object()
+
+
+def _token(tools, *, principals=_OMIT, expires_at=_FUTURE):
+    """A token record. Omitting ``principals`` lists OWNER; pass ``None`` to drop the key."""
+    record = {"tools": list(tools), "expires_at": expires_at}
+    if principals is _OMIT:
+        record["principals"] = [OWNER]
+    elif principals is not None:
+        record["principals"] = principals
     return record
 
 
@@ -51,10 +58,14 @@ POLICY_DOC = {
         "lab.cap.other": _token(["echo.other"]),
         "lab.cap.both": _token(["echo.ping", "echo.other"]),
         "lab.cap.badexp": _token(["echo.ping"], expires_at="not-a-date"),
+        # Malformed forms that still contain OWNER, so only validation can deny them.
         "lab.cap.p.empty": _token(["echo.ping"], principals=[]),
         "lab.cap.p.string": _token(["echo.ping"], principals=OWNER),
-        "lab.cap.p.bad": _token(["echo.ping"], principals=["Bad Id"]),
-        "lab.cap.p.int": _token(["echo.ping"], principals=[7]),
+        "lab.cap.p.mixed.bad": _token(["echo.ping"], principals=[OWNER, "Bad Id"]),
+        "lab.cap.p.mixed.int": _token(["echo.ping"], principals=[OWNER, 7]),
+        "lab.cap.p.mapping": _token(["echo.ping"], principals={OWNER: True}),
+        "lab.cap.p.nested": _token(["echo.ping"], principals=[[OWNER]]),
+        "lab.cap.p.null": {"tools": ["echo.ping"], "expires_at": _FUTURE, "principals": None},
         "lab.cap.legacy": _token(["echo.legacy"], principals=None),
     },
 }
@@ -132,7 +143,15 @@ def test_holder_still_gets_specific_details():
 
 
 def test_malformed_principals_authorise_nobody():
-    for token in ("lab.cap.p.empty", "lab.cap.p.string", "lab.cap.p.bad", "lab.cap.p.int"):
+    for token in (
+        "lab.cap.p.empty",
+        "lab.cap.p.string",
+        "lab.cap.p.mixed.bad",
+        "lab.cap.p.mixed.int",
+        "lab.cap.p.mapping",
+        "lab.cap.p.nested",
+        "lab.cap.p.null",
+    ):
         _assert_uniform(_run(_envelope(token)), token)
 
 
@@ -213,3 +232,25 @@ def test_lab_shape_envelope_is_bound_the_same_way():
     assert evaluate(lab, runtime=runtime, now=NOW, principal=OWNER).verdict == "ALLOW"
     _assert_uniform(evaluate(other, runtime=runtime, now=NOW, principal=OWNER), "lab.cap.echo.demo")
     _assert_uniform(evaluate(other, runtime=runtime, now=NOW, principal=OTHER), "lab.cap.echo.demo")
+
+
+def test_gated_invoke_with_a_non_holder_never_enters_the_tool():
+    calls: list[str] = []
+    decision, result = gated_invoke(
+        _envelope("lab.cap.echo.demo", identity=OTHER),
+        lambda: calls.append("entered"),
+        runtime=_runtime(),
+        now=NOW,
+        principal=OTHER,
+    )
+    _assert_uniform(decision, "lab.cap.echo.demo")
+    assert result is None and calls == []
+
+
+def test_begin_then_complete_without_attestation_never_enters_the_tool():
+    calls: list[str] = []
+    pending = begin_invoke(_envelope("lab.cap.echo.demo"), runtime=_runtime(), now=NOW)
+    decision, result = complete_invoke(pending, lambda: calls.append("entered"))
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_detail == "no attested principal"
+    assert result is None and calls == []

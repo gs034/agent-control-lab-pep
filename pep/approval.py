@@ -27,7 +27,7 @@ from typing import Any, Callable, Mapping
 
 from pep.canonical import canonical_dumps, sha256_prefixed
 from pep.envelope import IDENTITY_RE
-from pep.reasons import ReasonCode
+from pep.reasons import NO_ATTESTED_PRINCIPAL_DETAIL, ReasonCode
 
 APPROVAL_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 STATE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -312,7 +312,7 @@ def _principal_failure(
     wording to confirm a guess.
     """
     if attested is None:
-        return "no attested principal"
+        return NO_ATTESTED_PRINCIPAL_DETAIL
     if bound is None or attested != bound or envelope_identity != attested:
         return "principal check failed"
     return None

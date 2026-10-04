@@ -44,3 +44,5 @@ LATE_EFFECT_FENCE_DETAIL = (
 ADMISSION_CONSUMED_DETAIL = (
     "admission ticket already consumed; fail-closed deny, no second tool entry"
 )
+# Shared by approval (ADR-0002) and capability (ADR-0003) principal checks.
+NO_ATTESTED_PRINCIPAL_DETAIL = "no attested principal"

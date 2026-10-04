@@ -26,7 +26,12 @@ from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore, args_match_schema, parse_expiry
-from pep.reasons import ADMISSION_CONSUMED_DETAIL, LATE_EFFECT_FENCE_DETAIL, ReasonCode
+from pep.reasons import (
+    ADMISSION_CONSUMED_DETAIL,
+    LATE_EFFECT_FENCE_DETAIL,
+    NO_ATTESTED_PRINCIPAL_DETAIL,
+    ReasonCode,
+)
 from pep.receipt import Receipt, issue_receipt
 
 
@@ -564,7 +569,6 @@ class PepRuntime:
 
 
 _CAPABILITY_NOT_FOR_CALLER = "capability token not valid for this caller"
-_NO_ATTESTED_PRINCIPAL = "no attested principal"
 
 
 def _capability_deny(
@@ -574,7 +578,7 @@ def _capability_deny(
     required_cap: Any,
     clock: datetime,
     *,
-    principal: str | None = None,
+    principal: str | None,
 ) -> tuple[ReasonCode, str] | None:
     # ADR-0003: a token may be presented only by a principal its policy
     # record lists, attested by the host, with an agreeing envelope identity.
@@ -582,7 +586,7 @@ def _capability_deny(
     # check share one detail, so a non-holder learns nothing from the
     # response: not whether the id exists, nor its expiry or coverage.
     if principal is None:
-        return ReasonCode.CAPABILITY_MISSING, _NO_ATTESTED_PRINCIPAL
+        return ReasonCode.CAPABILITY_MISSING, NO_ATTESTED_PRINCIPAL_DETAIL
     cap = policy.capability(token)
     holders = _capability_holders(cap.get("principals")) if cap is not None else frozenset()
     if principal not in holders or parsed.caller_identity != principal:
@@ -605,10 +609,12 @@ def _capability_deny(
 
 
 def _capability_holders(value: Any) -> frozenset[str]:
-    """Valid holder set, or empty (authorises nobody). A bare string is not a list."""
-    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
-        return frozenset()
-    if not value or not all(is_principal(item) for item in value):
+    """Valid holder set, or empty (authorises nobody).
+
+    Only a list or tuple of well-formed identities counts; a bare string,
+    mapping, set or any malformed entry authorises nobody.
+    """
+    if not isinstance(value, (list, tuple)) or not all(is_principal(item) for item in value):
         return frozenset()
     return frozenset(value)
 
