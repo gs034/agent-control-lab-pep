@@ -1,139 +1,185 @@
 # ADR-0003: Bind standing capability tokens to host-attested principals
 
-- **Status:** Proposed. The owner asked for this ADR on 2026-10-04, after ADR-0002. It is not implemented on this tree.
+- **Status:** Proposed. The owner asked for this ADR on 2026-10-04, after ADR-0002. Not implemented on this tree.
 - **Date:** 2026-10-04
 - **Depends on:** [ADR-0002](ADR-0002-approval-principal-binding.md), which supplies the host-attested `principal` argument.
-- **Amends:** ADR-0001 "Capability language" item 2 and the "Fail-closed" list.
+- **Amends:** ADR-0001 "Capability language" items 2 and 5, the "Fail-closed" list, and the Consequences line that keeps `policy_version` at `0.1.0-stub`.
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
 
 ## Context
 
-ADR-0001 item 2 makes a standing capability token a grant. The token must be known, unexpired, cover the tool, and match the tool's `required_capability` when the tool names one. Tokens are records in the frozen policy document (`capability_tokens` in `pep/policy.py`). The envelope carries the token id (`capability_token`), and `_capability_deny` in `pep/evaluate.py` checks it.
+**How tokens work today.** ADR-0001 item 2 makes a standing capability token a grant. The token must be known, unexpired, cover the tool, and match the tool's `required_capability` when there is one. Tokens are records in the frozen policy document (`capability_tokens`, `pep/policy.py`). The envelope carries the token id (`capability_token`), and `_capability_deny` in `pep/evaluate.py` checks it.
 
-The checks never ask who is presenting the token, so on this tree a capability token is a bearer credential. ADR-0002 closed the same gap for single-use approvals, but tokens are the wider gap:
+**Nothing asks who presents it.** On this tree a capability token is therefore a bearer credential. ADR-0002 closed the same gap for single-use approvals, but tokens are the wider gap, for three reasons.
 
-- **Multi-use.** An approval is spent once. A token allows every matching invoke until it expires; the stub token `lab.cap.echo.demo` expires in 2099.
-- **Not secret.** The token id is a policy key. It appears in the public policy document, in corpus envelopes, in joint-eval fixtures and in the console witness (`lab_console/witness.py`). Knowing the id is the whole credential.
-- **Deny details leak token state.** For an unknown token the detail is "capability token unknown"; for an expired one it is "capability token expired". Uncovered tools and `required_capability` mismatches give different details again: `capability_missing` against `policy_miss`. Any caller can learn which guessed ids exist and what state they are in. Joint-eval pins this as an observation: `tests/test_evasion_alternate_paths.py::test_capability_detail_reveals_token_state_observation`.
+**Tokens are multi-use.** An approval is spent once. A token admits every matching invoke until it expires, and the stub token `lab.cap.echo.demo` expires in 2099.
 
-The ADR-0002 residuals already name this: "Standing capability tokens are still bearer."
+**The id is not secret.** It is a policy key, and it appears in several places:
+- the public policy document;
+- the corpus envelopes;
+- the joint-eval fixtures and tests;
+- the console witness (`lab_console/witness.py`).
+
+Knowing the id is the whole credential.
+
+**PEP responses leak token state.** An unknown token returns "capability token unknown", while an expired one returns "capability token expired". A token that does not cover the tool returns a third detail under reason code `capability_missing`. A `required_capability` mismatch returns reason code `policy_miss`. So any caller can probe the PEP to learn which ids exist and what state they are in. Joint-eval pins this as an observation: `tests/test_evasion_alternate_paths.py::test_capability_detail_reveals_token_state_observation`.
+
+ADR-0002's residuals already name the gap: "Standing capability tokens are still bearer."
 
 ## Decision
 
 Each capability token in policy names the principals that may present it. Only a call whose host-attested principal is one of them can use the token.
 
-1. **Policy.**
-   - Every `capability_tokens` record gains a required `principals` field: a non-empty list of identities matching `IDENTITY_RE`.
-   - A record with a missing, empty or malformed `principals` field authorises nobody (fail closed).
-   - The binding lives in operator-authored policy, not in a mint call. Tokens stay standing and multi-use; this ADR changes who may use them, not how long they last.
-2. **Attest.** The host-attested `principal` from ADR-0002 is used unchanged. It is the same function argument on `evaluate`, `begin_invoke` and `gated_invoke`, never an envelope field.
-3. **Check order.** In `_capability_deny`:
-   - Look up the token. Then, before the expiry, coverage and `required_capability` checks, require all three of the following:
-     - a host principal is attested;
-     - it is in the record's `principals`;
-     - the envelope identity equals it.
-   - **An unknown token and a failed principal check give the same result:** DENY `capability_missing` with one detail, "capability token not valid for this caller". A caller who is not a holder learns nothing: not whether the id exists, not whether it has expired, and not what it covers.
-   - Only a listed holder gets the specific details:
-     - expired: `capability_missing`;
-     - does not cover the tool: `capability_missing`;
-     - does not match the tool policy: `policy_miss`.
-   - No new reason code is needed.
-4. **Interaction with approvals.** The order inside `evaluate` is unchanged. A presented token is checked first, and a presented `approval_id` is consumed after the args schema check, with the ADR-0002 principal check. An envelope that carries both must pass both under the same attested principal.
-5. **Policy version.** Adding `principals` changes the policy bytes and their meaning. `STUB_POLICY_DOCUMENT` moves from `policy_version` `0.1.0-stub` to `0.2.0-stub`.
-   - Every receipt that attests the policy version changes with it. That covers every corpus expected receipt and the official `eval/` row.
-   - No tool regenerates expected receipts on this tree. Phase 2 adds a small script that evaluates each row and rewrites its expected receipt. The resulting diff is reviewed so that only the intended fields change; receipts are not hand-edited.
-   - A receipt that still said `0.1.0-stub` for a policy that now binds principals would misdescribe what was enforced.
-6. **Receipts.** Schema v1 does not change. The reason codes stay the same; only `reason_detail` text changes for non-holders, and no detail echoes a principal or a token id.
-7. **Version.** The package moves to 0.5.0. Adding the policy field and changing deny behaviour is a breaking change for any caller that presents tokens without attesting a principal.
+1. **Policy field.** Every `capability_tokens` record gains a required `principals` field:
+   - It must be a JSON array of one or more strings, each matching `IDENTITY_RE`.
+   - If `principals` is missing, empty, not an array, or holds a malformed entry, the record authorises nobody: fail closed. A bare string is rejected, so a substring test can never pass.
+   - The binding lives in operator-authored policy, not in a mint call. Tokens stay standing and multi-use; this changes who may use them, not how long they last.
+2. **Attestation.** The host-attested `principal` from ADR-0002 is reused unchanged. It is a function argument on `evaluate`, `begin_invoke` and `gated_invoke`, and is never an envelope field. On those routes, a malformed principal is already `envelope_invalid` before any grant is touched.
+3. **Check order in `_capability_deny`:**
+   1. No attested principal: DENY `capability_missing`, "no attested principal". This is checked before the token lookup, so it reveals nothing about the token. It matches ADR-0002, keeping a host wiring error distinguishable from a refused caller.
+   2. Look up the token.
+   3. If the token is unknown, the attested principal is not in the record's `principals`, or the envelope identity differs from the attested principal: DENY `capability_missing`, "capability token not valid for this caller". All three cases return the same result, so a caller that is not a holder learns nothing *from the PEP's response*: not whether the id exists, not its expiry, not its coverage.
+   4. Only a listed holder then reaches the existing checks, with their existing details:
+      - malformed or missing expiry: `capability_missing`;
+      - expired: `capability_missing`;
+      - does not cover the tool: `capability_missing`;
+      - does not match the tool policy: `policy_miss`.
+   No new reason code is introduced.
+4. **Approvals are unchanged.** The order inside `evaluate` stays as it is: a presented token is checked first, then the args schema, then any presented `approval_id` is consumed under the ADR-0002 principal check. A failing token check denies before the approval is touched, so the approval is not consumed.
+5. **Policy version.** Adding `principals` changes both the policy bytes and their meaning.
+   - The `POLICY_VERSION` constant, and with it `STUB_POLICY_DOCUMENT` and the empty-policy fallback receipt, moves from `0.1.0-stub` to `0.2.0-stub`.
+   - Fixture envelopes carry `policy_context.policy_version`, which is metadata, not policy. These move to `0.2.0-stub` as well, so the fixtures do not misstate the policy they run against.
+   - Because `envelope_hash` covers the whole envelope, those rows' `envelope_hash` changes too.
+6. **Receipts.**
+   - Schema v1 is unchanged, and there is no new reason code.
+   - Decisions and codes change only in the cases the acceptance table lists: callers that are not holders go from ALLOW or `policy_miss` to `capability_missing`.
+   - No detail echoes a principal or a token id.
+7. **Version.** The package moves to 0.5.0. The policy field and the deny behaviour are breaking changes for any caller that presents tokens without attesting a principal.
 
 ## Options considered
 
-| Option | What it binds | Assessment |
+| Option | Binds to | Assessment |
 | --- | --- | --- |
-| **A. Policy-listed holders, host-attested principal (chosen)** | Each token's `principals` list in frozen policy | The binding sits with the rest of capability policy, which is operator-authored and digest-attested. It reuses the ADR-0002 attestation channel and adds no key material. |
-| B. Per-session tokens minted by the host, like approvals | A runtime record per principal | Duplicates the approval store for a standing grant and moves capability authority out of the frozen policy, which ADR-0001 keeps as the source of truth. Rejected. |
-| C. Secret or keyed tokens (random ids, HMAC) | Possession of a secret | This makes possession harder, but it is still bearer: anyone holding the secret, including a delegate it was passed to, can use it. The secret would also share a process with the attacker that ADR-0002 already excludes. Rejected. |
-| D. Keep bearer tokens and document them | Nothing | Leaves a multi-use, public-id credential that is weaker than the approvals ADR-0002 just bound. Rejected. |
-| E. Uniform deny details only, no binding | Nothing | Closes the oracle but not the bearer gap. It is folded into A as decision 3. |
+| **A. Policy-listed holders, host-attested principal (chosen)** | The `principals` list on each token in frozen policy | The binding sits with the rest of capability policy, which is operator-authored and digest-attested. It reuses the ADR-0002 channel and needs no key material. |
+| B. Per-session tokens minted by the host, like approvals | A runtime record per principal | Duplicates the approval store for a standing grant, and moves capability authority out of frozen policy, which ADR-0001 keeps as the source of truth. Rejected. |
+| C. Secret or keyed tokens (random ids, HMAC) | Possession of a secret | Still bearer: anyone the secret is passed to can use it. The secret would also sit in the same process as the attacker that ADR-0002 already excludes. Rejected. |
+| D. Keep bearer tokens, document them | Nothing | Leaves a multi-use credential with a public id that is weaker than approvals are after ADR-0002. Rejected. |
+| E. Uniform deny details only | Nothing | Closes the response oracle, but not the bearer gap. Folded into A as decision 3. |
 
 ## Residuals (what this does not fix)
 
-- **In-process callers can still claim any principal.** As in ADR-0002, code with the same process access can pass any `principal` to `evaluate`. The binding defends host routes that assign per-session principals, not equivalent-access callers.
-- **A token listing several principals is shared among them.** The PEP does not tell listed holders apart beyond their identity, so policy authors should list the narrowest set.
-- **Policy authorship is trusted.** An operator who lists the wrong principal grants them the capability. The PEP enforces policy; it does not audit it.
-- **Holders still get specific details.** A listed holder can still tell an expired token from an uncovered tool. This is accepted, because holders are the principals the operator assigned.
-- **Expiry is unchanged.** Long-lived tokens such as the stub's 2099 expiry stay long-lived. Shortening them is a policy decision, not part of this ADR.
+- **Forged principals in process.** An in-process caller can still claim any principal, as with ADR-0002. Code with the same process access can pass any `principal` to `evaluate`. The binding defends host routes that assign per-session principals, not callers with equivalent access.
+- **The policy itself is public.** The policy document lists every token id, its tools, its expiry and now its `principals`. Decision 3 removes the oracle in the PEP's *response*, not knowledge of the published policy. Publishing holder identities is acceptable, because a holder's principal is attested by the host rather than presented by the caller, so knowing a holder's name does not let a caller become that holder.
+- **Shared holder lists.** A token that lists several principals is shared among them. Policy authors should list the narrowest set.
+- **Policy authorship is trusted.** An operator who lists the wrong principal grants it the capability.
+- **Holders still see specific details.** A listed holder can tell an expired token from an uncovered tool. This is accepted, because holders are the principals the operator assigned.
+- **Expiry is unchanged.** Long-lived tokens stay long-lived; shortening them is a policy decision.
 
 ## Consequences and dependent changes
 
+### Sibling pins
+
+On `main`, joint-eval and console still pin pep `ffd048a` (0.3.3). ADR-0002's own sibling work is also still pending: the joint-eval `story.py` principal and the pin bumps. Plan **one combined sibling change** once ADR-0002 and ADR-0003 are both merged in pep, rather than two separate pin moves.
+
 ### pep (this repository)
 
+**Code**
 - `pep/policy.py`:
   - `principals` on the stub token records;
-  - `policy_version` set to `0.2.0-stub`.
-- `pep/evaluate.py`:
-  - `_capability_deny` takes the attested principal and the envelope identity;
-  - the new early check;
-  - the uniform non-holder detail.
-- `eval/corpus/`: runtime fixtures for token rows gain a top-level `principal`. All expected receipts are regenerated for the policy version, and token rows also change detail where the caller is not a holder (for example `capability_spoof`).
-- The official `eval/` row's expected receipt is regenerated (`policy_version`).
-- `README.md` and `docs/ROADMAP.md`: the stated policy version and its history.
-- `docs/threat-model.md`: the Capability-spoof defence; the non-goal bullet; the capability-check row.
-- ADR-0001: item 2, the Fail-closed list, and the Consequences line that says `policy_version` remains `0.1.0-stub`.
-- Tests that present tokens: they now attest `lab.demo.agent`.
-  - Today these are `tests/test_approval.py`, `test_deny_path.py`, `test_envelope.py`, `test_fail_closed.py`, `test_halt_store.py`, `test_late_effect_fence.py`, `test_prose_ignored.py` and `test_receipt_schema.py`.
-  - Find the full list with `git grep capability_token tests`.
+  - `POLICY_VERSION` set to `0.2.0-stub`;
+  - a `principals` parser that rejects non-arrays. Note that `_freeze` turns lists into tuples.
+- `pep/evaluate.py`: `_capability_deny` takes the attested principal and the envelope identity, and gets the new checks.
 
-This is well over five files, so implementation would be phased. Expected receipts and fixtures are mechanical.
-1. Core check and new tests, with `principals` read but the version unchanged.
-2. Policy field, policy version, fixtures and regenerated receipts.
-3. Docs and the version bump.
+**Corpus and fixtures**
+- `eval/corpus/`:
+  - **Runtime fixtures.** The token rows that reach the token check today are `allow_catalog_bound` and `late_effect_fence`. They gain a top-level `principal` so they keep their outcomes. `capability_spoof` presents an unknown id and needs no attestation for its outcome. Its detail changes to the uniform one, or to "no attested principal" if no principal is attested. The phase plan gives it an attested principal, so that it exercises the uniform non-holder path. The 13 other token rows deny earlier (prose, kill, suspend, missing policy), and their decisions are unchanged.
+  - **Envelopes.** Every envelope's `policy_context.policy_version` moves to `0.2.0-stub`.
+  - **Expected receipts.** All are regenerated.
+- The official `eval/expected_deny_receipt.example.json`, `eval/structured_envelope.example.json` and `eval/ACL_PEP_Eval_Row_2609_19587_class_2026-09-18.md` (policy version).
 
-### joint-eval
+**Tests**
+- Tests that present the live token `lab.cap.echo.demo` attest `lab.demo.agent`. These include `tests/test_approval.py`, `test_deny_path.py`, `test_fail_closed.py`, `test_halt_store.py`, `test_late_effect_fence.py`, `test_prose_ignored.py` and `test_receipt_schema.py`.
+  - `git grep capability_token tests` over-matches: it also finds null tokens and `test_envelope.py`, whose tool is not allowlisted, so its token is never checked.
+- `tests/test_demo.py` hard-codes `0.1.0-stub`.
+- New holder-only tests need a custom policy document, because the stub policy has no uncovered or mismatched holder case.
 
-- `eval/joint_story/pep_monitor_bypass_prose` presents `lab.cap.echo.demo`, so the story must attest a principal.
-- `tests/test_evasion_alternate_paths.py::test_capability_detail_reveals_token_state_observation` will fail on the bump, as intended. It is replaced by a test that asserts the uniform detail.
-- The measured-corpus notes that quote receipt details or the policy version need checking.
-- The pin moves to the merged pep commit.
+**Docs**
+- `README.md`: fail-closed list and policy version.
+- `SECURITY.md`: fail-closed list and policy version.
+- `docs/ROADMAP.md`: "still bearer" line and version history.
+- `docs/threat-model.md`: asset row, Capability-spoof defence, capability-check row, non-goal bullet.
+- `eval/corpus/README.md`: the runtime `principal` now matters for token rows.
+- ADR-0001: as listed under Amends.
+- ADR-0002: annotate the "still bearer" residual.
 
-### console
+**Receipt regeneration**
 
-- `lab_console/witness.py` builds an envelope with `lab.cap.echo.demo` for the PEP admit colour. It must attest a principal, or its expected ALLOW becomes DENY.
-- The pins move with joint-eval and pep.
+No receipt-regeneration tool exists on this tree, so phase 2 adds a small script. It:
+1. evaluates each row;
+2. rewrites only the compared receipt fields;
+3. leaves `timestamp` as it is in the file, because 18 of the 24 runtime fixtures have no frozen `now`, and `timestamp` is not a compared key.
+
+The diff is reviewed: only `policy_version`, `envelope_hash` (where the envelope's `policy_context` changed) and the intended details may change.
+
+### Phases
+
+A transition like ADR-0002's keeps every phase green.
+
+| Phase | Scope | Green during transition because |
+| --- | --- | --- |
+| 1. Core check and new tests | `_capability_deny` enforces the checks for records that carry a valid `principals` field. Records without the field keep today's bearer behaviour, for this phase only. New tests use custom policy documents. | Stub records have no `principals` yet, so existing outcomes do not change. |
+| 2. Policy, fixtures, receipts | `principals` becomes required (missing means nobody); stub `principals`; `POLICY_VERSION` 0.2.0-stub; corpus fixtures and envelopes; regeneration script and regenerated receipts; existing tests attest. | All callers that present the live token attest a listed holder. |
+| 3. Docs and version 0.5.0 | Everything listed under Docs above. | Docs only. |
+
+The branch is not merged until phase 2 lands.
+
+### joint-eval (in the combined sibling change)
+
+- `tests/test_evasion_alternate_paths.py` presents `ALLOWED_CAPABILITY` without attesting a principal, and several of its tests assert ALLOW. They must attest a principal so that they keep measuring the residuals they measure. Turning their expected results into DENY would hide those residuals.
+- `test_capability_detail_reveals_token_state_observation` is replaced by a test that asserts the uniform non-holder detail.
+- Both joint_story expected receipts (`pep_monitor_bypass_prose`, `pep_approval_binding`) change `policy_version`. `tests/test_receipts.py` compares them, so both are regenerated. `pep_monitor_bypass_prose` still denies `agent_prose_rejected`, because the prose check runs before the token. What changes is its receipt, not its outcome.
+- Measured-corpus notes that quote receipt details or the policy version are checked.
+
+### console (in the combined sibling change)
+
+- `lab_console/witness.py` begins an invoke with `lab.cap.echo.demo` and expects ALLOW. It must attest a principal.
+- Its pins move together with joint-eval's and pep's.
 
 ## Comparison experiment and acceptance
 
-Run before and after at named commits. The "before" commit is the merged ADR-0002 tree.
+Run before and after, at named commits. "Before" is the merged ADR-0002 tree (0.4.0).
 
 | Case | Before (0.4.0) | Required after |
 | --- | --- | --- |
-| Listed holder presents a valid token for a covered tool | ALLOW | ALLOW (unchanged) |
-| Unlisted principal presents a valid token | ALLOW | DENY `capability_missing`, "capability token not valid for this caller" |
-| No attested principal, valid token | ALLOW | DENY `capability_missing`, same detail |
-| Holder attested, envelope identity differs | ALLOW | DENY `capability_missing`, same detail |
-| Unknown token id, any caller | DENY `capability_missing` "capability token unknown" | DENY `capability_missing`, same uniform detail |
-| Non-holder presents an expired, uncovered or `required_capability`-mismatched token | Distinct details or codes | The uniform non-holder result: no oracle |
-| Holder presents an expired / uncovered / mismatched token | `capability_missing` / `capability_missing` / `policy_miss` | Unchanged |
-| Token record with missing, empty or malformed `principals` | n/a | DENY for every caller, with the uniform detail |
-| Token and approval in one envelope, both bound to the attested principal | ALLOW | ALLOW |
-| Token and approval in one envelope, approval bound to another principal | n/a | DENY `approval_principal_mismatch`; grant not consumed |
-| Official `python -m pep.demo` row | DENY `TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY` | Same decision and code; receipt `policy_version` `0.2.0-stub` |
+| Listed holder, valid token, covered tool | ALLOW | ALLOW |
+| No attested principal, valid token | ALLOW | DENY `capability_missing`, "no attested principal" |
+| Unlisted principal, valid token | ALLOW | DENY `capability_missing`, "capability token not valid for this caller" |
+| Holder attested, envelope identity differs | ALLOW | DENY `capability_missing`, same uniform detail |
+| Unknown token id, attested caller | DENY `capability_missing` "capability token unknown" | DENY `capability_missing`, same uniform detail |
+| Non-holder presents an expired, uncovered, malformed-expiry or `required_capability`-mismatched token | Distinct details, or `policy_miss` | The uniform non-holder result |
+| Holder presents an expired, uncovered, malformed-expiry or mismatched token (custom policy) | `capability_missing` / `capability_missing` / `capability_missing` / `policy_miss` | Unchanged |
+| Token record with a missing, empty, non-array or malformed `principals` | n/a | DENY for every attested caller, uniform detail |
+| Non-holder: valid token plus a valid approval bound to the attested principal | ALLOW | DENY `capability_missing`; approval **not** consumed |
+| Holder: valid token plus an approval bound to another principal | DENY `approval_principal_mismatch`; not consumed | Unchanged |
+| Holder: valid token plus an approval bound to the same principal | ALLOW | ALLOW |
+| Official `python -m pep.demo` row | DENY `TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY` | Same decision and code; `policy_version` `0.2.0-stub` |
 
-The change is also accepted only when all of the following hold:
+Further acceptance requirements:
 - No receipt-schema change.
 - No detail echoes a principal or a token id.
 - Full suites pass in pep, joint-eval and console at the bumped pins.
 - The brand-wall checks are clean.
-- Expected receipts are regenerated by the phase 2 script, not by hand, and the diff shows that only `policy_version` and the intended non-holder details changed.
-- Every phase diff gets an independent cross-family review.
+- Receipts are regenerated by the phase 2 script; the reviewed diff shows only the intended fields changed.
+- Each phase diff gets an independent, cross-family review.
 
-**Rollback:** revert the implementation commits, and restore the previous pep pins in joint-eval and console.
+**Rollback:** revert the implementation commits and restore the previous pep pins in joint-eval and console.
 
-**What success would establish:** on this tree, a standing capability token can be used only by a principal that the operator listed in policy, attested by the host. A caller that is not a holder learns nothing about which tokens exist or what state they are in.
+**What success would establish:** on this tree, a standing capability token can be used only by a host-attested principal that the operator listed in policy. A caller that is not a holder learns nothing from the PEP's response about which tokens exist or their state.
 
 **What it would not establish:**
 - any measured attack-success rate;
-- resistance to an in-process attacker who forges the host argument;
-- correctness of the policy itself;
+- resistance to an in-process attacker that forges the host argument;
+- correctness of the policy;
+- secrecy of the published policy;
 - live enforcement.
