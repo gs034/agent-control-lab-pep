@@ -1,9 +1,7 @@
 # ADR-0002: Bind single-use approvals to a host-attested principal
 
 - **Status:** Accepted, 2026-10-04 (owner). Bearer approvals are not the intended design.
-- **Implementation:**
-  - **Phase 1 (core and new tests):** in progress on this branch. Phase 1 still accepts a mint without a principal, as a bearer grant, so the existing tests and corpus stay green until they are migrated.
-  - **Phase 2:** removes that path, migrates the corpus and tests, updates the docs and ADR-0001, and bumps the version to 0.4.0. This branch is not merged before phase 2 lands.
+- **Implementation:** done in pep 0.4.0, in two phases on one branch: phase 1 (core and new tests) and phase 2 (principal required at mint, corpus and test migration, docs, version). Not yet done: the joint-eval `story.py` principal and the joint-eval and console pin bumps, which are a separate change.
 - **Date:** 2026-10-04
 - **Supersedes:** nothing.
 - **Amends:** ADR-0001 "Capability language" items 3 and 5, and the "Fail-closed" list, which gains a principal mismatch.
