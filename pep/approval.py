@@ -75,8 +75,8 @@ class ApprovalRecord:
     single_use: bool = True
     consumed_at: datetime | None = None
     state_digest: str | None = None
-    # ADR-0002: the one principal that may spend this grant. None only for
-    # grants minted before principal binding (phase 1 transition).
+    # ADR-0002: the one principal that may spend this grant. Always set by
+    # issue(); a record without one fails every principal check.
     principal: str | None = None
 
     def covers(self, tool_name: str) -> bool:
@@ -143,8 +143,8 @@ class ApprovalStore:
     ) -> ApprovalRecord:
         self._refuse_reentry()
         clock = _aware(now)
-        if principal is not None and not is_principal(principal):
-            raise ApprovalError("principal must match the caller identity format")
+        if not is_principal(principal):
+            raise ApprovalError("approval must be bound to a principal in the caller identity format")
         frozen_state = normalize_state_digest(state_digest)
         if state_digest is not None and frozen_state is None:
             raise ApprovalError("state_digest must be sha256: plus 64 hex characters")
@@ -250,8 +250,7 @@ class ApprovalStore:
         thread the observer spawns is not detected and would block.
 
         ``principal`` is the host-attested caller (ADR-0002), never an envelope
-        field. For a principal-bound grant it is checked straight after the
-        lookup, before the consumed, expiry, binding and state checks, so a
+        field. It is checked straight after the lookup, before the consumed, expiry, binding and state checks, so a
         wrong or unattested caller learns only that the id exists.
         ``envelope_identity`` must then equal it. Every principal failure is
         ``APPROVAL_PRINCIPAL_MISMATCH``, does not consume, and never echoes
@@ -263,10 +262,9 @@ class ApprovalStore:
             record = self._records.get(approval_id)
             if record is None:
                 return ConsumeResult(ReasonCode.APPROVAL_INVALID)
-            if record.principal is not None:
-                failed = _principal_failure(record.principal, principal, envelope_identity)
-                if failed is not None:
-                    return ConsumeResult(ReasonCode.APPROVAL_PRINCIPAL_MISMATCH, failed)
+            failed = _principal_failure(record.principal, principal, envelope_identity)
+            if failed is not None:
+                return ConsumeResult(ReasonCode.APPROVAL_PRINCIPAL_MISMATCH, failed)
             if record.consumed():
                 return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
             if record.expired(clock):
@@ -303,7 +301,7 @@ def is_principal(value: object) -> bool:
 
 
 def _principal_failure(
-    bound: str, attested: str | None, envelope_identity: str | None
+    bound: str | None, attested: str | None, envelope_identity: str | None
 ) -> str | None:
     """Name the failed principal check, or None. Details never echo identities.
 
@@ -313,7 +311,7 @@ def _principal_failure(
     """
     if attested is None:
         return "no attested principal"
-    if attested != bound or envelope_identity != attested:
+    if bound is None or attested != bound or envelope_identity != attested:
         return "principal check failed"
     return None
 

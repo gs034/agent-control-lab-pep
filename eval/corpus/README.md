@@ -10,7 +10,7 @@ existence-proof deny remains at the `eval/` root
 Each corpus row is:
 
 - a Lab structured envelope
-- a runtime fixture (policy / halt mode / single-use approvals)
+- a runtime fixture (policy / halt mode / single-use approvals). Since ADR-0002, each approval fixture names the `principal` it is bound to, and the runtime fixture's top-level `principal` is the identity the fixture host attests when it evaluates the row.
 - an expected receipt matching frozen schema v1
 
 Enforcement is `pep.evaluate` / `pep.gated_invoke`. This directory is not a

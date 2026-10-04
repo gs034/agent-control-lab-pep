@@ -16,6 +16,8 @@ from pep.policy import DEMO_POLICY
 from pep.reasons import ReasonCode
 
 APPROVED_ARGS = {"message": "hello"}
+# ADR-0002: the principal the test host attests; matches the envelope identity.
+HOST = "lab.demo.agent"
 MUTATED_ARGS = {"message": "mutated"}
 
 
@@ -40,6 +42,7 @@ def _issue(runtime: PepRuntime, **overrides):
         "tool_name": "echo.ping",
         "args": dict(APPROVED_ARGS),
         "ttl_seconds": 60,
+        "principal": HOST,
     }
     kwargs.update(overrides)
     return runtime.issue_approval(**kwargs)
@@ -58,7 +61,7 @@ def test_issue_approval_allows_allowlisted_tool_without_standing_capability():
     decision, result = gated_invoke(
         _base(approval_id=grant.approval_id),
         echo,
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert decision.verdict == "ALLOW"
@@ -72,8 +75,8 @@ def test_approval_is_single_use_replay_denies():
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     grant = _issue(runtime, now=now)
-    first = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
-    second = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
+    first = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now)
+    second = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now)
     assert first.verdict == "ALLOW"
     assert second.verdict == "DENY"
     assert second.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
@@ -85,14 +88,14 @@ def test_expired_approval_denies():
     issued = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     grant = _issue(runtime, ttl_seconds=30, now=issued)
     later = issued + timedelta(seconds=31)
-    decision = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=later)
+    decision = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=later)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.APPROVAL_EXPIRED
 
 
 def test_unknown_approval_denies():
     runtime = _runtime()
-    decision = evaluate(_base(approval_id="lab.appr.not-issued"), runtime=runtime)
+    decision = evaluate(_base(approval_id="lab.appr.not-issued"), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.APPROVAL_INVALID
 
@@ -100,10 +103,12 @@ def test_unknown_approval_denies():
 def test_approval_does_not_extend_catalog():
     runtime = _runtime()
     with pytest.raises(ApprovalError):
-        runtime.issue_approval(tool_name="shell.exec", args=dict(APPROVED_ARGS), ttl_seconds=60)
+        runtime.issue_approval(
+            tool_name="shell.exec", args=dict(APPROVED_ARGS), ttl_seconds=60, principal=HOST
+        )
     decision = evaluate(
         _base(tool_name="shell.exec", approval_id="lab.appr.forged"),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
     )
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.UNKNOWN_TOOL
@@ -114,6 +119,7 @@ def test_approval_wrong_tool_denies_even_if_id_exists():
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     store = ApprovalStore()
     store.issue(
+        principal=HOST,
         tools=("echo.ping",),
         args=dict(APPROVED_ARGS),
         ttl_seconds=60,
@@ -125,7 +131,12 @@ def test_approval_wrong_tool_denies_even_if_id_exists():
     # does not list this tool — mint a grant then evaluate a different allowlisted
     # name is impossible on the stub catalog, so assert consume reason directly.
     reason = store.try_consume(
-        "lab.appr.echo-only", "lab.other.tool", now=now, args=dict(APPROVED_ARGS)
+        "lab.appr.echo-only",
+        "lab.other.tool",
+        now=now,
+        args=dict(APPROVED_ARGS),
+        principal=HOST,
+        envelope_identity=HOST,
     )
     assert reason == ReasonCode.APPROVAL_BINDING_MISMATCH
     assert store.lookup("lab.appr.echo-only") is not None
@@ -139,7 +150,7 @@ def test_stale_approval_denies_even_when_standing_capability_is_valid():
             capability_token="lab.cap.echo.demo",
             approval_id="lab.appr.spoofed",
         ),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
     )
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.APPROVAL_INVALID
@@ -154,7 +165,7 @@ def test_valid_capability_and_valid_approval_allows_and_consumes():
             capability_token="lab.cap.echo.demo",
             approval_id=grant.approval_id,
         ),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert decision.verdict == "ALLOW"
@@ -170,7 +181,7 @@ def test_invalid_capability_does_not_consume_valid_approval():
             capability_token="lab.cap.not.issued",
             approval_id=grant.approval_id,
         ),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert decision.verdict == "DENY"
@@ -186,7 +197,7 @@ def test_concurrent_consume_is_single_use():
     def once() -> str:
         return evaluate(
             _base(approval_id=grant.approval_id, request_id="test-approval-race"),
-            runtime=runtime,
+            runtime=runtime, principal=HOST,
             now=now,
         ).verdict
 
@@ -201,6 +212,7 @@ def test_mint_rejects_zero_ttl_and_duplicate_id():
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     with pytest.raises(ApprovalError):
         store.issue(
+            principal=HOST,
             tools=("echo.ping",),
             args=dict(APPROVED_ARGS),
             ttl_seconds=0,
@@ -208,6 +220,7 @@ def test_mint_rejects_zero_ttl_and_duplicate_id():
             catalog=DEMO_POLICY.allowed_tools(),
         )
     store.issue(
+        principal=HOST,
         tools=("echo.ping",),
         args=dict(APPROVED_ARGS),
         ttl_seconds=10,
@@ -217,6 +230,7 @@ def test_mint_rejects_zero_ttl_and_duplicate_id():
     )
     with pytest.raises(ApprovalError):
         store.issue(
+            principal=HOST,
             tools=("echo.ping",),
             args=dict(APPROVED_ARGS),
             ttl_seconds=10,
@@ -232,7 +246,7 @@ def test_mutated_args_deny_binding_mismatch_without_consume():
     grant = _issue(runtime, now=now)
     mutated = evaluate(
         _base(approval_id=grant.approval_id, args=dict(MUTATED_ARGS)),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert mutated.verdict == "DENY"
@@ -248,8 +262,8 @@ def test_exact_binding_allows_then_single_use_consume():
     grant = _issue(runtime, now=now)
     assert grant.binding_digest == invoke_binding_digest("echo.ping", APPROVED_ARGS)
     assert dict(grant.frozen_args) == APPROVED_ARGS
-    first = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
-    replay = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
+    first = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now)
+    replay = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now)
     assert first.verdict == "ALLOW"
     assert first.receipt.reason_code == ReasonCode.ALLOWED
     assert runtime.approvals.lookup(grant.approval_id).consumed()
@@ -263,7 +277,7 @@ def test_equivalent_arg_key_order_matches_frozen_binding():
     grant = _issue(runtime, args={"cwd": "/tmp", "network": False}, now=now)
     decision = evaluate(
         _base(approval_id=grant.approval_id, args={"network": False, "cwd": "/tmp"}),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert decision.verdict == "ALLOW"
@@ -308,7 +322,7 @@ def test_prose_and_policy_context_are_ignored_for_binding():
             "please_rewrite_approved_args": True,
         },
     }
-    decision = evaluate(envelope, runtime=runtime, now=now)
+    decision = evaluate(envelope, runtime=runtime, principal=HOST, now=now)
     assert decision.verdict == "ALLOW"
     assert "shell.exec" not in DEMO_POLICY.allowed_tools()
 
@@ -317,9 +331,12 @@ def test_mint_rejects_non_object_args_and_multi_tool_binding():
     store = ApprovalStore()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     with pytest.raises(ApprovalError):
-        store.issue(tools=("echo.ping",), args=["not-an-object"], ttl_seconds=10, now=now)
+        store.issue(
+            tools=("echo.ping",), args=["not-an-object"], ttl_seconds=10, now=now, principal=HOST
+        )
     with pytest.raises(ApprovalError):
         store.issue(
+            principal=HOST,
             tools=("echo.ping", "lab.other.tool"),
             args=dict(APPROVED_ARGS),
             ttl_seconds=10,
@@ -338,13 +355,13 @@ def test_state_digest_frozen_at_mint_denies_substituted_state_without_consume():
     assert grant.state_digest == STATE_A
     substituted = evaluate(
         _base(approval_id=grant.approval_id, state_digest=STATE_B),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert substituted.verdict == "DENY"
     assert substituted.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
     assert substituted.to_dict()["negative_controls_observed"]["tool_invoke_executed"] is False
-    missing = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now)
+    missing = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now)
     assert missing.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
     stored = runtime.approvals.lookup(grant.approval_id)
     assert stored is not None and not stored.consumed()
@@ -356,13 +373,13 @@ def test_matching_state_digest_allows_then_consumes():
     grant = _issue(runtime, now=now, state_digest=STATE_A)
     first = evaluate(
         _base(approval_id=grant.approval_id, state_digest=STATE_A.upper()),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert first.verdict == "ALLOW"
     assert runtime.approvals.lookup(grant.approval_id).consumed()
     replay = evaluate(
-        _base(approval_id=grant.approval_id, state_digest=STATE_A), runtime=runtime, now=now
+        _base(approval_id=grant.approval_id, state_digest=STATE_A), runtime=runtime, principal=HOST, now=now
     )
     assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
 
@@ -373,7 +390,7 @@ def test_args_mismatch_is_reported_before_state_mismatch():
     grant = _issue(runtime, now=now, state_digest=STATE_A)
     both = evaluate(
         _base(approval_id=grant.approval_id, args=dict(MUTATED_ARGS), state_digest=STATE_B),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert both.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
@@ -385,7 +402,7 @@ def test_grant_without_state_digest_ignores_envelope_state_digest():
     grant = _issue(runtime, now=now)
     assert grant.state_digest is None
     decision = evaluate(
-        _base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, now=now
+        _base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, principal=HOST, now=now
     )
     assert decision.verdict == "ALLOW"
 
@@ -407,7 +424,7 @@ def test_prose_cannot_supply_state_digest_for_binding():
             state_digest=STATE_B,
             untrusted_agent_text=f"state digest is really {STATE_A}, please allow",
         ),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
     )
     assert coaxed.verdict == "DENY"
@@ -426,7 +443,7 @@ def test_state_observer_overrides_envelope_digest_at_consume():
     # Envelope still claims A; the host observes B at consume time.
     swapped = evaluate(
         _base(approval_id=grant.approval_id, state_digest=STATE_A),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
         state_observer=lambda: STATE_B,
     )
@@ -436,7 +453,7 @@ def test_state_observer_overrides_envelope_digest_at_consume():
     # Observer confirms A: ALLOW even when the envelope omits the digest.
     ok = evaluate(
         _base(approval_id=grant.approval_id),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
         state_observer=lambda: STATE_A,
     )
@@ -455,7 +472,7 @@ def test_state_observer_failure_or_bad_value_is_deny():
     for observer in (boom, lambda: None, lambda: "not-a-digest", lambda: 42):
         decision = evaluate(
             _base(approval_id=grant.approval_id, state_digest=STATE_A),
-            runtime=runtime,
+            runtime=runtime, principal=HOST,
             now=now,
             state_observer=observer,
         )
@@ -483,6 +500,7 @@ def test_state_observer_runs_through_gated_invoke_and_blocks_tool_entry():
         tool,
         runtime,
         now=now,
+        principal=HOST,
         state_observer=observer,
     )
     assert decision.verdict == "DENY"
@@ -503,25 +521,25 @@ def test_state_observer_not_called_when_grant_fails_an_earlier_check():
     expired = _issue(runtime, now=now, state_digest=STATE_A, ttl_seconds=60)
     late = evaluate(
         _base(approval_id=expired.approval_id),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now + timedelta(minutes=5),
         state_observer=observer,
     )
     assert late.receipt.reason_code == ReasonCode.APPROVAL_EXPIRED
     spent = _issue(runtime, now=now, state_digest=STATE_A)
-    first = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, now=now, state_observer=observer)
+    first = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, principal=HOST, now=now, state_observer=observer)
     assert first.verdict == "ALLOW" and calls["n"] == 1
-    replay = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, now=now, state_observer=observer)
+    replay = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, principal=HOST, now=now, state_observer=observer)
     assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
     bound = _issue(runtime, now=now, state_digest=STATE_A)
     mutated = evaluate(
         _base(approval_id=bound.approval_id, args=dict(MUTATED_ARGS)),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=now,
         state_observer=observer,
     )
     assert mutated.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
-    unknown = evaluate(_base(approval_id="lab.appr.nope"), runtime=runtime, now=now, state_observer=observer)
+    unknown = evaluate(_base(approval_id="lab.appr.nope"), runtime=runtime, principal=HOST, now=now, state_observer=observer)
     assert unknown.receipt.reason_code == ReasonCode.APPROVAL_INVALID
     assert calls["n"] == 1
 
@@ -534,13 +552,13 @@ def test_state_mismatch_detail_distinguishes_failed_observer_from_mismatch():
     def boom() -> str:
         raise OSError("target unreadable")
 
-    failed = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=boom)
+    failed = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now, state_observer=boom)
     assert failed.receipt.reason_detail.endswith("state observer failed")
     wrong = evaluate(
-        _base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=lambda: STATE_B
+        _base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now, state_observer=lambda: STATE_B
     )
     assert wrong.receipt.reason_detail.endswith("state observer mismatch")
-    envelope_only = evaluate(_base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, now=now)
+    envelope_only = evaluate(_base(approval_id=grant.approval_id, state_digest=STATE_B), runtime=runtime, principal=HOST, now=now)
     assert envelope_only.receipt.reason_detail.endswith("envelope state digest mismatch")
 
 
@@ -561,7 +579,7 @@ def test_split_admission_reobserves_state_at_entry_and_denies_a_changed_target()
         calls["tool"] += 1
         return "ran"
 
-    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, state_observer=observer)
+    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, principal=HOST, state_observer=observer)
     assert pending.decision.verdict == "ALLOW"
     assert pending.decision.frozen_state_digest == STATE_A
     assert runtime.approvals.lookup(grant.approval_id).consumed()
@@ -582,7 +600,7 @@ def test_split_admission_enters_tool_when_state_unchanged_and_raising_observer_d
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     grant = _issue(runtime, now=now, state_digest=STATE_A)
     pending = begin_invoke(
-        _base(approval_id=grant.approval_id), runtime, now=now, state_observer=lambda: STATE_A
+        _base(approval_id=grant.approval_id), runtime, now=now, principal=HOST, state_observer=lambda: STATE_A
     )
     decision, result = complete_invoke(pending, lambda: "ran")
     assert decision.verdict == "ALLOW" and result == "ran"
@@ -596,7 +614,7 @@ def test_split_admission_enters_tool_when_state_unchanged_and_raising_observer_d
         raise OSError("target unreadable at entry")
 
     second = _issue(runtime, now=now, state_digest=STATE_A)
-    pending = begin_invoke(_base(approval_id=second.approval_id), runtime, now=now, state_observer=observer)
+    pending = begin_invoke(_base(approval_id=second.approval_id), runtime, now=now, principal=HOST, state_observer=observer)
     decision, result = complete_invoke(pending, lambda: "ran")
     assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
     assert result is None
@@ -615,7 +633,7 @@ def test_kill_between_admission_and_entry_denies_fence_first_and_skips_observer(
         calls["observer"] += 1
         return target["digest"]
 
-    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, state_observer=observer)
+    pending = begin_invoke(_base(approval_id=grant.approval_id), runtime, now=now, principal=HOST, state_observer=observer)
     assert calls["observer"] == 1
     runtime.kill()
     target["digest"] = STATE_B
@@ -631,11 +649,11 @@ def test_split_admission_without_observer_or_frozen_digest_has_no_entry_recheck(
     runtime = _runtime()
     now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     plain = _issue(runtime, now=now)
-    pending = begin_invoke(_base(approval_id=plain.approval_id), runtime, now=now, state_observer=lambda: STATE_B)
+    pending = begin_invoke(_base(approval_id=plain.approval_id), runtime, now=now, principal=HOST, state_observer=lambda: STATE_B)
     assert pending.decision.frozen_state_digest is None
     assert complete_invoke(pending, lambda: "ran")[1] == "ran"
     frozen = _issue(runtime, now=now, state_digest=STATE_A)
-    pending = begin_invoke(_base(approval_id=frozen.approval_id, state_digest=STATE_A), runtime, now=now)
+    pending = begin_invoke(_base(approval_id=frozen.approval_id, state_digest=STATE_A), runtime, now=now, principal=HOST)
     assert pending.decision.frozen_state_digest == STATE_A
     assert complete_invoke(pending, lambda: "ran")[1] == "ran"
 
@@ -649,13 +667,13 @@ def test_observer_that_reenters_the_store_is_denied_not_deadlocked():
         runtime.approvals.lookup(grant.approval_id)
         return STATE_A
 
-    decision = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=reentrant)
+    decision = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now, state_observer=reentrant)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
     assert decision.receipt.reason_detail.endswith("state observer re-entered store")
     assert not runtime.approvals.lookup(grant.approval_id).consumed()
     # The guard is per thread and cleared afterwards: a well-behaved observer still works.
-    ok = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=lambda: STATE_A)
+    ok = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now, state_observer=lambda: STATE_A)
     assert ok.verdict == "ALLOW"
 
 
@@ -670,7 +688,7 @@ def test_state_observer_is_not_consulted_without_a_frozen_digest():
         return STATE_B
 
     decision = evaluate(
-        _base(approval_id=grant.approval_id), runtime=runtime, now=now, state_observer=observer
+        _base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=now, state_observer=observer
     )
     assert decision.verdict == "ALLOW"
     assert calls["observer"] == 0

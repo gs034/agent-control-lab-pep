@@ -368,14 +368,12 @@ def test_owner_grant_spent_when_state_changes_before_entry_is_the_documented_res
     assert _consumed(runtime, grant.approval_id)
 
 
-def test_phase1_unbound_grant_is_still_bearer():
-    """Phase 1 transition only (ADR-0002): a grant minted without a principal
-    ignores the attested principal. Phase 2 removes unbound mints and this test."""
-    runtime = _runtime()
-    grant = _grant(runtime, principal=None)
-    assert grant.principal is None
-    decision = evaluate(_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OTHER)
-    assert decision.verdict == "ALLOW"
+def test_mint_without_principal_raises():
+    """ADR-0002 phase 2: there is no unbound mode."""
+    with pytest.raises(ApprovalError):
+        _grant(_runtime(), principal=None)
+    with pytest.raises(ApprovalError):
+        _runtime().approvals.issue(tools=("echo.ping",), args=dict(ARGS), ttl_seconds=60, now=NOW)
 
 
 def test_try_consume_passes_principal_through():
