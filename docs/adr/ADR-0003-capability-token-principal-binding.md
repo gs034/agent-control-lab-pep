@@ -1,6 +1,7 @@
 # ADR-0003: Bind standing capability tokens to host-attested principals
 
-- **Status:** Accepted, 2026-10-04 (owner). Implemented on the ADR-0002 branch in three phases (see Phases). Phase 1 is in progress. Its transitional bearer behaviour, for records without `principals`, is removed in phase 2, and the branch does not merge before then.
+- **Status:** Accepted, 2026-10-04 (owner).
+- **Implementation:** pep 0.5.0, on the ADR-0002 branch, in three phases: core check and tests; required `principals`, policy `0.2.0-stub`, fixtures and regenerated receipts; docs and version. Still to do: joint-eval and console, as part of the combined sibling change.
 - **Date:** 2026-10-04
 - **Depends on:** [ADR-0002](ADR-0002-approval-principal-binding.md), which supplies the host-attested `principal` argument.
 - **Amends:** ADR-0001 "Capability language" items 2 and 5, the "Fail-closed" list, and the Consequences line that keeps `policy_version` at `0.1.0-stub`.

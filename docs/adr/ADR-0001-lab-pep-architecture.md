@@ -1,6 +1,6 @@
 # ADR-0001 — Lab host/runtime PEP architecture
 
-- **Status:** Accepted (v0.3.3 / approval state digest; v0.3.2 late-effect fence and v0.3.1 approval invoke binding remain). Amended by [ADR-0002](ADR-0002-approval-principal-binding.md) in v0.4.0: approvals are bound to a host-attested principal.
+- **Status:** Accepted (v0.3.3 / approval state digest; v0.3.2 late-effect fence and v0.3.1 approval invoke binding remain). Amended by [ADR-0002](ADR-0002-approval-principal-binding.md) in v0.4.0, which binds approvals to a host-attested principal, and by [ADR-0003](ADR-0003-capability-token-principal-binding.md) in v0.5.0, which binds standing capability tokens to policy-listed, host-attested holders.
 - **Date:** 2026-09-21
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
@@ -32,16 +32,16 @@ Policy-relevant input is a structured invoke envelope (Lab or flat JSON object).
 Allow is a **grant check**, not a judgement:
 
 1. **Frozen catalog.** Only allowlisted tools can run. An approval cannot extend the catalog.
-2. **Standing capability.** A capability token must be known, unexpired, cover the tool, and match the tool’s required capability when present.
+2. **Standing capability.** A capability token must be known, unexpired, cover the tool, and match the tool’s required capability when present. Since v0.5.0 (ADR-0003), it must also be presented by a host-attested principal listed in the token's policy `principals`, with an agreeing envelope identity. A non-holder and an unknown token get the same `capability_missing` detail.
 3. **Single-use TTL approval.** An operator-issued `approval_id` is a one-shot grant for an already-catalogued **invoke**. Mint freezes `tool_name` plus canonical JSON args (`pep.canonical` / `sha256_prefixed`). The first successful ALLOW of that exact binding consumes it. Replay, expiry, unknown id, uncovered tool, or a post-mint args substitution → **DENY**. `policy_context` and untrusted attachments are not part of the binding. This closes the Loopjacking-class gap where a HITL/TTL approval is not a control if the operation presented for approval is not exactly what later executes (existence-proof threat pattern: [arXiv:2609.21081](https://arxiv.org/abs/2609.21081); not a measured attack-success-rate claim). Since v0.4.0 ([ADR-0002](ADR-0002-approval-principal-binding.md)) each grant is also bound at mint to one principal. Spending it needs a host-attested principal equal to that bound principal, and an envelope identity equal to both. Otherwise the result is **DENY** `approval_principal_mismatch` and the grant is not consumed. This addresses the Delegation class (arXiv:2609.38983v1, class inspiration only), not the Loopjacking gap above.
 4. **Neither grant.** Allowlisted tool with no capability and no approval → **DENY** (`capability_missing`). Unknown tool with both grants absent → official eval reason `TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY`.
-5. **Presented grant must hold.** A spoofed, stale or principal-mismatched approval fails closed even if a standing capability would otherwise allow.
+5. **Presented grant must hold.** A spoofed, stale or principal-mismatched approval, or a capability token presented by a non-holder, fails closed even if a standing capability would otherwise allow.
 
 Prose cannot insert a capability row or an approval row.
 
 ### Fail-closed
 
-Missing policy, unknown tool, expired or missing capability, invalid/expired/consumed/binding-mismatched/principal-mismatched approval, parse failure, PEP unavailable, **kill**, or **suspend** → **DENY + receipt**. `gated_invoke` does not enter the tool. There is no fail-open path.
+Missing policy, unknown tool, expired or missing capability, a capability token presented by a non-holder, invalid/expired/consumed/binding-mismatched/principal-mismatched approval, parse failure, PEP unavailable, **kill**, or **suspend** → **DENY + receipt**. `gated_invoke` does not enter the tool. There is no fail-open path.
 
 ### Kill and suspend
 
@@ -79,7 +79,7 @@ Every decision emits a receipt that attests `decision`, `reason_code`, `envelope
 ## Consequences
 
 - Diligence readers can treat `pep/evaluate.py` as the enforcement plane, not a model-graded monitor.
-- Official `eval/` deny (`python -m pep.demo`) stays a fail-closed DENY with the frozen receipt shape (`policy_version` remains `0.1.0-stub` on that allowlist).
+- Official `eval/` deny (`python -m pep.demo`) stays a fail-closed DENY with the frozen receipt shape (`policy_version` was `0.1.0-stub` on that allowlist until v0.5.0; ADR-0003 moved it to `0.2.0-stub`, because the token records gained `principals`).
 - Package version `0.3.3` names the optional approval state digest on the v0.3.2 / late-effect-fence tree, not a production control plane. `0.3.2` remains the late-effect fence patch and `0.3.1` the approval-binding patch.
 - EOI **M1** (evaluator corpus) adds rows under `eval/corpus/`; v0.3.1 adds approval-binding rows on the same path. The official demo row stays at `eval/` root. Allow authority does not move onto a model or monitor.
 - Package version `0.4.0` binds approvals to a host-attested principal (ADR-0002).

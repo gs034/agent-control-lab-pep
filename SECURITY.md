@@ -4,7 +4,7 @@ This repository is a public-goods, Apache-2.0 **reference host/runtime Policy En
 
 ## Fail-closed default
 
-The PEP default is **DENY**. Missing policy, unknown tool, expired or missing capability, invalid/expired/consumed/binding-mismatched/principal-mismatched single-use approval, PEP unavailable, kill, a late effect after kill, suspend, and parse failure all yield **DENY + receipt**. `gated_invoke` does not enter the tool on DENY. An in-process admission that completes after `kill()` denies as `late_effect_fence` and does not enter the tool.
+The PEP default is **DENY**. Missing policy, unknown tool, expired or missing capability, a capability token presented by a principal that is not a listed holder (ADR-0003), invalid/expired/consumed/binding-mismatched/principal-mismatched single-use approval, PEP unavailable, kill, a late effect after kill, suspend, and parse failure all yield **DENY + receipt**. `gated_invoke` does not enter the tool on DENY. An in-process admission that completes after `kill()` denies as `late_effect_fence` and does not enter the tool.
 
 There is no documented fail-open path. Do not treat absence of a monitor, model, or approval string as allow.
 
@@ -36,7 +36,7 @@ Issues: https://github.com/gs034/agent-control-lab-pep/issues
 
 Please include:
 
-- PEP id / policy version if you have a receipt (`acl-pep-stub-host-runtime-001`, `0.1.0-stub` on the published allowlist);
+- PEP id / policy version if you have a receipt (`acl-pep-stub-host-runtime-001`, `0.2.0-stub` on the published allowlist);
 - whether `gated_invoke` entered a callable on DENY, or `evaluate()` returned ALLOW when a listed fail-closed condition should have denied;
 - that you are talking about **this** host/runtime PEP, not a model or monitor judgement.
 

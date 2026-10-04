@@ -61,7 +61,7 @@ Example: `eval/expected_deny_receipt.example.json`
 
 | Field | Example / requirement |
 |-------|------------------------|
-| `policy_version` | `0.1.0-stub` (must match loaded stub policy) |
+| `policy_version` | `0.2.0-stub` (must match loaded stub policy; `0.1.0-stub` before ADR-0003) |
 | `reason_code` | e.g. `TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY` |
 | `envelope_hash` | SHA-256 of the canonical structured envelope bytes (`sha256:…`) |
 | `timestamp` | RFC 3339 UTC of the deny decision |
