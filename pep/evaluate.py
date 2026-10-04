@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal, Mapping
 
-from pep.approval import ApprovalRecord, ApprovalStore
+from pep.approval import ApprovalRecord, ApprovalStore, is_principal
 from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
@@ -294,12 +294,14 @@ class PepRuntime:
         approval_id: str | None = None,
         now: datetime | None = None,
         state_digest: str | None = None,
+        principal: str | None = None,
     ) -> ApprovalRecord:
         """Mint a single-use TTL approval bound to one allowlisted invoke.
 
         ``state_digest`` optionally freezes a host-computed digest of the state
         the invoke acts on; consume then requires the host-observed digest to
-        match.
+        match. ``principal`` binds the grant to the one caller the host will
+        attest at consume (ADR-0002).
         """
         return self._approvals.issue(
             tools=(tool_name,),
@@ -309,6 +311,7 @@ class PepRuntime:
             now=now,
             catalog=self._policy.allowed_tools(),
             state_digest=state_digest,
+            principal=principal,
         )
 
     def evaluate(
@@ -317,9 +320,15 @@ class PepRuntime:
         *,
         now: datetime | None = None,
         state_observer: Callable[[], object] | None = None,
+        principal: str | None = None,
         _before_allow: Callable[[], None] | None = None,
     ) -> Decision:
         """Evaluate one structured envelope.
+
+        ``principal`` is the host-attested caller (ADR-0002): the identity the
+        host assigned to this caller session, passed by the host and never
+        read from the envelope. A principal-bound approval needs it; a
+        malformed value is ``envelope_invalid``.
 
         ``state_observer`` is the host's read of the current digest of the
         state the invoke acts on. When the referenced approval froze a state
@@ -376,6 +385,15 @@ class PepRuntime:
             )
 
         env_hash = parsed.digest()
+
+        if principal is not None and not is_principal(principal):
+            return _deny(
+                ReasonCode.ENVELOPE_INVALID,
+                "attested principal is malformed; fail-closed deny",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
+            )
 
         if parsed.has_untrusted_prose():
             return _deny(
@@ -472,6 +490,8 @@ class PepRuntime:
                 args=parsed.args,
                 state_digest=parsed.state_digest,
                 observe=state_observer,
+                principal=principal,
+                envelope_identity=parsed.caller_identity,
             )
             frozen_state = consumed.frozen_state_digest
             if consumed.reason is not None:
@@ -598,12 +618,17 @@ def evaluate(
     *,
     now: datetime | None = None,
     state_observer: Callable[[], object] | None = None,
+    principal: str | None = None,
     _before_allow: Callable[[], None] | None = None,
 ) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""
     pep = resolve_runtime(runtime)
     return pep.evaluate(
-        envelope, now=now, state_observer=state_observer, _before_allow=_before_allow
+        envelope,
+        now=now,
+        state_observer=state_observer,
+        principal=principal,
+        _before_allow=_before_allow,
     )
 
 

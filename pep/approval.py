@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from pep.canonical import canonical_dumps, sha256_prefixed
+from pep.envelope import IDENTITY_RE
 from pep.reasons import ReasonCode
 
 APPROVAL_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -74,6 +75,9 @@ class ApprovalRecord:
     single_use: bool = True
     consumed_at: datetime | None = None
     state_digest: str | None = None
+    # ADR-0002: the one principal that may spend this grant. None only for
+    # grants minted before principal binding (phase 1 transition).
+    principal: str | None = None
 
     def covers(self, tool_name: str) -> bool:
         return tool_name in self.tools
@@ -135,9 +139,12 @@ class ApprovalStore:
         now: datetime | None = None,
         catalog: Mapping[str, object] | None = None,
         state_digest: str | None = None,
+        principal: str | None = None,
     ) -> ApprovalRecord:
         self._refuse_reentry()
         clock = _aware(now)
+        if principal is not None and not is_principal(principal):
+            raise ApprovalError("principal must match the caller identity format")
         frozen_state = normalize_state_digest(state_digest)
         if state_digest is not None and frozen_state is None:
             raise ApprovalError("state_digest must be sha256: plus 64 hex characters")
@@ -171,6 +178,7 @@ class ApprovalStore:
             single_use=True,
             consumed_at=None,
             state_digest=frozen_state,
+            principal=principal,
         )
         with self._lock:
             if token in self._records:
@@ -192,13 +200,22 @@ class ApprovalStore:
         args: Mapping[str, Any],
         state_digest: str | None = None,
         observe: Callable[[], object] | None = None,
+        principal: str | None = None,
+        envelope_identity: str | None = None,
     ) -> ReasonCode | None:
         """Atomically consume a valid grant. ``None`` means the grant was taken.
 
         Thin wrapper over ``consume`` for callers that need only the reason.
         """
         return self.consume(
-            approval_id, tool_name, now, args=args, state_digest=state_digest, observe=observe
+            approval_id,
+            tool_name,
+            now,
+            args=args,
+            state_digest=state_digest,
+            observe=observe,
+            principal=principal,
+            envelope_identity=envelope_identity,
         ).reason
 
     def consume(
@@ -210,6 +227,8 @@ class ApprovalStore:
         args: Mapping[str, Any],
         state_digest: str | None = None,
         observe: Callable[[], object] | None = None,
+        principal: str | None = None,
+        envelope_identity: str | None = None,
     ) -> ConsumeResult:
         """Atomically consume a valid grant, with the state observation inside.
 
@@ -229,6 +248,14 @@ class ApprovalStore:
         store from this thread is refused as a mismatch (``state observer
         re-entered store``) rather than deadlocking. A callback from another
         thread the observer spawns is not detected and would block.
+
+        ``principal`` is the host-attested caller (ADR-0002), never an envelope
+        field. For a principal-bound grant it is checked straight after the
+        lookup, before the consumed, expiry, binding and state checks, so a
+        wrong or unattested caller learns only that the id exists.
+        ``envelope_identity`` must then equal it. Every principal failure is
+        ``APPROVAL_PRINCIPAL_MISMATCH``, does not consume, and never echoes
+        either identity.
         """
         self._refuse_reentry()
         clock = _aware(now)
@@ -236,6 +263,10 @@ class ApprovalStore:
             record = self._records.get(approval_id)
             if record is None:
                 return ConsumeResult(ReasonCode.APPROVAL_INVALID)
+            if record.principal is not None:
+                failed = _principal_failure(record.principal, principal, envelope_identity)
+                if failed is not None:
+                    return ConsumeResult(ReasonCode.APPROVAL_PRINCIPAL_MISMATCH, failed)
             if record.consumed():
                 return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
             if record.expired(clock):
@@ -264,6 +295,24 @@ class ApprovalStore:
                     return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, f"{source} mismatch")
             self._records[approval_id] = replace(record, consumed_at=clock)
             return ConsumeResult(None, frozen_state_digest=record.state_digest)
+
+
+def is_principal(value: object) -> bool:
+    """True for a well-formed principal (same format as an envelope identity)."""
+    return isinstance(value, str) and IDENTITY_RE.fullmatch(value) is not None
+
+
+def _principal_failure(
+    bound: str, attested: str | None, envelope_identity: str | None
+) -> str | None:
+    """Name the failed principal check, or None. Details never echo identities."""
+    if attested is None:
+        return "no attested principal"
+    if attested != bound:
+        return "attested principal is not the grant principal"
+    if envelope_identity != attested:
+        return "envelope identity differs from attested principal"
+    return None
 
 
 def state_matches(frozen: str | None, observed: Any) -> bool:

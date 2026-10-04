@@ -28,6 +28,9 @@ class ReasonCode(StrEnum):
     # Approved invoke unchanged, but the host-observed state the invoke acts on
     # differs from the state digest frozen at mint (post-approval substitution).
     APPROVAL_STATE_MISMATCH = "approval_state_mismatch"
+    # The grant is bound to a principal and the host attested none, attested a
+    # different one, or the envelope identity disagrees with the host (ADR-0002).
+    APPROVAL_PRINCIPAL_MISMATCH = "approval_principal_mismatch"
     ENVELOPE_INVALID = "envelope_invalid"
     # Exact Deep Research receipt code for the official eval row.
     TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY = "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"

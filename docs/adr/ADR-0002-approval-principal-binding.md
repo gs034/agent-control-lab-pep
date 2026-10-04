@@ -1,6 +1,9 @@
 # ADR-0002: Bind single-use approvals to a host-attested principal
 
-- **Status:** Proposed. Owner decision 2026-10-04: bearer approvals are not the intended design. Not implemented on this tree.
+- **Status:** Accepted, 2026-10-04 (owner). Bearer approvals are not the intended design.
+- **Implementation:**
+  - **Phase 1 (core and new tests):** in progress on this branch. Phase 1 still accepts a mint without a principal, as a bearer grant, so the existing tests and corpus stay green until they are migrated.
+  - **Phase 2:** removes that path, migrates the corpus and tests, updates the docs and ADR-0001, and bumps the version to 0.4.0. This branch is not merged before phase 2 lands.
 - **Date:** 2026-10-04
 - **Supersedes:** nothing.
 - **Amends:** ADR-0001 "Capability language" items 3 and 5, and the "Fail-closed" list, which gains a principal mismatch.

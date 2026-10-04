@@ -48,18 +48,22 @@ def begin_invoke(
     *,
     now: datetime | None = None,
     state_observer: Callable[[], object] | None = None,
+    principal: str | None = None,
 ) -> PendingInvoke:
     """Admit one invoke. Does not call a tool.
 
     The returned epoch is the cut generation observed before evaluation.
     A later ``kill()`` makes ``complete_invoke`` fail closed. ``state_observer``
     is passed to ``evaluate`` and kept on the admission so ``complete_invoke``
-    can re-observe the target at tool entry.
+    can re-observe the target at tool entry. ``principal`` is the
+    host-attested caller (ADR-0002), passed through to ``evaluate``.
     """
     pep = resolve_runtime(runtime)
     admission_id = pep.mint_admission_id()
     admitted_epoch = pep.fence_epoch
-    decision = evaluate(envelope, runtime=pep, now=now, state_observer=state_observer)
+    decision = evaluate(
+        envelope, runtime=pep, now=now, state_observer=state_observer, principal=principal
+    )
     return PendingInvoke(
         decision=decision,
         admitted_epoch=admitted_epoch,
@@ -138,12 +142,15 @@ def gated_invoke(
     *,
     now: datetime | None = None,
     state_observer: Callable[[], object] | None = None,
+    principal: str | None = None,
 ) -> tuple[Decision, T | None]:
     """Run ``tool`` only after ``evaluate`` returns ALLOW and the fence is open.
 
     On DENY the callable is not entered. Callers that bypass this helper
     are outside the PEP trust domain. ``state_observer`` is passed through
-    to ``evaluate``.
+    to ``evaluate``, and so is the host-attested ``principal`` (ADR-0002).
     """
-    pending = begin_invoke(envelope, runtime=runtime, now=now, state_observer=state_observer)
+    pending = begin_invoke(
+        envelope, runtime=runtime, now=now, state_observer=state_observer, principal=principal
+    )
     return complete_invoke(pending, tool)
