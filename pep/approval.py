@@ -255,7 +255,7 @@ class ApprovalStore:
         wrong or unattested caller learns only that the id exists.
         ``envelope_identity`` must then equal it. Every principal failure is
         ``APPROVAL_PRINCIPAL_MISMATCH``, does not consume, and never echoes
-        either identity.
+        either identity; the detail only says whether a principal was attested.
         """
         self._refuse_reentry()
         clock = _aware(now)
@@ -305,13 +305,16 @@ def is_principal(value: object) -> bool:
 def _principal_failure(
     bound: str, attested: str | None, envelope_identity: str | None
 ) -> str | None:
-    """Name the failed principal check, or None. Details never echo identities."""
+    """Name the failed principal check, or None. Details never echo identities.
+
+    A wrong principal and an envelope that disagrees with the host share one
+    detail, so a caller that can choose the attested principal cannot use the
+    wording to confirm a guess.
+    """
     if attested is None:
         return "no attested principal"
-    if attested != bound:
-        return "attested principal is not the grant principal"
-    if envelope_identity != attested:
-        return "envelope identity differs from attested principal"
+    if attested != bound or envelope_identity != attested:
+        return "principal check failed"
     return None
 
 

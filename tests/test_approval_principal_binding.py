@@ -11,13 +11,14 @@ envelope identity is only a consistency check. Every principal failure is
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from pep.approval import ApprovalError
 from pep.evaluate import PepRuntime, evaluate
-from pep.gate import gated_invoke
+from pep.gate import begin_invoke, complete_invoke, gated_invoke
 from pep.policy import DEMO_POLICY
 from pep.reasons import ReasonCode
 
@@ -36,6 +37,19 @@ def _envelope(approval_id: str, *, identity: str = OWNER, args=None) -> dict:
         "caller_identity": identity,
         "request_id": "test-principal-binding",
         "approval_id": approval_id,
+    }
+
+
+def _lab_envelope(approval_id: str, *, identity: str = OWNER) -> dict:
+    return {
+        "caller": {"identity": identity},
+        "envelope_version": "1.0",
+        "invoke": {
+            "tool_name": "echo.ping",
+            "argv": [],
+            "schema_fields": {"approval_id": approval_id, "capability_token": None},
+        },
+        "pep_eval_id": "acl-pep-principal-binding-lab",
     }
 
 
@@ -170,6 +184,30 @@ def test_wrong_principal_learns_nothing_about_grant_state():
     for probe in probes:
         _assert_mismatch(probe)
     assert len({p.receipt.reason_detail for p in probes[:3]}) == 1
+    assert not _consumed(runtime, expiring.approval_id)
+    assert not _consumed(runtime, other_args.approval_id)
+
+    # The owner sees the real state, so the probes above hid something real.
+    owner_late = evaluate(
+        _envelope(expiring.approval_id), runtime=runtime, now=NOW + timedelta(minutes=5), principal=OWNER
+    )
+    assert owner_late.receipt.reason_code == ReasonCode.APPROVAL_EXPIRED
+    owner_args = evaluate(_envelope(other_args.approval_id), runtime=runtime, now=NOW, principal=OWNER)
+    assert owner_args.receipt.reason_code == ReasonCode.APPROVAL_BINDING_MISMATCH
+    owner_spent = evaluate(_envelope(spent.approval_id), runtime=runtime, now=NOW, principal=OWNER)
+    assert owner_spent.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
+
+
+def test_wrong_principal_and_envelope_disagreement_share_one_detail():
+    runtime = _runtime()
+    grant = _grant(runtime)
+    wrong = evaluate(_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OTHER)
+    disagree = evaluate(
+        _envelope(grant.approval_id, identity="lab.zzz"), runtime=runtime, now=NOW, principal=OWNER
+    )
+    _assert_mismatch(wrong)
+    _assert_mismatch(disagree)
+    assert wrong.receipt.reason_detail == disagree.receipt.reason_detail
 
 
 def test_owner_expiry_consume_and_replay_codes_are_unchanged():
@@ -234,28 +272,110 @@ def test_wrong_principal_never_triggers_a_host_state_read():
     assert reads == [1]
 
 
-def test_two_principals_racing_one_grant_only_the_owner_consumes():
-    for _ in range(50):
-        runtime = _runtime()
-        grant = _grant(runtime)
-        barrier = threading.Barrier(2)
-        results: dict[str, object] = {}
+def test_wrong_principal_before_and_after_the_owner_both_mismatch():
+    """Both orders, forced: the principal check precedes the consumed check."""
+    runtime = _runtime()
+    grant = _grant(runtime)
+    before = evaluate(_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OTHER)
+    _assert_mismatch(before)
+    assert evaluate(_envelope(grant.approval_id), runtime=runtime, now=NOW, principal=OWNER).allowed()
+    after = evaluate(_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OTHER)
+    _assert_mismatch(after)
 
-        def run(name: str) -> None:
-            barrier.wait()
-            results[name] = evaluate(
-                _envelope(grant.approval_id, identity=name), runtime=runtime, now=NOW, principal=name
-            )
 
-        threads = [threading.Thread(target=run, args=(name,)) for name in (OWNER, OTHER)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+def test_concurrent_owner_calls_consume_exactly_once():
+    """Owner calls race one grant. A slow state observer runs inside consume,
+    after the single-use check, so a consume without the store lock would let
+    a second owner call through while the first is still observing."""
+    runtime = _runtime()
+    grant = _grant(runtime, state_digest=DIGEST)
 
-        assert results[OWNER].verdict == "ALLOW"
-        _assert_mismatch(results[OTHER])
-        assert _consumed(runtime, grant.approval_id)
+    def slow_observe() -> str:
+        time.sleep(0.02)
+        return DIGEST
+
+    barrier = threading.Barrier(4)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def run(name: str) -> None:
+        barrier.wait()
+        decision = evaluate(
+            _envelope(grant.approval_id, identity=name),
+            runtime=runtime,
+            now=NOW,
+            principal=name,
+            state_observer=slow_observe,
+        )
+        with lock:
+            results.append((name, decision))
+
+    names = [OWNER, OWNER, OWNER, OTHER]
+    threads = [threading.Thread(target=run, args=(name,)) for name in names]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    allowed = [name for name, d in results if d.verdict == "ALLOW"]
+    assert allowed == [OWNER]
+    owner_denies = [d.receipt.reason_code for name, d in results if name == OWNER and d.verdict == "DENY"]
+    assert owner_denies == [ReasonCode.APPROVAL_CONSUMED, ReasonCode.APPROVAL_CONSUMED]
+    for name, decision in results:
+        if name == OTHER:
+            _assert_mismatch(decision)
+
+
+def test_lab_shape_envelope_is_bound_the_same_way():
+    runtime = _runtime()
+    grant = _grant(runtime, args={"argv": []})
+    for decision in (
+        evaluate(_lab_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OTHER),
+        evaluate(_lab_envelope(grant.approval_id), runtime=runtime, now=NOW),
+        evaluate(_lab_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OWNER),
+    ):
+        _assert_mismatch(decision)
+    assert not _consumed(runtime, grant.approval_id)
+    owner = evaluate(_lab_envelope(grant.approval_id), runtime=runtime, now=NOW, principal=OWNER)
+    assert owner.verdict == "ALLOW"
+
+
+def test_begin_then_complete_with_wrong_principal_never_enters_the_tool():
+    runtime = _runtime()
+    grant = _grant(runtime)
+    calls: list[str] = []
+    pending = begin_invoke(_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OTHER)
+    decision, result = complete_invoke(pending, lambda: calls.append("entered"))
+    _assert_mismatch(decision)
+    assert result is None and calls == []
+    assert not _consumed(runtime, grant.approval_id)
+
+
+def test_owner_grant_spent_when_state_changes_before_entry_is_the_documented_residual():
+    """ADR-0002 residual: an owner ALLOW whose target changes before entry is
+    DENY with the grant already spent. Only a wrong caller is kept from spending it."""
+    runtime = _runtime()
+    grant = _grant(runtime, state_digest=DIGEST)
+    reads = iter([DIGEST, "sha256:" + "b" * 64])
+    pending = begin_invoke(
+        _envelope(grant.approval_id), runtime=runtime, now=NOW, principal=OWNER, state_observer=lambda: next(reads)
+    )
+    assert pending.decision.verdict == "ALLOW"
+    calls: list[str] = []
+    decision, result = complete_invoke(pending, lambda: calls.append("entered"))
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_STATE_MISMATCH
+    assert result is None and calls == []
+    assert _consumed(runtime, grant.approval_id)
+
+
+def test_phase1_unbound_grant_is_still_bearer():
+    """Phase 1 transition only (ADR-0002): a grant minted without a principal
+    ignores the attested principal. Phase 2 removes unbound mints and this test."""
+    runtime = _runtime()
+    grant = _grant(runtime, principal=None)
+    assert grant.principal is None
+    decision = evaluate(_envelope(grant.approval_id, identity=OTHER), runtime=runtime, now=NOW, principal=OTHER)
+    assert decision.verdict == "ALLOW"
 
 
 def test_try_consume_passes_principal_through():
@@ -266,6 +386,10 @@ def test_try_consume_passes_principal_through():
         store.try_consume(
             grant.approval_id, "echo.ping", NOW, args=ARGS, principal=OTHER, envelope_identity=OTHER
         )
+        == ReasonCode.APPROVAL_PRINCIPAL_MISMATCH
+    )
+    assert (
+        store.try_consume(grant.approval_id, "echo.ping", NOW, args=ARGS, principal=OWNER)
         == ReasonCode.APPROVAL_PRINCIPAL_MISMATCH
     )
     assert (

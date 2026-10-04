@@ -51,7 +51,7 @@ An approval is bound, at mint, to one **principal**. Only a call whose principal
 4. **No transitive delegation.** A delegate needs its own approval, minted by the operator for the delegate's principal. Delegation grants, where one principal authorises another, are out of scope and would need their own ADR.
 5. **Receipts.**
    - The receipt stays on frozen schema v1. `reason_code` is a free string in `eval/receipt.schema.json` (`pep/receipt.py` checks only that it is non-empty), so `approval_principal_mismatch` needs no schema bump.
-   - `reason_detail` names the failed check and never echoes either principal string.
+   - `reason_detail` says only whether a principal was attested ("no attested principal" or "principal check failed"). It never echoes either principal string, and it does not tell a wrong principal apart from an envelope disagreement, so a caller cannot use the wording to confirm a guessed principal.
    - Adding a principal field to the receipt would be a schema bump and is not proposed.
 6. **Version.** The mint signature changes behaviour (mint without a principal raises), so the package version moves from 0.3.3 to 0.4.0.
 
@@ -86,7 +86,7 @@ An approval is bound, at mint, to one **principal**. Only a call whose principal
 - `pep/corpus.py`, which needs a principal source (for example, a runtime-spec field):
   - the mint at line 110;
   - the fixture pre-consume `try_consume` at line 120, which raises if consume denies;
-  - the `evaluate`, `gated_invoke` and `begin_invoke` calls at lines 150, 158 and 169.
+  - the `evaluate`, `gated_invoke` and `begin_invoke` calls at lines 151, 159 and 169.
 - Existing approval tests and `eval/corpus/` rows: every mint and every approval-path evaluate gains a principal.
 - `docs/threat-model.md`:
   - replace the delegation non-goal bullet;
