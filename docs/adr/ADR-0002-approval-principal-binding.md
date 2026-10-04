@@ -1,93 +1,110 @@
 # ADR-0002: Bind single-use approvals to a host-attested principal
 
-- **Status:** Proposed (owner decision 2026-10-04: bearer approvals are not the intended design). Not implemented on this tree.
+- **Status:** Proposed. Owner decision 2026-10-04: bearer approvals are not the intended design. Not implemented on this tree.
 - **Date:** 2026-10-04
-- **Supersedes:** nothing. Amends ADR-0001 "Capability language", item 3.
+- **Supersedes:** nothing.
+- **Amends:** ADR-0001 "Capability language" items 3 and 5, and the "Fail-closed" list, which gains a principal mismatch.
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
 
 ## Context
 
-ADR-0001 makes an operator-issued `approval_id` a single-use, TTL-bound grant for one exact invoke (`tool_name` plus canonical args), with an optional host-observed state digest. It does not say who may spend the grant.
+ADR-0001 makes an operator-issued `approval_id` a single-use, TTL-bound grant for one exact invoke: `tool_name` plus canonical args, with an optional host-observed state digest. It does not say who may spend the grant.
 
 On this tree the grant is a bearer capability:
 - `ApprovalRecord` has no principal field.
-- `ApprovalStore.consume` never reads an identity (`pep/approval.py`).
+- `ApprovalStore.consume` takes no identity argument (`pep/approval.py`).
 - The module docstring says approvals "are capability grants, not caller identity".
 
 `tests/test_approval_laundering_classes.py::test_delegation_is_bearer_residual` shows the consequence:
 1. A second caller presents the same `approval_id` with the exact invoke.
-2. The second caller gets ALLOW, and the tool runs.
-3. The caller the approval was minted for then gets DENY `approval_consumed`.
+2. That caller gets ALLOW, and the tool runs.
+3. The original caller then gets DENY `approval_consumed`.
 
-So one grant can be spent by the wrong party, and spending it denies the right party. This is the Delegation class in Approval Laundering (arXiv:2609.38983v1, a single-harness working draft). That paper measured it at a bound-gap rate of 0.947 (18 of 19 runs) in one coding-agent harness. The paper and that rate are class inspiration only; this repo makes no measured attack-success-rate claim.
+So one grant can be spent by the wrong party, and spending it denies the right party. The attack class is the Delegation class in Approval Laundering (arXiv:2609.38983v1). It is cited as class inspiration only. This repository makes no attack-success-rate claim.
 
-The envelope already carries an identity, but ADR-0001 rules it out as authority:
-- The Lab shape uses `caller.identity` and the flat shape uses `caller_identity`, both matching `IDENTITY_RE` (`pep/envelope.py`).
-- The value is caller-asserted.
-- ADR-0001 says "Identity strings and free-text are not allow authorities".
-- `docs/threat-model.md` lists "caller identity as authority" as a capability-spoof attempt.
-
-Binding approvals to that string alone would be cosmetic: a delegate that copies the owner's identity string would pass.
+The envelope already carries an identity: `caller.identity` in the Lab shape and `caller_identity` in the flat shape, both matching `IDENTITY_RE` (`pep/envelope.py`). But it is asserted by the caller. ADR-0001 says "Identity strings and free-text are not allow authorities", and `docs/threat-model.md` lists "caller identity as authority" as a capability-spoof attempt. Binding approvals to that string alone would be cosmetic: a delegate that copies the owner's identity string would pass.
 
 ## Decision
 
-An approval is bound, at mint, to one **principal**. Only a call whose principal is **attested by the host**, not asserted by the envelope, can consume it.
+An approval is bound, at mint, to one **principal**. Only a call whose principal is attested by the host, not merely asserted by the envelope, can consume it.
 
 1. **Mint.**
-   - `PepRuntime.issue_approval(...)` and `ApprovalStore.issue(...)` take a required keyword `principal: str` that matches `IDENTITY_RE`.
-   - It is stored on `ApprovalRecord.principal`.
-   - `invoke_binding` and `binding_digest` stay as they are (tool plus canonical args). The principal is checked on its own, so it gets its own reason code instead of surfacing as `approval_binding_mismatch`.
-   - Mint without a principal raises `ApprovalError`. There is no unbound mode.
+   - `PepRuntime.issue_approval(...)` and `ApprovalStore.issue(...)` take `principal: str | None = None`. `None`, or a value that does not match `IDENTITY_RE`, raises `ApprovalError`. There is no unbound mode.
+   - The value is stored on `ApprovalRecord.principal`.
+   - `invoke_binding` and `binding_digest` are unchanged (tool plus canonical args). The principal is checked on its own, so a principal failure has its own reason code and never surfaces as `approval_binding_mismatch`.
 2. **Attest.**
-   - `evaluate`, `begin_invoke` and `gated_invoke` take a keyword `principal: str | None`, supplied by the host.
-   - This uses the same trust channel as `state_observer`: it is a function argument from the code that owns the session, never an envelope field.
-   - The host derives it from its own session state, for example the console host's per-session handle. It never copies it from the envelope.
-3. **Consume.** Inside `ApprovalStore.consume`, under the store lock, after the existence, single-use, expiry and invoke-binding checks and before any state observation:
-   - If the host passed no principal, the result is DENY `approval_principal_mismatch` (detail: "no attested principal").
-   - If the host principal differs from `record.principal`, the result is DENY `approval_principal_mismatch`.
-   - If the envelope's caller identity differs from the host principal, the result is DENY `approval_principal_mismatch`. This is a consistency check that catches a host/envelope disagreement; the envelope string never authorises anything.
-   - None of these denials consume the grant, so a wrong caller cannot burn the owner's approval. This matches the existing rule that a binding mismatch does not consume.
-4. **No transitive delegation.** A delegate, sub-agent or second session needs its own approval, minted by the operator for the delegate's principal. Delegation grants, meaning one principal authorising another, are out of scope for this ADR and would need their own.
+   - `evaluate`, `begin_invoke`, `gated_invoke` and `ApprovalStore.consume` / `try_consume` take `principal: str | None = None`, supplied by the host.
+   - This is the same trust channel as `state_observer`: a function argument from the code that owns the caller's session, never an envelope field.
+   - **Mapping.** The host principal is the identity the host has assigned to that caller session, in `IDENTITY_RE` format; for example, a host that runs one demo agent assigns it `lab.demo.agent`. A host that runs several callers must give each its own identity, so a sub-agent or second session gets a different principal from its parent.
+   - A host principal that does not match `IDENTITY_RE` is `envelope_invalid` before any grant is touched.
+3. **Consume.** Inside `ApprovalStore.consume`, under the store lock:
+   - **Order.** Look up the `approval_id`. An unknown id stays `approval_invalid`. **The principal check comes next, immediately after the lookup and before the consumed, expired, binding, single-use-flag and state checks.** A wrong or unattested caller therefore learns only that the id exists, and nothing about whether the grant is spent, expired or bound to other args. Approval ids are random (`lab.appr.<uuid4>`) unless an operator names them.
+   - **No attested principal.** If the host passed no principal, the result is DENY `approval_principal_mismatch`, with detail "no attested principal".
+   - **Wrong principal.** If the host principal differs from `record.principal`, the result is DENY `approval_principal_mismatch`.
+   - **Envelope disagreement.** If the envelope's caller identity differs from the host principal, the result is DENY `approval_principal_mismatch`. This consistency check catches a host/envelope disagreement; the envelope string never authorises anything.
+   - **No consumption.** None of these denials consume the grant, so a wrong caller cannot burn the owner's approval. This matches the existing rule that a binding mismatch does not consume.
+   - **Owner path.** After the principal check passes, the existing order (consumed, expired, binding, single-use flag, state observer) is unchanged.
+4. **No transitive delegation.** A delegate needs its own approval, minted by the operator for the delegate's principal. Delegation grants, where one principal authorises another, are out of scope and would need their own ADR.
 5. **Receipts.**
-   - The receipt stays on frozen schema v1. `reason_code` is a free string in `eval/receipt.schema.json`, so `approval_principal_mismatch` needs no schema bump.
-   - `reason_detail` names the failed check but does not echo either principal string. That keeps the deny from becoming an oracle for valid principals.
-   - Adding a principal field to the receipt would be a schema bump and is not proposed here.
-6. **Version.** This is a behaviour change to the mint signature, so the package moves to 0.4.0.
+   - The receipt stays on frozen schema v1. `reason_code` is a free string in `eval/receipt.schema.json` (`pep/receipt.py` checks only that it is non-empty), so `approval_principal_mismatch` needs no schema bump.
+   - `reason_detail` names the failed check and never echoes either principal string.
+   - Adding a principal field to the receipt would be a schema bump and is not proposed.
+6. **Version.** The mint signature changes behaviour (mint without a principal raises), so the package version moves from 0.3.3 to 0.4.0.
 
 ## Options considered
 
-| Option | What it binds | Why accepted or rejected |
+| Option | Binds to | Assessment |
 | --- | --- | --- |
-| A. Envelope `caller_identity` only | A caller-asserted string | Rejected. It turns an identity string into partial authority, contrary to ADR-0001, and a delegate that copies the string passes. |
-| **B. Host-attested principal, envelope string as a consistency check (chosen)** | Principal from the host's own session state | Matches the existing `state_observer` trust model. No key material. Closes the measured Delegation case for callers that go through a host route. |
-| C. Keyed token, HMAC over principal, agent, session, tool, args, scope and expiry (as in arXiv:2609.38983v1, sec. 6) | A keyed capability | Not needed in-process: records already live server-side in `ApprovalStore`, and the key would sit in the same process as the attacker this ADR excludes. Worth revisiting only if approvals persist out of process (ADR-0001, Consequences). |
-| D. Keep bearer approvals and document them | Nothing | Rejected by the owner on 2026-10-04. |
+| A. Envelope `caller_identity` only | A caller-asserted string | **Rejected.** It turns an identity string into partial authority, contrary to ADR-0001, and a delegate copying the string passes. |
+| **B. Host-attested principal; envelope string as a consistency check (chosen)** | The identity the host assigned to the caller session | Matches the existing `state_observer` trust model and needs no key material. It closes the Delegation case for callers that reach the PEP through a host that assigns per-session principals. No such host route sends approvals through pep today (see Consequences), so the console case is prospective. |
+| C. Keyed token: HMAC over principal, agent, session, tool, args, scope and expiry (arXiv:2609.38983v1, sec. 6) | A keyed capability | Not needed in process. Records already live in `ApprovalStore`, and the key would sit in the same process as the attacker this ADR excludes. Revisit only if approvals persist out of process (ADR-0001, Consequences). |
+| D. Keep bearer approvals and document them | Nothing | **Rejected** by the owner on 2026-10-04. |
 
 ## Residuals (what this does not fix)
 
-- **In-process callers can claim any principal.** Code that calls `PepRuntime.evaluate` directly can pass any `principal` it likes. ADR-0001 puts the trust boundary at the function boundary, so this binding defends routes where the host, not the agent, supplies the principal. It does not defend against an agent with equivalent process access, which remains outside the boundary (joint-eval `docs/lab-threat-model.md`).
-- **Standing capability tokens are still bearer.** `capability_token` in the envelope is checked for existence, expiry and tool coverage, not for who presents it. This ADR does not cover it. A follow-up decision is needed.
-- **Effects below the tool boundary.** Effect divergence from pre-existing hooks and scripts, and `PATH`-level program resolution, are unchanged by this ADR. The Scope and Argument cases in arXiv:2609.38983v1, which defeated that paper's own token defence, also fall here. See the `docs/threat-model.md` non-goals.
-- **No cross-process principal.** `HaltStore` and any future out-of-process approval store would need to persist and verify `principal` too.
+- **In-process callers can claim any principal.** Code that calls `PepRuntime.evaluate` directly can pass any `principal`. ADR-0001 puts the trust boundary at the function boundary. This binding defends routes where the host, not the agent, supplies the principal; it does not defend against an agent with equivalent process access (joint-eval `docs/lab-threat-model.md`).
+- **`PendingInvoke` is still a bearer handle in process.** An ALLOW admission from `begin_invoke` can be completed by whoever holds it. The in-process residual above covers this; this ADR does not change it.
+- **Standing capability tokens are still bearer.** `capability_token` is checked for existence, expiry, tool coverage and the tool's `required_capability`, but not for who presents it. A follow-up decision is needed.
+- **The owner's grant can still be spent without the tool running.** This happens when, after the owner's consume, `complete_invoke` re-observes a changed state or a kill or suspend intervenes. That is existing behaviour ("a grant can be spent and the decision still DENY") and is unchanged here. The guarantee is that a *wrong* caller cannot spend it.
+- **Effects below the tool boundary are unchanged.** Pre-existing hooks and scripts, and `PATH`-level program resolution, remain residuals; see the `docs/threat-model.md` non-goals.
+- **No out-of-process approval store exists.** Any future one would need to persist and verify `principal`. `HaltStore` holds only runtime mode and availability, not approvals, so it is unaffected.
 
 ## Consequences and dependent changes
 
-**pep, this repository.** The changes touch:
-- `pep/approval.py`: record field, binding key, consume check.
-- `pep/evaluate.py`: `issue_approval` and `evaluate` signatures.
-- `pep/gate.py`: `begin_invoke` and `gated_invoke` pass-through.
-- `pep/reasons.py`: the new code.
-- `pep/corpus.py:110`: corpus mint.
-- the existing approval tests and corpus rows: every mint gains `principal`.
+**pep (this repository):**
+- `pep/approval.py`:
+  - `ApprovalRecord.principal`;
+  - `issue(principal=)` with validation;
+  - `consume` and `try_consume` take `principal=` and run the new early check.
+- `pep/evaluate.py`: `issue_approval(principal=)`; `PepRuntime.evaluate` and module-level `evaluate` pass `principal=` through to consume.
+- `pep/gate.py`: `begin_invoke` and `gated_invoke` pass `principal=` through.
+- `pep/reasons.py`: `APPROVAL_PRINCIPAL_MISMATCH`.
+- `pep/corpus.py`, which needs a principal source (for example, a runtime-spec field):
+  - the mint at line 110;
+  - the fixture pre-consume `try_consume` at line 120, which raises if consume denies;
+  - the `evaluate`, `gated_invoke` and `begin_invoke` calls at lines 150, 158 and 169.
+- Existing approval tests and `eval/corpus/` rows: every mint and every approval-path evaluate gains a principal.
+- `docs/threat-model.md`:
+  - replace the delegation non-goal bullet;
+  - add the principal check to the Capability-spoof defence cell.
+- ADR-0001: amend items 3 and 5 and the Fail-closed list.
 
 That is more than five files, so implementation splits into two reviewed phases:
 1. Core and new tests.
 2. Corpus, docs, ROADMAP and the version bump.
 
-**joint-eval.** `joint_eval/story.py:264` mints an approval and must pass a principal. It also pins pep, so it needs a pin bump to the 0.4.0 commit.
+**joint-eval:**
+- `joint_eval/story.py:264` (mint) must pass a principal.
+- `joint_eval/story.py:212` (the `pep_gated(...)` call) must pass the same principal as host.
+- `eval/joint_story/` fixtures may need a principal field.
+- Its pep pin moves to the 0.4.0 commit.
 
-**console.** It has no direct mint (`issue_approval` does not appear on console `main`). It pins joint-eval, so it moves when joint-eval moves. Each repo's declared pins are updated in the same change as its code.
+**console:**
+- **No change today:** console `main` has no `issue_approval`, and its pep call sites (`stories.py`, `witness.py`) use no approvals.
+- **Pins:** console pins pep directly (`pyproject.toml`) and also pins joint-eval. Both pins move together when the joint-eval change lands.
+
+Each repository updates its declared pins in the same change as its code.
 
 ## Comparison experiment and acceptance
 
@@ -95,26 +112,33 @@ Re-run `tests/test_approval_laundering_classes.py` before and after the change, 
 
 | Case | Before (this tree) | Required after |
 | --- | --- | --- |
-| Delegation: second principal, same `approval_id`, exact invoke | ALLOW, grant spent | DENY `approval_principal_mismatch`; grant **not** consumed; the owner's next call is ALLOW |
-| Host passes no principal for an approval call | n/a | DENY `approval_principal_mismatch`; not consumed |
-| Host principal matches the record, envelope identity differs | n/a | DENY `approval_principal_mismatch`; not consumed |
+| Delegation: second principal, same `approval_id`, exact invoke | ALLOW; grant spent | DENY `approval_principal_mismatch`; grant **not** consumed; the owner's next call is ALLOW |
+| Host passes no principal, issued `approval_id` (any grant state) | n/a | DENY `approval_principal_mismatch`; not consumed |
+| Host passes no principal, unknown `approval_id` | `approval_invalid` | `approval_invalid` (unchanged) |
+| Wrong principal against a spent, expired or args-mismatched grant | n/a | DENY `approval_principal_mismatch`, so no status or binding oracle |
+| Host principal matches record, envelope identity differs | n/a | DENY `approval_principal_mismatch`; not consumed |
+| Malformed host principal | n/a | DENY `envelope_invalid`; no grant touched |
 | Owner principal, exact invoke | ALLOW | ALLOW (unchanged) |
-| Temporal (TTL, after consume) and residual replay | DENY | DENY (unchanged codes) |
-| Execute-then-write state mismatch | DENY `approval_state_mismatch` | Unchanged. The principal check runs before the observer, so a wrong principal never triggers a host read. |
-| Pre-existing hook; `PATH` substitution | ALLOW (residual) | ALLOW (unchanged; still a residual) |
-| Two principals race one grant (threaded) | n/a | Exactly one consume, and only by the record's principal |
-| Mint without `principal` | allowed | `ApprovalError` |
+| Owner: temporal (TTL, after consume) and residual replay | DENY `approval_expired` / `approval_consumed` | Unchanged |
+| Owner: execute-then-write state mismatch | DENY `approval_state_mismatch` | Unchanged. A wrong principal never triggers a host state read |
+| Pre-existing hook; `PATH` substitution | ALLOW (residual) | ALLOW (unchanged; still residual) |
+| Two principals race one grant (threaded) | n/a | Exactly one consume, by the record's principal. The other caller gets `approval_principal_mismatch` whichever order they run in, because the principal check precedes the consumed check |
+| Mint with `principal=None` or a malformed value | Allowed | `ApprovalError` |
 
-Further acceptance requirements:
+Further acceptance criteria:
 - No receipt-schema change.
 - `reason_detail` contains no principal string.
 - The full pep, joint-eval and console suites pass at the bumped pins.
 - The brand-wall checks are clean.
-- The `test_delegation_is_bearer_residual` row in `docs/threat-model.md` is replaced by the new behaviour.
-- An independent, cross-family review of each phase diff.
+- The delegation non-goal bullet in `docs/threat-model.md` is replaced.
+- Each phase diff gets an independent, cross-family review.
 
-**Rollback.** Revert the 0.4.0 commit and restore the previous pins in joint-eval and console. Approvals are process-local, so no persisted state needs migrating.
+**Rollback:** revert the 0.4.0 commit and restore the previous pins in joint-eval and console. Approvals are process-local, so no persisted state needs migrating.
 
-**What success would establish.** On this tree, an approval can be spent only through a host route that attests its principal, and a wrong caller cannot burn it.
+**What success would establish:** on this tree, an approval can be spent only through a host route that attests its principal, and a wrong caller can neither spend it nor learn its state.
 
-**What it would not establish.** It would not establish any measured attack-success rate, resistance to an in-process attacker that forges the host argument, or live enforcement. Soft DEMO ≠ live ≠ live enforcement ≠ efficacy ≠ safety case.
+**What it would not establish:**
+- any attack-success rate;
+- resistance to an in-process attacker who forges the host argument;
+- live enforcement;
+- a safety case.
