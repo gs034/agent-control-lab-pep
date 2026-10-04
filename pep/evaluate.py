@@ -450,7 +450,9 @@ class PepRuntime:
 
         required_cap = spec.get("required_capability")
         if token:
-            denied = _capability_deny(policy, parsed, token, required_cap, clock)
+            denied = _capability_deny(
+                policy, parsed, token, required_cap, clock, principal=principal
+            )
             if denied is not None:
                 reason, detail = denied
                 return _deny(reason, detail, env_hash, version, policy.bytes_unchanged())
@@ -561,16 +563,37 @@ class PepRuntime:
             )
 
 
+_CAPABILITY_NOT_FOR_CALLER = "capability token not valid for this caller"
+_NO_ATTESTED_PRINCIPAL = "no attested principal"
+
+
 def _capability_deny(
     policy: PolicyStore,
     parsed: InvokeEnvelope,
     token: str,
     required_cap: Any,
     clock: datetime,
+    *,
+    principal: str | None = None,
 ) -> tuple[ReasonCode, str] | None:
     cap = policy.capability(token)
     if cap is None:
         return ReasonCode.CAPABILITY_MISSING, "capability token unknown"
+    # ADR-0003: a record that lists principals may be presented only by one
+    # of them, attested by the host, with an agreeing envelope identity. The
+    # holder check precedes expiry, coverage and required-capability checks,
+    # so a non-holder sees one uniform detail. Phase 1: records without a
+    # ``principals`` key keep the earlier bearer behaviour.
+    if "principals" in cap:
+        if principal is None:
+            return ReasonCode.CAPABILITY_MISSING, _NO_ATTESTED_PRINCIPAL
+        holders = _capability_holders(cap.get("principals"))
+        if (
+            not holders
+            or principal not in holders
+            or parsed.caller_identity != principal
+        ):
+            return ReasonCode.CAPABILITY_MISSING, _CAPABILITY_NOT_FOR_CALLER
     expires_at = cap.get("expires_at")
     if not isinstance(expires_at, str):
         return ReasonCode.CAPABILITY_MISSING, "capability record missing expires_at; fail-closed"
@@ -586,6 +609,15 @@ def _capability_deny(
     if required_cap and token != required_cap:
         return ReasonCode.POLICY_MISS, "capability token does not match tool policy"
     return None
+
+
+def _capability_holders(value: Any) -> frozenset[str]:
+    """Valid holder set, or empty (authorises nobody). A bare string is not a list."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        return frozenset()
+    if not value or not all(is_principal(item) for item in value):
+        return frozenset()
+    return frozenset(value)
 
 
 def _mode_to_halt(mode: RuntimeMode) -> HaltMode:
