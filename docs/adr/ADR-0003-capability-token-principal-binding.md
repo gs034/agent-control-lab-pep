@@ -89,7 +89,7 @@ On `main`, joint-eval and console still pin pep `ffd048a` (0.3.3). ADR-0002's ow
 - `pep/policy.py`:
   - `principals` on the stub token records;
   - `POLICY_VERSION` set to `0.2.0-stub`;
-  - a `principals` parser that rejects non-arrays. Note that `_freeze` turns lists into tuples.
+  - a `principals` parser that rejects non-arrays. Note that `_freeze` turns lists into tuples. (As implemented, the parser is `_capability_holders` in `pep/evaluate.py`.)
 - `pep/evaluate.py`: `_capability_deny` takes the attested principal and the envelope identity, and gets the new checks.
 
 **Corpus and fixtures**
@@ -119,7 +119,7 @@ On `main`, joint-eval and console still pin pep `ffd048a` (0.3.3). ADR-0002's ow
 No receipt-regeneration tool exists on this tree, so phase 2 adds a small script. It:
 1. evaluates each row;
 2. rewrites only the compared receipt fields;
-3. leaves `timestamp` as it is in the file, because 18 of the 24 runtime fixtures have no frozen `now`, and `timestamp` is not a compared key.
+3. leaves `timestamp` as it is in the file, because 16 of the 24 runtime fixtures have no frozen `now`, and `timestamp` is not a compared key.
 
 The diff is reviewed: only `policy_version`, `envelope_hash` (where the envelope's `policy_context` changed) and the intended details may change.
 

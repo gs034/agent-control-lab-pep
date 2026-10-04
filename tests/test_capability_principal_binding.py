@@ -58,6 +58,7 @@ POLICY_DOC = {
         "lab.cap.other": _token(["echo.other"]),
         "lab.cap.both": _token(["echo.ping", "echo.other"]),
         "lab.cap.badexp": _token(["echo.ping"], expires_at="not-a-date"),
+        "lab.cap.noexp": {"tools": ["echo.ping"], "principals": [OWNER]},
         # Malformed forms that still contain OWNER, so only validation can deny them.
         "lab.cap.p.empty": _token(["echo.ping"], principals=[]),
         "lab.cap.p.string": _token(["echo.ping"], principals=OWNER),
@@ -121,7 +122,7 @@ def test_envelope_identity_disagreeing_with_host_gets_the_uniform_detail():
 
 def test_non_holder_learns_nothing_about_token_state():
     """Expired, uncovered, malformed-expiry and mismatched tokens look the same to a non-holder."""
-    for token in ("lab.cap.echo.expired", "lab.cap.other", "lab.cap.badexp", "lab.cap.both"):
+    for token in ("lab.cap.echo.expired", "lab.cap.other", "lab.cap.badexp", "lab.cap.noexp", "lab.cap.both"):
         _assert_uniform(_run(_envelope(token, identity=OTHER), principal=OTHER), token)
 
 
@@ -254,3 +255,19 @@ def test_begin_then_complete_without_attestation_never_enters_the_tool():
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_detail == "no attested principal"
     assert result is None and calls == []
+
+
+def test_no_attested_principal_is_checked_before_the_lookup():
+    """An unattested caller gets the same detail for a known and an unknown id."""
+    known = _run(_envelope("lab.cap.echo.demo"), principal=None)
+    unknown = _run(_envelope("lab.cap.not.issued"), principal=None)
+    for decision in (known, unknown):
+        assert decision.verdict == "DENY"
+        assert decision.receipt.reason_code == ReasonCode.CAPABILITY_MISSING
+        assert decision.receipt.reason_detail == "no attested principal"
+
+
+def test_holder_with_missing_expiry_gets_the_fail_closed_detail():
+    missing = _run(_envelope("lab.cap.noexp"))
+    assert missing.receipt.reason_code == ReasonCode.CAPABILITY_MISSING
+    assert missing.receipt.reason_detail == "capability record missing expires_at; fail-closed"

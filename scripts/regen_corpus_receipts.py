@@ -9,6 +9,10 @@ should change only the fields the fixture change was meant to change.
 
     python scripts/regen_corpus_receipts.py          # write
     python scripts/regen_corpus_receipts.py --check  # exit 1 if any file would change
+
+A change to ``decision`` or ``reason_code`` is reported per file and refused
+unless ``--allow-outcome-change`` is given, so a fixture slip cannot silently
+rewrite an expected outcome.
 """
 
 from __future__ import annotations
@@ -41,12 +45,16 @@ REWRITTEN_KEYS = (
 )
 
 
-def _merged(path: Path, live: dict) -> tuple[str, str]:
+OUTCOME_KEYS = ("decision", "reason_code")
+
+
+def _merged(path: Path, live: dict) -> tuple[str, str, list[str]]:
     before = path.read_text(encoding="utf-8")
     current = json.loads(before)
+    outcome = [f"{key}: {current.get(key)} -> {live[key]}" for key in OUTCOME_KEYS if current.get(key) != live[key]]
     for key in REWRITTEN_KEYS:
         current[key] = live[key]
-    return before, json.dumps(current, indent=2, sort_keys=True) + "\n"
+    return before, json.dumps(current, indent=2, sort_keys=True) + "\n", outcome
 
 
 def _targets() -> list[tuple[Path, dict]]:
@@ -61,16 +69,27 @@ def _targets() -> list[tuple[Path, dict]]:
 
 def main(argv: list[str]) -> int:
     check = "--check" in argv
+    allow_outcome = "--allow-outcome-change" in argv
     changed = []
+    refused = []
     for path, live in _targets():
-        before, after = _merged(path, live)
-        if before != after:
-            changed.append(path.relative_to(ROOT))
-            if not check:
-                path.write_text(after, encoding="utf-8")
-    for path in changed:
-        print(("would change " if check else "rewrote ") + str(path))
-    return 1 if check and changed else 0
+        before, after, outcome = _merged(path, live)
+        if before == after:
+            continue
+        rel = path.relative_to(ROOT)
+        for line in outcome:
+            print(f"outcome change {rel}: {line}")
+        if outcome and not allow_outcome and not check:
+            refused.append(rel)
+            continue
+        changed.append(rel)
+        if not check:
+            path.write_text(after, encoding="utf-8")
+    for rel in changed:
+        print(("would change " if check else "rewrote ") + str(rel))
+    for rel in refused:
+        print(f"refused {rel}: outcome change needs --allow-outcome-change")
+    return 1 if (check and changed) or refused else 0
 
 
 if __name__ == "__main__":

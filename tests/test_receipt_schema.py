@@ -44,7 +44,7 @@ def test_expected_deny_receipt_matches_frozen_schema():
 
 
 def test_live_official_deny_matches_frozen_schema():
-    live = evaluate(load_structured_envelope(), principal=HOST).to_dict()
+    live = evaluate(load_structured_envelope()).to_dict()
     validate_receipt(live)
     assert set(live) == FROZEN_RECEIPT_KEYS
     assert live["decision"] == "DENY"

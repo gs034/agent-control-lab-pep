@@ -43,7 +43,7 @@ def test_unknown_tool_with_token_is_unknown_tool():
 
 
 def test_unknown_tool_without_capability_uses_dr_reason():
-    decision = evaluate(_base(tool_name="shell.exec", capability_token=None), principal=HOST)
+    decision = evaluate(_base(tool_name="shell.exec", capability_token=None))
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY
 
