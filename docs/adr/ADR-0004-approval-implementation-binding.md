@@ -1,7 +1,7 @@
 # ADR-0004: Bind single-use approvals to the implementation resolved at mint
 
 - **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions".
-- **Implementation:** in progress. Phase 1 (core and tests) on the ADR-0004 branch.
+- **Implementation:** in progress. Phase 1 (core, helpers and tests) on the ADR-0004 branch. Measured added cost of a bound `gated_invoke` with `executable_digest` on the test program: 129.7 µs median over 2,000 runs (local container), under the 1 ms provisional ceiling.
 - **Date:** 2026-10-05
 - **Depends on:** [ADR-0002](ADR-0002-approval-principal-binding.md) (principal-bound approvals). Independent of [ADR-0003](ADR-0003-capability-token-principal-binding.md).
 - **Amends:** ADR-0001 "Fail-closed" list, which would gain an implementation mismatch; the `docs/threat-model.md` non-goal on program resolution.
@@ -42,7 +42,7 @@ A grant may freeze a host-computed digest of the implementation that the tool na
    - observed digest differs: DENY.
 
    Each DENY is the new reason code `approval_implementation_mismatch` and does **not** consume the grant, like a binding or principal mismatch. The observer has the same constraints as the state observer: it must be quick, and it must not call back into the store. A call back into the store from the observer's thread is refused as a mismatch, not deadlocked. Every earlier exit (unknown id, principal, consumed, expired, binding) returns before the observer is called.
-4. **Tool entry.** `PendingInvoke` keeps the observer. `complete_invoke` checks in this order: the fence read, then the implementation re-observation, then the state re-observation, then `claim_entry`. That matches the consume order. At entry, when the grant froze an implementation digest:
+4. **Tool entry.** `PendingInvoke` keeps the observer. `complete_invoke` checks in this order: the fence read, then whether the admission was already spent, then the implementation re-observation, then the state re-observation, then `claim_entry`. The implementation-before-state order matches consume. The spent check (added in phase 1 review) makes a second `complete_invoke` return `admission_consumed` without calling either observer; before it, a replay with a state observer re-read the host first. At entry, when the grant froze an implementation digest:
    - no observer: DENY. This differs from `_state_still_matches`, which returns True when no state observer is present (`pep/gate.py:129-130`);
    - observer raises or returns a non-digest: DENY;
    - observed digest differs: DENY.

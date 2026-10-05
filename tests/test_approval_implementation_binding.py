@@ -18,13 +18,13 @@ import subprocess
 import sys
 import threading
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
 from pep.approval import ApprovalError
 from pep.evaluate import PepRuntime, evaluate
 from pep.gate import begin_invoke, complete_invoke, gated_invoke
+from pep.implementation import executable_digest
 from pep.policy import DEMO_POLICY
 from pep.reasons import ReasonCode
 
@@ -42,14 +42,6 @@ posix_only = pytest.mark.skipif(os.name == "nt", reason="shutil.which resolution
 
 def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
-
-
-def _program_digest(name: str) -> str:
-    """What a host might freeze: the resolved absolute path plus the file bytes."""
-    resolved = shutil.which(name)
-    assert resolved is not None
-    path = Path(resolved).resolve()
-    return _digest(str(path).encode("utf-8") + b"\0" + path.read_bytes())
 
 
 class _Observer:
@@ -120,7 +112,7 @@ ARGS = {"message": "hello"}
 @posix_only
 def test_path_reorder_after_mint_denies_at_consume_without_spending(programs):
     runtime = _runtime()
-    grant = _issue(runtime, ARGS, implementation_digest=_program_digest("labtool"))
+    grant = _issue(runtime, ARGS, implementation_digest=executable_digest("labtool"))
     programs("program-b")
     calls: list[str] = []
 
@@ -130,7 +122,7 @@ def test_path_reorder_after_mint_denies_at_consume_without_spending(programs):
         runtime=runtime,
         now=NOW,
         principal=HOST,
-        implementation_observer=lambda: _program_digest("labtool"),
+        implementation_observer=lambda: executable_digest("labtool"),
     )
 
     assert decision.verdict == "DENY"
@@ -143,8 +135,8 @@ def test_path_reorder_after_mint_denies_at_consume_without_spending(programs):
 @posix_only
 def test_unchanged_implementation_allows_and_runs_the_approved_program(programs):
     runtime = _runtime()
-    grant = _issue(runtime, ARGS, implementation_digest=_program_digest("labtool"))
-    observer = _Observer(lambda: _program_digest("labtool"))
+    grant = _issue(runtime, ARGS, implementation_digest=executable_digest("labtool"))
+    observer = _Observer(lambda: executable_digest("labtool"))
 
     decision, result = gated_invoke(
         _envelope(ARGS, grant.approval_id),
@@ -164,13 +156,13 @@ def test_unchanged_implementation_allows_and_runs_the_approved_program(programs)
 @posix_only
 def test_change_between_admission_and_entry_denies_at_entry_with_grant_spent(programs):
     runtime = _runtime()
-    grant = _issue(runtime, ARGS, implementation_digest=_program_digest("labtool"))
+    grant = _issue(runtime, ARGS, implementation_digest=executable_digest("labtool"))
     pending = begin_invoke(
         _envelope(ARGS, grant.approval_id),
         runtime=runtime,
         now=NOW,
         principal=HOST,
-        implementation_observer=lambda: _program_digest("labtool"),
+        implementation_observer=lambda: executable_digest("labtool"),
     )
     assert pending.decision.verdict == "ALLOW"
     programs("program-b")
@@ -353,7 +345,28 @@ def test_admission_without_an_entry_observer_fails_closed():
     decision, result = complete_invoke(stripped, lambda: calls.append("entered"))
 
     assert decision.receipt.reason_code == MISMATCH
+    assert decision.receipt.reason_detail == ENTRY_DETAIL
     assert result is None and calls == []
+    assert runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_second_complete_is_admission_consumed_without_calling_the_observer():
+    runtime = _runtime()
+    grant = _issue(runtime, ARGS, implementation_digest=FROZEN)
+    answers = iter([FROZEN, FROZEN, CHANGED])
+    observer = _Observer(lambda: next(answers))
+    pending = begin_invoke(
+        _envelope(ARGS, grant.approval_id), runtime=runtime, now=NOW, principal=HOST, implementation_observer=observer
+    )
+    first, ran = complete_invoke(pending, lambda: "entered")
+    assert first.verdict == "ALLOW" and ran == "entered"
+    assert observer.calls == 2
+
+    second, again = complete_invoke(pending, lambda: "entered again")
+
+    assert second.receipt.reason_code == ReasonCode.ADMISSION_CONSUMED
+    assert again is None
+    assert observer.calls == 2
 
 
 def test_implementation_is_checked_before_state_at_entry():
@@ -399,7 +412,7 @@ def test_kill_between_admission_and_entry_is_the_fence_and_skips_the_entry_obser
 def test_two_threads_consuming_one_bound_grant_get_one_allow():
     runtime = _runtime()
     grant = _issue(runtime, ARGS, implementation_digest=FROZEN)
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=5)
     verdicts: list[str] = []
 
     def worker():
@@ -417,7 +430,8 @@ def test_two_threads_consuming_one_bound_grant_get_one_allow():
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
 
     assert sorted(verdicts) == sorted([ReasonCode.ALLOWED, ReasonCode.APPROVAL_CONSUMED])
 
@@ -426,6 +440,42 @@ def test_two_threads_consuming_one_bound_grant_get_one_allow():
 def test_malformed_implementation_digest_is_refused_at_mint(bad):
     with pytest.raises(ApprovalError):
         _issue(_runtime(), ARGS, implementation_digest=bad)
+
+
+def _lab_envelope(approval_id, **schema_extra):
+    schema_fields = {"approval_id": approval_id, "capability_token": None}
+    schema_fields.update(schema_extra)
+    return {
+        "caller": {"identity": HOST},
+        "envelope_version": "1.0",
+        "invoke": {"tool_name": "echo.ping", "argv": [], "schema_fields": schema_fields},
+        "pep_eval_id": "acl-pep-implementation-lab-shape",
+    }
+
+
+def test_lab_envelope_top_level_implementation_digest_is_envelope_invalid():
+    runtime = _runtime()
+    grant = _issue(runtime, ARGS, implementation_digest=FROZEN)
+    envelope = {**_lab_envelope(grant.approval_id), "implementation_digest": FROZEN}
+
+    decision = evaluate(envelope, runtime=runtime, now=NOW, principal=HOST)
+
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_lab_envelope_schema_field_implementation_digest_is_never_read():
+    """Unknown ``schema_fields`` keys are dropped; the observation still comes only from the host."""
+    runtime = _runtime()
+    grant = _issue(runtime, {"argv": []}, implementation_digest=FROZEN)
+
+    decision = evaluate(
+        _lab_envelope(grant.approval_id, implementation_digest=FROZEN), runtime=runtime, now=NOW, principal=HOST
+    )
+
+    assert decision.receipt.reason_code == MISMATCH
+    assert decision.receipt.reason_detail.endswith("; no implementation observer")
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
 
 
 def test_envelope_cannot_carry_an_implementation_digest():
@@ -450,7 +500,7 @@ def test_swap_after_the_entry_check_is_residual(programs):
     closes this window.
     """
     runtime = _runtime()
-    grant = _issue(runtime, ARGS, implementation_digest=_program_digest("labtool"))
+    grant = _issue(runtime, ARGS, implementation_digest=executable_digest("labtool"))
 
     def tool() -> str:
         programs("program-b")
@@ -462,7 +512,7 @@ def test_swap_after_the_entry_check_is_residual(programs):
         runtime=runtime,
         now=NOW,
         principal=HOST,
-        implementation_observer=lambda: _program_digest("labtool"),
+        implementation_observer=lambda: executable_digest("labtool"),
     )
 
     assert decision.verdict == "ALLOW"

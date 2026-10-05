@@ -103,7 +103,7 @@ def complete_invoke(
     is re-observed the same way, before the state, and a missing, failing or
     different observation is DENY ``approval_implementation_mismatch`` with the
     grant spent. A cut seen by the fence read denies first and skips both
-    observers. ``_before_commit`` is a yield before that locked transition (tests use it
+    observers, and so does a completion whose admission was already spent. ``_before_commit`` is a yield before that locked transition (tests use it
     to cut in the old check-then-call gap). It is not a permit. The runtime
     re-checks under the lock after it returns. Once ``tool()`` has started,
     this gate does not preempt it.
@@ -116,6 +116,9 @@ def complete_invoke(
     cut = pending.runtime.entry_blocked(pending.admitted_epoch)
     if cut is not None:
         return supersede(decision, cut), None
+    # A replayed completion must not call back into the host.
+    if pending.runtime.admission_spent(pending.admission_id):
+        return supersede(decision, ReasonCode.ADMISSION_CONSUMED), None
     if not _implementation_still_matches(pending):
         return supersede(decision, ReasonCode.APPROVAL_IMPLEMENTATION_MISMATCH), None
     if not _state_still_matches(pending):

@@ -207,6 +207,11 @@ class PepRuntime:
         self._spent_admissions.add(admission_id)
         return None
 
+    def admission_spent(self, admission_id: int) -> bool:
+        """True once ``claim_entry`` has spent this admission. Not a permit."""
+        with self._lock:
+            return admission_id in self._spent_admissions
+
     def entry_blocked(self, admitted_epoch: int) -> ReasonCode | None:
         """Cheap fence read for callers about to do host work before ``claim_entry``.
 
