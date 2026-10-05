@@ -51,6 +51,23 @@ python -m pep.demo --late-effect-fence
 
 That admits an allowlisted `echo.ping`, calls `kill()`, then completes the admission as a callback. The live receipt is `decision: DENY`, `reason_code: late_effect_fence`, with `cut+fence` in `reason_detail`. The tool is not entered. A fresh invoke after kill remains `kill_active`.
 
+**Implementation binding, step by step** (Linux only):
+
+```bash
+python -m pep.demo --implementation-binding
+```
+
+That prints one line per scenario, using two programs both named `labtool` and a `PATH` that changes after the approval:
+
+| Scenario | Since | Outcome |
+| --- | --- | --- |
+| Unbound grant | before 0.6.0 | ALLOW; program B runs |
+| Bound grant, `PATH` changed before the invoke | 0.6.0 (ADR-0004) | DENY `approval_implementation_mismatch`; grant not spent |
+| Bound grant, `PATH` changed inside the tool, host runs by path | 0.6.0 residual | ALLOW; program B runs |
+| Bound grant, same change, host uses `open_executable` | 0.7.0 (ADR-0005) | ALLOW; program A runs |
+
+It exits non-zero if any outcome differs. The third row is shown on purpose: it is the residual that 0.7.0 closes, and only for hosts that use the helper. Existence proof on fixtures; not live enforcement and not a measured attack-success rate.
+
 ## Receipt shape
 
 Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v1 schema (`eval/receipt.schema.json`):
