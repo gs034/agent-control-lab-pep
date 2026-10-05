@@ -36,10 +36,14 @@ def callable_digest(fn: Callable[..., object]) -> str:
     """Digest of an in-process callable: module, qualified name and code object.
 
     The code object is serialised with ``marshal``, so the digest is stable
-    within one interpreter version, not across versions. Closure cell values,
-    globals and anything the code imports at call time are not covered.
-    A bound method digests as its function. Callables without a Python
-    code object raise ``TypeError``.
+    within one interpreter version, not across versions. It includes the
+    source file name and first line number, so moving or re-indenting code
+    changes the digest (a fail-closed mismatch). Not covered: default
+    argument values (``__defaults__``, ``__kwdefaults__``), closure cell
+    values, globals, and anything the code imports at call time. A wrapper
+    such as one from ``functools.wraps`` digests as the wrapper, not the
+    function it wraps. A bound method digests as its function. Callables
+    without a Python code object raise ``TypeError``.
     """
     code = getattr(fn, "__code__", None)
     if code is None:

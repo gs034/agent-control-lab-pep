@@ -111,17 +111,19 @@ def test_callable_digest_distinguishes_handlers_and_is_stable():
     assert callable_digest(_Tool().run) == callable_digest(_Tool.run)
 
 
+def _compiled_handler(body: str):
+    """A function named ``handler`` from one fixed file name and line, so only its body varies."""
+    namespace: dict = {"__name__": __name__}
+    exec(compile(f"def handler():\n    return {body!r}\n", "<lab-handler>", "exec"), namespace)
+    return namespace["handler"]
+
+
 def test_callable_digest_covers_the_code_not_just_the_name():
-    def handler():
-        return "one"
+    one, same, two = _compiled_handler("one"), _compiled_handler("one"), _compiled_handler("two")
+    assert (one.__module__, one.__qualname__) == (two.__module__, two.__qualname__)
 
-    first = callable_digest(handler)
-
-    def handler():  # noqa: F811 - same module and qualified name, different body
-        return "two"
-
-    assert handler.__qualname__.endswith("handler")
-    assert callable_digest(handler) != first
+    assert callable_digest(one) == callable_digest(same)
+    assert callable_digest(one) != callable_digest(two)
 
 
 def test_callable_digest_refuses_callables_without_python_code():
