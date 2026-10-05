@@ -1,6 +1,6 @@
 # ADR-0001 — Lab host/runtime PEP architecture
 
-- **Status:** Accepted (v0.3.3 / approval state digest; v0.3.2 late-effect fence and v0.3.1 approval invoke binding remain). Amended by [ADR-0002](ADR-0002-approval-principal-binding.md) in v0.4.0, which binds approvals to a host-attested principal, by [ADR-0003](ADR-0003-capability-token-principal-binding.md) in v0.5.0, which binds standing capability tokens to policy-listed, host-attested holders, and by [ADR-0004](ADR-0004-approval-implementation-binding.md) in v0.6.0, which lets an approval bind the implementation resolved at mint.
+- **Status:** Accepted (v0.3.3 / approval state digest; v0.3.2 late-effect fence and v0.3.1 approval invoke binding remain). Amended by [ADR-0002](ADR-0002-approval-principal-binding.md) in v0.4.0, which binds approvals to a host-attested principal, by [ADR-0003](ADR-0003-capability-token-principal-binding.md) in v0.5.0, which binds standing capability tokens to policy-listed, host-attested holders, by [ADR-0004](ADR-0004-approval-implementation-binding.md) in v0.6.0, which lets an approval bind the implementation resolved at mint, and by [ADR-0005](ADR-0005-execute-the-digested-artefact.md) in v0.7.0, whose host helper executes the sealed copy it digested, so its entry observation confirms that copy rather than re-resolving.
 - **Date:** 2026-09-21
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
