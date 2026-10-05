@@ -31,6 +31,9 @@ class ReasonCode(StrEnum):
     # The grant is bound to a principal and the host attested none, attested a
     # different one, or the envelope identity disagrees with the host (ADR-0002).
     APPROVAL_PRINCIPAL_MISMATCH = "approval_principal_mismatch"
+    # The grant froze an implementation digest and the host-observed
+    # implementation is missing, unreadable or different (ADR-0004).
+    APPROVAL_IMPLEMENTATION_MISMATCH = "approval_implementation_mismatch"
     ENVELOPE_INVALID = "envelope_invalid"
     # Exact Deep Research receipt code for the official eval row.
     TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY = "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"

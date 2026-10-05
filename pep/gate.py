@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeVar
 
-from pep.approval import state_matches
+from pep.approval import normalize_state_digest, state_matches
 from pep.evaluate import Decision, PepRuntime, evaluate, resolve_runtime, supersede
 from pep.reasons import ReasonCode
 
@@ -40,6 +40,7 @@ class PendingInvoke:
     runtime: PepRuntime
     admission_id: int
     state_observer: Callable[[], object] | None = None
+    implementation_observer: Callable[[], object] | None = None
 
 
 def begin_invoke(
@@ -49,20 +50,27 @@ def begin_invoke(
     now: datetime | None = None,
     state_observer: Callable[[], object] | None = None,
     principal: str | None = None,
+    implementation_observer: Callable[[], object] | None = None,
 ) -> PendingInvoke:
     """Admit one invoke. Does not call a tool.
 
     The returned epoch is the cut generation observed before evaluation.
     A later ``kill()`` makes ``complete_invoke`` fail closed. ``state_observer``
-    is passed to ``evaluate`` and kept on the admission so ``complete_invoke``
-    can re-observe the target at tool entry. ``principal`` is the
-    host-attested caller (ADR-0002), passed through to ``evaluate``.
+    and ``implementation_observer`` (ADR-0004) are passed to ``evaluate`` and
+    kept on the admission so ``complete_invoke`` can re-observe at tool entry.
+    ``principal`` is the host-attested caller (ADR-0002), passed through to
+    ``evaluate``.
     """
     pep = resolve_runtime(runtime)
     admission_id = pep.mint_admission_id()
     admitted_epoch = pep.fence_epoch
     decision = evaluate(
-        envelope, runtime=pep, now=now, state_observer=state_observer, principal=principal
+        envelope,
+        runtime=pep,
+        now=now,
+        state_observer=state_observer,
+        principal=principal,
+        implementation_observer=implementation_observer,
     )
     return PendingInvoke(
         decision=decision,
@@ -70,6 +78,7 @@ def begin_invoke(
         runtime=pep,
         admission_id=admission_id,
         state_observer=state_observer,
+        implementation_observer=implementation_observer,
     )
 
 
@@ -90,8 +99,11 @@ def complete_invoke(
     When the admission consumed a grant with a frozen state digest and an
     observer was given, the target is re-observed here, after a fence read and
     before the permit is claimed; a change is DENY ``approval_state_mismatch``
-    with the grant already spent. A cut seen by the fence read denies first and
-    skips the observer. ``_before_commit`` is a yield before that locked transition (tests use it
+    with the grant already spent. A grant with a frozen implementation digest
+    is re-observed the same way, before the state, and a missing, failing or
+    different observation is DENY ``approval_implementation_mismatch`` with the
+    grant spent. A cut seen by the fence read denies first and skips both
+    observers, and so does a completion whose admission was already spent. ``_before_commit`` is a yield before that locked transition (tests use it
     to cut in the old check-then-call gap). It is not a permit. The runtime
     re-checks under the lock after it returns. Once ``tool()`` has started,
     this gate does not preempt it.
@@ -104,6 +116,11 @@ def complete_invoke(
     cut = pending.runtime.entry_blocked(pending.admitted_epoch)
     if cut is not None:
         return supersede(decision, cut), None
+    # A replayed completion must not call back into the host.
+    if pending.runtime.admission_spent(pending.admission_id):
+        return supersede(decision, ReasonCode.ADMISSION_CONSUMED), None
+    if not _implementation_still_matches(pending):
+        return supersede(decision, ReasonCode.APPROVAL_IMPLEMENTATION_MISMATCH), None
     if not _state_still_matches(pending):
         # The grant was consumed at admission; a changed target at entry is a
         # fail-closed deny with the grant spent, like a suspend after consume.
@@ -117,6 +134,24 @@ def complete_invoke(
         return supersede(decision, blocked), None
     # One-shot ticket was spent in claim_entry before this call. Replay denies.
     return decision, tool()
+
+
+def _implementation_still_matches(pending: PendingInvoke) -> bool:
+    """Re-observe the implementation at entry when the grant froze a digest.
+
+    Unlike the state check, a frozen digest with no observer fails closed:
+    an implementation binding is only meaningful if the host re-resolves.
+    """
+    frozen = pending.decision.frozen_implementation_digest
+    if frozen is None:
+        return True
+    if pending.implementation_observer is None:
+        return False
+    try:
+        observed = pending.implementation_observer()
+    except Exception:
+        return False
+    return normalize_state_digest(observed) == frozen
 
 
 def _state_still_matches(pending: PendingInvoke) -> bool:
@@ -143,14 +178,21 @@ def gated_invoke(
     now: datetime | None = None,
     state_observer: Callable[[], object] | None = None,
     principal: str | None = None,
+    implementation_observer: Callable[[], object] | None = None,
 ) -> tuple[Decision, T | None]:
     """Run ``tool`` only after ``evaluate`` returns ALLOW and the fence is open.
 
     On DENY the callable is not entered. Callers that bypass this helper
-    are outside the PEP trust domain. ``state_observer`` is passed through
-    to ``evaluate``, and so is the host-attested ``principal`` (ADR-0002).
+    are outside the PEP trust domain. ``state_observer`` and
+    ``implementation_observer`` (ADR-0004) are passed through to
+    ``evaluate``, and so is the host-attested ``principal`` (ADR-0002).
     """
     pending = begin_invoke(
-        envelope, runtime=runtime, now=now, state_observer=state_observer, principal=principal
+        envelope,
+        runtime=runtime,
+        now=now,
+        state_observer=state_observer,
+        principal=principal,
+        implementation_observer=implementation_observer,
     )
     return complete_invoke(pending, tool)

@@ -11,7 +11,10 @@ Replay, expiry, unknown id, uncovered tool, a post-mint args substitution,
 or a missing, wrong or disagreeing principal fail closed. An operator may also freeze a
 state digest at mint (a host-computed digest of the object the invoke
 acts on); consume then requires the host-observed digest to match, so a
-substitution of the target between approval and execute is DENY.
+substitution of the target between approval and execute is DENY. An
+implementation digest frozen at mint works the same way for the program the
+tool name resolves to (ADR-0004), except that its observation only ever
+comes from the host.
 """
 
 from __future__ import annotations
@@ -80,6 +83,8 @@ class ApprovalRecord:
     # ADR-0002: the one principal that may spend this grant. Always set by
     # issue(); a record without one fails every principal check.
     principal: str | None = None
+    # ADR-0004: optional digest of the implementation resolved at mint.
+    implementation_digest: str | None = None
 
     def covers(self, tool_name: str) -> bool:
         return tool_name in self.tools
@@ -107,8 +112,9 @@ class ConsumeResult:
 
     reason: ReasonCode | None
     detail: str | None = None
-    # Digest frozen on the consumed grant, so the gate can re-observe at entry.
+    # Digests frozen on the consumed grant, so the gate can re-observe at entry.
     frozen_state_digest: str | None = None
+    frozen_implementation_digest: str | None = None
 
 
 class ApprovalStore:
@@ -142,6 +148,7 @@ class ApprovalStore:
         catalog: Mapping[str, object] | None = None,
         state_digest: str | None = None,
         principal: str | None = None,
+        implementation_digest: str | None = None,
     ) -> ApprovalRecord:
         self._refuse_reentry()
         clock = _aware(now)
@@ -150,6 +157,9 @@ class ApprovalStore:
         frozen_state = normalize_state_digest(state_digest)
         if state_digest is not None and frozen_state is None:
             raise ApprovalError("state_digest must be sha256: plus 64 hex characters")
+        frozen_implementation = normalize_state_digest(implementation_digest)
+        if implementation_digest is not None and frozen_implementation is None:
+            raise ApprovalError("implementation_digest must be sha256: plus 64 hex characters")
         if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
             raise ApprovalError("ttl_seconds must be a positive integer")
         if ttl_seconds < MIN_TTL_SECONDS or ttl_seconds > MAX_TTL_SECONDS:
@@ -181,6 +191,7 @@ class ApprovalStore:
             consumed_at=None,
             state_digest=frozen_state,
             principal=principal,
+            implementation_digest=frozen_implementation,
         )
         with self._lock:
             if token in self._records:
@@ -204,6 +215,7 @@ class ApprovalStore:
         observe: Callable[[], object] | None = None,
         principal: str | None = None,
         envelope_identity: str | None = None,
+        observe_implementation: Callable[[], object] | None = None,
     ) -> ReasonCode | None:
         """Atomically consume a valid grant. ``None`` means the grant was taken.
 
@@ -218,6 +230,7 @@ class ApprovalStore:
             observe=observe,
             principal=principal,
             envelope_identity=envelope_identity,
+            observe_implementation=observe_implementation,
         ).reason
 
     def consume(
@@ -231,6 +244,7 @@ class ApprovalStore:
         observe: Callable[[], object] | None = None,
         principal: str | None = None,
         envelope_identity: str | None = None,
+        observe_implementation: Callable[[], object] | None = None,
     ) -> ConsumeResult:
         """Atomically consume a valid grant, with the state observation inside.
 
@@ -257,6 +271,13 @@ class ApprovalStore:
         ``envelope_identity`` must then equal it. Every principal failure is
         ``APPROVAL_PRINCIPAL_MISMATCH``, does not consume, and never echoes
         either identity; the detail only says whether a principal was attested.
+
+        ``observe_implementation`` is the host's re-resolution of the tool's
+        implementation (ADR-0004). It is called only for a grant that froze an
+        implementation digest, after the binding check and before the state
+        check, under the same lock and re-entry rules as ``observe``. A missing,
+        raising or non-digest observer, or a different digest, is
+        ``APPROVAL_IMPLEMENTATION_MISMATCH`` and does not consume.
         """
         self._refuse_reentry()
         clock = _aware(now)
@@ -275,6 +296,10 @@ class ApprovalStore:
                 return ConsumeResult(ReasonCode.APPROVAL_BINDING_MISMATCH)
             if not record.single_use:
                 return ConsumeResult(ReasonCode.APPROVAL_INVALID)
+            if record.implementation_digest is not None:
+                failed = self._implementation_failure(record.implementation_digest, observe_implementation)
+                if failed is not None:
+                    return ConsumeResult(ReasonCode.APPROVAL_IMPLEMENTATION_MISMATCH, failed)
             if record.state_digest is not None:
                 observed: object = state_digest
                 source = "envelope state digest"
@@ -294,7 +319,33 @@ class ApprovalStore:
                 if not record.matches_state(observed):
                     return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, f"{source} mismatch")
             self._records[approval_id] = replace(record, consumed_at=clock)
-            return ConsumeResult(None, frozen_state_digest=record.state_digest)
+            return ConsumeResult(
+                None,
+                frozen_state_digest=record.state_digest,
+                frozen_implementation_digest=record.implementation_digest,
+            )
+
+    def _implementation_failure(
+        self, frozen: str, observe: Callable[[], object] | None
+    ) -> str | None:
+        """Name the failed implementation check, or None. Called with the lock held."""
+        if observe is None:
+            return "no implementation observer"
+        self._observing.active = True
+        try:
+            observed = observe()
+        except ObserverReentry:
+            return "implementation observer re-entered store"
+        except Exception:
+            return "implementation observer failed"
+        finally:
+            self._observing.active = False
+        normalized = normalize_state_digest(observed)
+        if normalized is None:
+            return "implementation observer failed"
+        if normalized != frozen:
+            return "implementation mismatch"
+        return None
 
 
 def is_principal(value: object) -> bool:

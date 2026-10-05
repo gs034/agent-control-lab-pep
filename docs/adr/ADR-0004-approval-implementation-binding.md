@@ -1,6 +1,7 @@
 # ADR-0004: Bind single-use approvals to the implementation resolved at mint
 
-- **Status:** Proposed, 2026-10-05. Awaiting owner decision; see "Owner decisions" below.
+- **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions".
+- **Implementation:** in progress. Phase 1 (core, helpers and tests) on the ADR-0004 branch. Measured added cost of a bound `gated_invoke` with `executable_digest` on the test program: 129.7 µs median over 2,000 runs (local container), under the 1 ms provisional ceiling.
 - **Date:** 2026-10-05
 - **Depends on:** [ADR-0002](ADR-0002-approval-principal-binding.md) (principal-bound approvals). Independent of [ADR-0003](ADR-0003-capability-token-principal-binding.md).
 - **Amends:** ADR-0001 "Fail-closed" list, which would gain an implementation mismatch; the `docs/threat-model.md` non-goal on program resolution.
@@ -41,7 +42,7 @@ A grant may freeze a host-computed digest of the implementation that the tool na
    - observed digest differs: DENY.
 
    Each DENY is the new reason code `approval_implementation_mismatch` and does **not** consume the grant, like a binding or principal mismatch. The observer has the same constraints as the state observer: it must be quick, and it must not call back into the store. A call back into the store from the observer's thread is refused as a mismatch, not deadlocked. Every earlier exit (unknown id, principal, consumed, expired, binding) returns before the observer is called.
-4. **Tool entry.** `PendingInvoke` keeps the observer. `complete_invoke` checks in this order: the fence read, then the implementation re-observation, then the state re-observation, then `claim_entry`. That matches the consume order. At entry, when the grant froze an implementation digest:
+4. **Tool entry.** `PendingInvoke` keeps the observer. `complete_invoke` checks in this order: the fence read, then whether the admission was already spent, then the implementation re-observation, then the state re-observation, then `claim_entry`. The implementation-before-state order matches consume. The spent check (added in phase 1 review) makes a second `complete_invoke` return `admission_consumed` without calling either observer; before it, a replay with a state observer re-read the host first. At entry, when the grant froze an implementation digest:
    - no observer: DENY. This differs from `_state_still_matches`, which returns True when no state observer is present (`pep/gate.py:129-130`);
    - observer raises or returns a non-digest: DENY;
    - observed digest differs: DENY.
@@ -76,11 +77,11 @@ A grant may freeze a host-computed digest of the implementation that the tool na
 
 ## Owner decisions
 
-These are the points the owner should settle before acceptance. A recommendation is given for each.
+Settled on 2026-10-05: the owner accepted all three recommendations.
 
-1. **New reason code, or reuse `approval_binding_mismatch`?** Recommend the new code `approval_implementation_mismatch`. A changed program is a different failure from changed args, and the receipt should say which. It is additive and the schema is unchanged.
-2. **Optional per grant, or required?** Recommend optional per grant in this ADR. The stub catalog's `echo.ping` has no external program, and the host may not be able to resolve every tool. Making it required per tool belongs with option C, in a later ADR.
-3. **Mismatch at entry: spent or not spent?** Recommend spent, consistent with the existing state-digest rule at entry. Refunding a grant after consume would need a new store transition.
+1. **New reason code, or reuse `approval_binding_mismatch`?** Decided: the new code `approval_implementation_mismatch`. A changed program is a different failure from changed args, and the receipt should say which. It is additive and the schema is unchanged.
+2. **Optional per grant, or required?** Decided: optional per grant in this ADR. The stub catalog's `echo.ping` has no external program, and the host may not be able to resolve every tool. Making it required per tool belongs with option C, in a later ADR.
+3. **Mismatch at entry: spent or not spent?** Decided: spent, consistent with the existing state-digest rule at entry. Refunding a grant after consume would need a new store transition.
 
 ## Residuals (what this does not fix)
 
