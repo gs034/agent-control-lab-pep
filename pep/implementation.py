@@ -6,15 +6,31 @@ The PEP compares opaque ``sha256:`` digests and never resolves anything
 itself. These helpers are one way for a host to compute a digest at mint and
 again in its observer. ``evaluate`` does not call them, and they are not a
 definition of implementation identity.
+
+``open_executable`` (ADR-0005) also runs what it digested: a sealed in-memory
+copy of the resolved program, so nothing is resolved by path after the copy.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import marshal
+import os
 import shutil
-from collections.abc import Callable
+import subprocess
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
+
+# Linux 6.3+ memfd_create flag; Python does not export it. Without it, a kernel
+# with vm.memfd_noexec >= 1 creates the memfd exec-sealed.
+_MFD_EXEC = 0x10
+_PROC_FD = "/proc/self/fd"
+
+
+class ImplementationUnavailable(OSError):
+    """The artefact cannot be pinned and executed here. There is no path fallback."""
 
 
 def executable_digest(name: str, path: str | None = None) -> str:
@@ -25,11 +41,133 @@ def executable_digest(name: str, path: str | None = None) -> str:
     A name that does not resolve raises ``FileNotFoundError``, which an
     observer turns into a fail-closed mismatch.
     """
-    resolved = shutil.which(name, path=path)
-    if resolved is None:
-        raise FileNotFoundError(f"executable not found: {name}")
-    real = Path(resolved).resolve()
-    return _digest(str(real).encode("utf-8") + b"\0" + real.read_bytes())
+    real = _resolve(name, path)
+    return _program_digest(real, real.read_bytes())
+
+
+class ResolvedExecutable:
+    """A sealed in-memory copy of one resolved program, and the digest of that copy.
+
+    Use one handle per invoke: return ``digest`` from the implementation
+    observer and call ``run`` from the tool, so the PEP checks exactly the
+    bytes that run. Close it, or use it as a context manager.
+    """
+
+    __slots__ = ("real_path", "digest", "_fd")
+
+    def __init__(self, real_path: Path, digest: str, fd: int) -> None:
+        self.real_path = real_path
+        self.digest = digest
+        self._fd = fd
+
+    def fileno(self) -> int:
+        if self._fd < 0:
+            raise ValueError("executable handle is closed")
+        return self._fd
+
+    @property
+    def exec_path(self) -> str:
+        return f"{_PROC_FD}/{self.fileno()}"
+
+    def run(
+        self,
+        args: Sequence[str] = (),
+        *,
+        interpreter: str | os.PathLike[str] | ResolvedExecutable | None = None,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[Any]:
+        """Run the sealed copy; ``kwargs`` go to ``subprocess.run``.
+
+        ``interpreter`` runs the copy as a script under that interpreter. A
+        ``ResolvedExecutable`` interpreter is itself run from its sealed copy.
+        ``shell`` and ``executable`` are refused: either would run something
+        other than the copy. Caller ``pass_fds`` are kept.
+        """
+        for refused in ("shell", "executable"):
+            if refused in kwargs:
+                raise TypeError(f"run() does not accept {refused}=")
+        fds = set(kwargs.pop("pass_fds", ()))
+        fds.add(self.fileno())
+        if interpreter is None:
+            argv = [self.exec_path]
+        elif isinstance(interpreter, ResolvedExecutable):
+            fds.add(interpreter.fileno())
+            argv = [interpreter.exec_path, self.exec_path]
+        else:
+            argv = [os.fspath(interpreter), self.exec_path]
+        return subprocess.run([*argv, *args], pass_fds=tuple(sorted(fds)), **kwargs)
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+    def __enter__(self) -> ResolvedExecutable:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def open_executable(
+    name: str,
+    path: str | None = None,
+    *,
+    _before_open: Callable[[Path], None] | None = None,
+    _after_copy: Callable[[Path], None] | None = None,
+) -> ResolvedExecutable:
+    """Copy the program ``name`` resolves to into a sealed memfd and digest the copy.
+
+    The digest uses the ``executable_digest`` formula over the real path and
+    the sealed bytes, so a digest frozen at mint matches an unchanged program
+    and a program changed before the copy does not. Linux only: without
+    ``os.memfd_create``, sealing or ``/proc/self/fd``, or under a kernel policy
+    that refuses an executable memfd, this raises ``ImplementationUnavailable``.
+    ``_before_open`` and ``_after_copy`` are test seams.
+    """
+    if not hasattr(os, "memfd_create") or not os.path.isdir(_PROC_FD):
+        raise ImplementationUnavailable("sealed in-memory exec is not available on this platform")
+    try:
+        import fcntl
+
+        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    except (ImportError, AttributeError) as exc:
+        raise ImplementationUnavailable("file sealing is not available on this platform") from exc
+    real = _resolve(name, path)
+    if _before_open is not None:
+        _before_open(real)
+    data = _read_all(real)
+    fd = _create_memfd()
+    try:
+        _write_all(fd, data)
+        try:
+            os.fchmod(fd, 0o500)
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+        except OSError as exc:
+            raise ImplementationUnavailable(f"cannot seal an executable copy: {exc.strerror}") from exc
+        if _after_copy is not None:
+            _after_copy(real)
+        copy = _pread_all(fd, len(data))
+        return ResolvedExecutable(real, _program_digest(real, copy), fd)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def combined_digest(*parts: ResolvedExecutable | str) -> str:
+    """One digest over several, in order: script then interpreter, for example.
+
+    Each part is a handle or a ``sha256:`` digest string, so the value frozen
+    at mint from ``executable_digest`` results equals the value observed from
+    handles.
+    """
+    if not parts:
+        raise ValueError("combined_digest needs at least one part")
+    digests = [part.digest if isinstance(part, ResolvedExecutable) else part for part in parts]
+    for digest in digests:
+        if not isinstance(digest, str) or not digest.startswith("sha256:") or len(digest) != 71:
+            raise ValueError("combined_digest parts must be sha256: digests or handles")
+    return _digest("\0".join(digests).encode("utf-8"))
 
 
 def callable_digest(fn: Callable[..., object]) -> str:
@@ -50,6 +188,62 @@ def callable_digest(fn: Callable[..., object]) -> str:
         raise TypeError(f"callable has no Python code object: {fn!r}")
     header = f"{fn.__module__}\0{fn.__qualname__}\0".encode("utf-8")
     return _digest(header + marshal.dumps(code))
+
+
+def _resolve(name: str, path: str | None) -> Path:
+    resolved = shutil.which(name, path=path)
+    if resolved is None:
+        raise FileNotFoundError(f"executable not found: {name}")
+    return Path(resolved).resolve()
+
+
+def _program_digest(real: Path, data: bytes) -> str:
+    return _digest(str(real).encode("utf-8") + b"\0" + data)
+
+
+def _create_memfd() -> int:
+    base = os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC
+    try:
+        return os.memfd_create("pep-exec", base | _MFD_EXEC)
+    except OSError as exc:
+        if exc.errno == errno.EINVAL:
+            # Kernels before 6.3 do not know MFD_EXEC; they never exec-seal.
+            try:
+                return os.memfd_create("pep-exec", base)
+            except OSError as retry:
+                raise ImplementationUnavailable(f"memfd_create failed: {retry.strerror}") from retry
+        if exc.errno in (errno.EPERM, errno.EACCES):
+            raise ImplementationUnavailable("kernel policy refuses an executable memfd") from exc
+        raise
+
+
+def _read_all(real: Path) -> bytes:
+    fd = os.open(real, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        chunks = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _pread_all(fd: int, size: int) -> bytes:
+    chunks = []
+    offset = 0
+    while offset < size:
+        chunk = os.pread(fd, size - offset, offset)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
 
 
 def _digest(data: bytes) -> str:
