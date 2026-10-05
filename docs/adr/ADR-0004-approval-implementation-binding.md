@@ -1,6 +1,7 @@
 # ADR-0004: Bind single-use approvals to the implementation resolved at mint
 
-- **Status:** Proposed, 2026-10-05. Awaiting owner decision; see "Owner decisions" below.
+- **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions".
+- **Implementation:** in progress. Phase 1 (core and tests) on the ADR-0004 branch.
 - **Date:** 2026-10-05
 - **Depends on:** [ADR-0002](ADR-0002-approval-principal-binding.md) (principal-bound approvals). Independent of [ADR-0003](ADR-0003-capability-token-principal-binding.md).
 - **Amends:** ADR-0001 "Fail-closed" list, which would gain an implementation mismatch; the `docs/threat-model.md` non-goal on program resolution.
@@ -76,11 +77,11 @@ A grant may freeze a host-computed digest of the implementation that the tool na
 
 ## Owner decisions
 
-These are the points the owner should settle before acceptance. A recommendation is given for each.
+Settled on 2026-10-05: the owner accepted all three recommendations.
 
-1. **New reason code, or reuse `approval_binding_mismatch`?** Recommend the new code `approval_implementation_mismatch`. A changed program is a different failure from changed args, and the receipt should say which. It is additive and the schema is unchanged.
-2. **Optional per grant, or required?** Recommend optional per grant in this ADR. The stub catalog's `echo.ping` has no external program, and the host may not be able to resolve every tool. Making it required per tool belongs with option C, in a later ADR.
-3. **Mismatch at entry: spent or not spent?** Recommend spent, consistent with the existing state-digest rule at entry. Refunding a grant after consume would need a new store transition.
+1. **New reason code, or reuse `approval_binding_mismatch`?** Decided: the new code `approval_implementation_mismatch`. A changed program is a different failure from changed args, and the receipt should say which. It is additive and the schema is unchanged.
+2. **Optional per grant, or required?** Decided: optional per grant in this ADR. The stub catalog's `echo.ping` has no external program, and the host may not be able to resolve every tool. Making it required per tool belongs with option C, in a later ADR.
+3. **Mismatch at entry: spent or not spent?** Decided: spent, consistent with the existing state-digest rule at entry. Refunding a grant after consume would need a new store transition.
 
 ## Residuals (what this does not fix)
 
