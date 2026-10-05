@@ -1,6 +1,7 @@
 # ADR-0005: Execute the artefact that was digested
 
-- **Status:** Proposed, 2026-10-05. Awaiting owner decision; see "Owner decisions" below.
+- **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions".
+- **Implementation:** in progress. Phase 1 (helper and tests) on the ADR-0005 branch.
 - **Date:** 2026-10-05
 - **Depends on:** [ADR-0004](ADR-0004-approval-implementation-binding.md) (implementation digest at mint, consume and entry).
 - **Amends:** ADR-0004 "Residuals", the check-to-exec race bullet. Its last remedy sentence ("executing the artefact from the same open file descriptor it digested") is not sufficient on its own; see Context.
@@ -86,9 +87,11 @@ Two corrections follow. First, ADR-0004's remedy, "the same open file descriptor
 
 ## Owner decisions
 
-1. **Sealed memfd only, or also a plain-fd variant?** Recommend memfd only. The plain fd fails the in-place write case. Offering it invites the mistake ADR-0004's own wording made.
-2. **Interpreter binding now, through `interpreter=` and `combined_digest`, or later?** Recommend now. It is small, and without it a `#!/usr/bin/env` script stays fully exposed through its interpreter.
-3. **Version 0.7.0 or 0.6.1?** Recommend 0.7.0, because the helper is new public API.
+Settled on 2026-10-05: the owner accepted all three recommendations.
+
+1. **Sealed memfd only, or also a plain-fd variant?** Decided: memfd only. The plain fd fails the in-place write case. Offering it invites the mistake ADR-0004's own wording made.
+2. **Interpreter binding now, through `interpreter=` and `combined_digest`, or later?** Decided: now. It is small, and without it a `#!/usr/bin/env` script stays fully exposed through its interpreter.
+3. **Version 0.7.0 or 0.6.1?** Decided: 0.7.0, because the helper is new public API.
 
 ## Residuals (what this does not fix)
 
