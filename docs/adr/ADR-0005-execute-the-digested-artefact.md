@@ -14,7 +14,7 @@
 
 **Why a path cannot close it.** Any exec by path resolves the name again, and the file at that path can be replaced between the check and the exec. The fix has to make the thing that runs the same object as the thing that was digested.
 
-**What was checked, and how.** The research run cited specifications only: execveat(2), fexecve(3), memfd_create(2) and Python's `os.execve`. Before writing this ADR, each claim was tried in the development container (Linux 6.18, Python 3.11.15, `vm.memfd_noexec = 0`). These are observations in one environment, not tests in this repository:
+**What was checked, and how.** The research run cited specifications only: execveat(2), fexecve(3), memfd_create(2) and Python's `os.execve`. Before writing this ADR, each claim was tried in the development container (Linux 6.18, Python 3.11.15 and 3.12.3, default `vm.memfd_noexec = 0`; other levels set as noted). These are observations in one environment, not tests in this repository:
 
 | Question | Observed |
 | --- | --- |
@@ -27,6 +27,8 @@
 | The same exec with the fd not passed (close-on-exec) | `ENOENT`, matching fexecve(3) |
 | A `#!/usr/bin/env python3` script from a sealed memfd, with `PATH` changed afterwards | Ran the interpreter from the changed `PATH` |
 | 50 open-and-close cycles of a `MFD_CLOEXEC` memfd | No fd leak |
+| `vm.memfd_noexec = 1` and `= 2`, set inside a throwaway pid namespace (`unshare -p --mount-proc`; the sysctl is per pid namespace) | A memfd created without `MFD_EXEC` starts with `F_SEAL_EXEC` and mode `0666`, and `fchmod(0o500)` fails with `EPERM`. Creating it with `MFD_EXEC` (`0x10`) works at level 1 and fails with `EACCES` at level 2. |
+| `os.MFD_EXEC` or `fcntl.F_SEAL_EXEC` in Python 3.11 and 3.12 | Not present; the value has to be passed as a literal |
 
 Two corrections follow. First, ADR-0004's remedy, "the same open file descriptor", closes a path swap but not an in-place write to the file it points at. Second, a script's interpreter is a second resolution by path, and sealing the script does not pin it.
 
@@ -36,15 +38,17 @@ Two corrections follow. First, ADR-0004's remedy, "the same open file descriptor
 
 1. **Open.** `open_executable(name, path=None)` works as follows:
    1. It resolves `name` with `shutil.which` and takes the real path, exactly as `executable_digest` does.
-   2. It opens the file `O_RDONLY | O_CLOEXEC` and copies its bytes into a memfd created with `MFD_ALLOW_SEALING | MFD_CLOEXEC`.
+   2. It opens the file `O_RDONLY | O_CLOEXEC` and copies its bytes into a memfd created with `MFD_ALLOW_SEALING | MFD_CLOEXEC | MFD_EXEC`. `MFD_EXEC` (`0x10`, Linux 6.3+) is passed as a literal, because Python does not export it. If the kernel rejects it as unknown (`EINVAL`, before 6.3), the helper retries without it.
    3. It sets mode `0o500` and adds `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK` and `F_SEAL_SEAL`.
    4. It returns a `ResolvedExecutable`.
+
+   Any `EPERM` or `EACCES` from the create, the `fchmod` or the seal, such as `vm.memfd_noexec = 2`, becomes `ImplementationUnavailable`.
 2. **Digest.** `ResolvedExecutable.digest` is computed from the real path and the bytes read back from the sealed copy, using the same formula as `executable_digest`. A digest frozen at mint with `executable_digest` therefore matches an unchanged program. A file changed between `which` and the copy gives a different digest, so the PEP denies it.
 3. **Run.** `ResolvedExecutable.run(args, *, interpreter=None, **subprocess_kwargs)` runs `/proc/self/fd/<fd>` with the memfd in `pass_fds`, and returns the `subprocess.CompletedProcess`:
    - when `interpreter` is a string, it runs `[interpreter, "/proc/self/fd/<fd>", *args]`;
    - when `interpreter` is another `ResolvedExecutable`, it runs that one's fd as the interpreter, and both fds are passed to the child.
 
-   Caller-supplied `pass_fds` are merged, not replaced. It has no `shell` option.
+   Caller-supplied `pass_fds` are merged, not replaced. `shell=` and `executable=` are refused with `TypeError`, because either would let the caller run something other than the copy. `subprocess.run(["/bin/false"], executable="/bin/true")` runs `/bin/true`.
 4. **Host pattern.** The host opens one handle per invoke. The same handle serves the observer and the tool:
 
    ```python
@@ -58,12 +62,16 @@ Two corrections follow. First, ADR-0004's remedy, "the same open file descriptor
        )
    ```
 
-   The consume and entry observations then report the digest of the exact bytes that will run, and nothing re-resolves after the copy. This narrows ADR-0004's "the host re-resolves at entry": with this helper, the entry observation does not re-resolve. It confirms the pinned artefact that is about to run.
+   The consume and entry observations then report the digest of the exact bytes that will run, and nothing re-resolves after the copy. This narrows how ADR-0001 describes ADR-0004 ("the host re-resolves at consume and at tool entry"): with this helper, the entry observation does not re-resolve. It confirms the pinned artefact that is about to run.
 5. **Interpreters.** `combined_digest(*resolved)` gives one `sha256:` digest over several handles, in order. A host that wants the interpreter bound as well as the script does three things:
    - freezes `combined_digest(script, interpreter)` at mint;
    - observes the same value;
    - passes `interpreter=` to `run`.
-6. **Fail closed.** On a platform without `os.memfd_create`, sealing support or `/proc/self/fd`, `open_executable` raises `ImplementationUnavailable`, a subclass of `OSError`. It never falls back to exec by path. Raised inside an observer, this is the existing `approval_implementation_mismatch` (ADR-0004 decision 3). Raised before `gated_invoke`, the host gets an exception and no invoke happens. If the exec itself fails (for example under a kernel policy that blocks exec from memfd), `run` raises, after the grant is already spent.
+6. **Fail closed.** `open_executable` raises `ImplementationUnavailable`, a subclass of `OSError`, on any of:
+   - a platform without `os.memfd_create`, sealing support or `/proc/self/fd`;
+   - a kernel policy that refuses an executable memfd (`vm.memfd_noexec = 2`).
+
+   It never falls back to exec by path. In the host pattern the handle is opened before `gated_invoke`, so the host gets the exception, no invoke happens and no grant is touched. If the exec itself fails later, for example under an LSM rule against exec from memfd (not observed here), `run` raises after the grant is already spent.
 7. **Version.** pep moves to 0.7.0. The helper is new public API; nothing existing changes.
 
 ## Options considered
@@ -89,7 +97,14 @@ Two corrections follow. First, ADR-0004's remedy, "the same open file descriptor
 - **Unpinned interpreters.** A script run directly (`run(args)` with no `interpreter=`) has its shebang interpreter resolved by path. With `#!/usr/bin/env`, that is a `PATH` lookup, as observed above.
 - **In-process callables.** Unchanged from ADR-0004: `callable_digest` covers the code object only.
 - **The window before the copy.** A swap between `which` and the copy is not a residual. It gives a digest mismatch and a DENY. It also means a benign update in that window denies.
-- **Platforms and kernel policy.** The helper is Linux only. macOS and Windows raise `ImplementationUnavailable`. A kernel with `vm.memfd_noexec = 2`, or an LSM that forbids exec from memfd, makes `run` fail after the grant is spent. That case was not observed here, because this container has `memfd_noexec = 0`.
+- **Platforms and kernel policy.** The helper is Linux only, and macOS and Windows raise `ImplementationUnavailable`.
+  - **`vm.memfd_noexec = 1`:** works, because the helper passes `MFD_EXEC`.
+  - **`vm.memfd_noexec = 2`:** fails closed in `open_executable`, before any grant is touched. Both levels were observed in a pid namespace.
+  - **An LSM that forbids exec from memfd:** would make `run` fail after the grant is spent. That was not observed.
+- **What the child sees.**
+  - Its `argv[0]` is `/proc/self/fd/<n>`, so multi-call programs that dispatch on `argv[0]` misbehave.
+  - The memfd stays open in the child and its descendants. The seals stop writes through it.
+  - With `interpreter=`, flags on the script's own shebang line are not applied.
 - **Equivalent-access attackers.** A caller that can `ptrace` the child or write the parent's memory is out of scope, as in ADR-0002.
 - **Cost.** One full copy of the program into memory per invoke. Large binaries make this visible.
 
@@ -135,17 +150,28 @@ All tests are Linux-only and skip elsewhere, as the existing `PATH` tests do. "B
 | Script with `#!/usr/bin/env python3`, `PATH` swapped, no `interpreter=` | n/a | Named residual test: the swapped interpreter runs |
 | Same script with `interpreter=` a `ResolvedExecutable`, grant frozen on `combined_digest` | n/a | The pinned interpreter runs |
 | Interpreter changed after mint, grant frozen on `combined_digest` | n/a | DENY `approval_implementation_mismatch`; not consumed |
-| `os.memfd_create` unavailable (patched out) inside the observer | n/a | DENY `approval_implementation_mismatch`, "implementation observer failed"; not consumed; no exec by path |
-| Same, called before `gated_invoke` | n/a | `ImplementationUnavailable` raised; no invoke |
+| `os.memfd_create` unavailable (patched out) | n/a | `open_executable` raises `ImplementationUnavailable`; no invoke; no exec by path |
+| `/proc/self/fd` unavailable (patched out) | n/a | `ImplementationUnavailable`; no invoke |
+| `memfd_create` or `fchmod` refused with `EPERM` / `EACCES` (patched, standing in for `vm.memfd_noexec = 2`) | n/a | `ImplementationUnavailable`; no invoke |
+| `MFD_EXEC` rejected with `EINVAL` (patched, standing in for a pre-6.3 kernel) | n/a | Retries without it; the handle works |
+| File replaced between `which` and the open (test seam) | n/a | Digest of the copy differs from mint: DENY `approval_implementation_mismatch`; not consumed |
+| File rewritten on disk after the copy and before the digest (test seam) | n/a | ALLOW, program A: the digest is of the copy, not the disk |
+| `run(..., executable=...)` or `run(..., shell=True)` | n/a | `TypeError`; nothing runs |
 | Caller passes its own `pass_fds` | n/a | Both its fds and the handle's fd reach the child |
 | 100 handles opened and closed | n/a | No fd leak (`/proc/self/fd` count unchanged) |
-| Kill between admission and entry, helper in use | DENY `late_effect_fence` | Unchanged |
+| Kill between admission and entry, helper in use | n/a | DENY `late_effect_fence`; the tool does not run |
 | Existing `test_swap_after_the_entry_check_is_residual` (helper not used) | ALLOW, program B | Unchanged |
 | Corpus receipts | Current | Byte-identical (`regen_corpus_receipts.py --check` clean) |
 
 Further acceptance requirements:
 - Measure and report the added cost of `open_executable` plus `run` against ADR-0004's bound path with `executable_digest`. The ceiling stays provisional at 1 ms median for the stub test program; going over it is a finding, not an automatic fail.
-- Run mutation checks on the helper (no seal, digest from disk instead of the copy, path fallback on failure, `pass_fds` replaced instead of merged). Each must be caught.
+- Run mutation checks on the helper. Each must be caught:
+  - no seal;
+  - digest from disk instead of the copy (caught by the after-copy seam row);
+  - path fallback on failure;
+  - `pass_fds` replaced instead of merged;
+  - `executable=` passed through;
+  - the `MFD_EXEC` retry removed.
 - The full pep suite and the brand-wall checks pass. Each phase gets an independent review.
 
 **Rollback:** revert the helper commits. Nothing else depends on it.
