@@ -121,12 +121,12 @@ Still open at 0.5.0: an in-process caller can pass any principal; the published 
 
 ## v0.6.0 / approval implementation binding (this tree)
 
-Same PEP trust domain. [ADR-0004](adr/ADR-0004-approval-implementation-binding.md) lets a single-use approval bind the implementation its tool name resolves to at mint. Before this release, a `PATH` reorder or handler swap between mint and tool entry ran a different program under the same grant (`test_path_resolution_substitution_is_residual`).
+Same PEP trust domain. [ADR-0004](adr/ADR-0004-approval-implementation-binding.md) lets a single-use approval bind the implementation its tool name resolves to at mint. Before this release, a `PATH` reorder between mint and tool entry ran a different program under the same grant (`test_path_resolution_substitution_is_residual`).
 
 | Work | Status |
 | --- | --- |
 | `issue_approval(..., implementation_digest=)` is optional per grant; a malformed value raises `ApprovalError` | In tree |
-| Host-only `implementation_observer=` on `evaluate` / `begin_invoke` / `gated_invoke`, and `observe_implementation=` on `consume` / `try_consume`. No envelope field; a top-level `implementation_digest` key is `envelope_invalid` | In tree |
+| Host-only `implementation_observer=` on `evaluate` / `begin_invoke` / `gated_invoke`, and `observe_implementation=` on `consume` / `try_consume`. No envelope field: a top-level `implementation_digest` key is `envelope_invalid` in both shapes, and one inside a lab envelope's `schema_fields` is dropped and never read | In tree |
 | Consume checks it after the binding and before the state check, under the store lock. Missing, raising, non-digest or different observations, and observer re-entry, are `approval_implementation_mismatch` and do not consume. Earlier exits never call the observer | In tree |
 | `complete_invoke` checks the fence, then whether the admission was already spent, then the implementation, then the state. An entry mismatch, including a missing entry observer, denies with the grant spent | In tree |
 | `pep/implementation.py`: optional host helpers `executable_digest` and `callable_digest` | In tree |
