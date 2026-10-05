@@ -144,9 +144,9 @@ Same PEP trust domain. [ADR-0005](adr/ADR-0005-execute-the-digested-artefact.md)
 | `open_executable(name)` copies the resolved program into a memfd (`MFD_EXEC` passed as a literal, retried without it on `EINVAL`), sets `0o500`, seals write, grow, shrink and seal, and digests the whole sealed file with `executable_digest`'s formula | In tree |
 | `ResolvedExecutable.run()` executes `/proc/self/fd/<n>`, merges caller `pass_fds`, refuses `shell=`, `executable=` and `preexec_fn`, and can run the copy under a pinned interpreter handle; `combined_digest()` binds script and interpreter | In tree |
 | Fail closed: no memfd, sealing or `/proc`, a kernel that refuses an executable memfd, or a source that is not a regular file raises `ImplementationUnavailable`; there is no fallback to exec by path | In tree |
-| Measured added cost of `open_executable` over `executable_digest`: 16 µs median on the test script; 1.1 ms on a 1.4 MB binary, where hashing alone is 1.8 ms (over the provisional 1 ms ceiling for ADR-0004's helper too) | Measured |
+| Measured added cost, local container: `open_executable` over `executable_digest` is 16 µs median on the test script and 1.1 ms on a 1.4 MB binary (whose hash alone is 1.8 ms); `open_executable` plus `run` over exec by path is 194 µs median on a two-line shell script (1.74 ms against 1.54 ms, 300 runs). The provisional 1 ms ceiling is set for the stub test program, which is under it | Measured |
 
-Still open: hosts that do not use the helper; what the program loads by path; unpinned `#!/usr/bin/env` interpreters; platforms other than Linux; an LSM that blocks exec from memfd (not observed); equivalent-access attackers.
+Still open: hosts that do not use the helper; what the program loads by path; unpinned `#!/usr/bin/env` interpreters; platforms other than Linux; an LSM that blocks exec from memfd (not observed; it would fail after the grant is spent); what the child sees (`argv[0]` is `/proc/self/fd/<n>`, the sealed fd is inherited, `interpreter=` drops the script's shebang flags); equivalent-access attackers.
 
 ## Remaining v1 notes
 
