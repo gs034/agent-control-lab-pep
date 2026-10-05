@@ -11,6 +11,7 @@ from __future__ import annotations
 import errno
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -88,6 +89,12 @@ def _gate(runtime, grant, program, tool):
     )
 
 
+def _host_invoke(runtime, grant, name, calls):
+    """The ADR-0005 host pattern: open one handle, observe its digest, run it."""
+    with open_executable(name) as program:
+        return _gate(runtime, grant, program, lambda: calls.append(_run_python(program)))
+
+
 def _run_python(program) -> str:
     return program.run(interpreter=sys.executable, capture_output=True, text=True, check=True).stdout.strip()
 
@@ -152,6 +159,43 @@ def test_file_replaced_between_which_and_open_denies_at_consume(programs):
 
     with open_executable("labtool", _before_open=replace) as program:
         decision, result = _gate(runtime, grant, program, lambda: calls.append("entered"))
+
+    assert decision.receipt.reason_code == MISMATCH
+    assert result is None and calls == []
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_file_changed_between_mint_and_open_denies_at_consume(programs):
+    dirs, _ = programs
+    runtime = _runtime()
+    grant = _bound_grant(runtime, executable_digest("labtool"))
+    (dirs["program-a"] / "labtool").write_text("print('program-b')\n", encoding="utf-8")
+    calls: list[str] = []
+
+    decision, result = _host_invoke(runtime, grant, "labtool", calls)
+
+    assert decision.receipt.reason_code == MISMATCH
+    assert result is None and calls == []
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+
+
+def test_bytes_added_to_the_memfd_before_sealing_are_digested(programs, monkeypatch):
+    """Whatever is in the sealed file is what gets digested, not only what was copied."""
+    runtime = _runtime()
+    minted = executable_digest("labtool")
+    grant = _bound_grant(runtime, minted)
+    real_fchmod = os.fchmod
+
+    def inject_then_fchmod(fd, mode):
+        os.pwrite(fd, b"print('injected')\n", os.fstat(fd).st_size)
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fchmod", inject_then_fchmod)
+    calls: list[str] = []
+
+    with open_executable("labtool") as program:
+        assert program.digest != minted
+        decision, result = _gate(runtime, grant, program, lambda: calls.append(_run_python(program)))
 
     assert decision.receipt.reason_code == MISMATCH
     assert result is None and calls == []
@@ -255,16 +299,24 @@ def test_interpreter_changed_after_mint_denies_under_a_combined_digest(interpret
     assert not runtime.approvals.lookup(grant.approval_id).consumed()
 
 
+def _assert_unavailable_before_any_invoke():
+    runtime = _runtime()
+    grant = _bound_grant(runtime, executable_digest("labtool"))
+    calls: list[str] = []
+    with pytest.raises(ImplementationUnavailable):
+        _host_invoke(runtime, grant, "labtool", calls)
+    assert calls == []
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
+
+
 def test_missing_memfd_create_is_unavailable(programs, monkeypatch):
     monkeypatch.delattr(os, "memfd_create")
-    with pytest.raises(ImplementationUnavailable):
-        open_executable("labtool")
+    _assert_unavailable_before_any_invoke()
 
 
 def test_missing_proc_self_fd_is_unavailable(programs, monkeypatch, tmp_path):
     monkeypatch.setattr(implementation, "_PROC_FD", str(tmp_path / "no-proc"))
-    with pytest.raises(ImplementationUnavailable):
-        open_executable("labtool")
+    _assert_unavailable_before_any_invoke()
 
 
 @pytest.mark.parametrize("code", [errno.EPERM, errno.EACCES])
@@ -273,8 +325,29 @@ def test_kernel_refusing_an_executable_memfd_is_unavailable(programs, monkeypatc
         raise OSError(code, os.strerror(code))
 
     monkeypatch.setattr(os, "memfd_create", refuse)
-    with pytest.raises(ImplementationUnavailable):
-        open_executable("labtool")
+    _assert_unavailable_before_any_invoke()
+
+
+def test_a_fifo_on_path_is_refused_without_hanging(tmp_path, monkeypatch):
+    fifo = tmp_path / "bin" / "labtool"
+    fifo.parent.mkdir()
+    os.mkfifo(fifo)
+    fifo.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fifo.parent}{os.pathsep}{os.environ['PATH']}")
+    outcomes: list[type] = []
+
+    def attempt():
+        for call in (lambda: open_executable("labtool"), lambda: executable_digest("labtool")):
+            try:
+                call()
+            except ImplementationUnavailable:
+                outcomes.append(ImplementationUnavailable)
+
+    worker = threading.Thread(target=attempt, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "opening a FIFO blocked"
+    assert outcomes == [ImplementationUnavailable, ImplementationUnavailable]
 
 
 def test_refused_fchmod_is_unavailable_and_closes_the_memfd(programs, monkeypatch):
@@ -305,7 +378,11 @@ def test_kernel_without_mfd_exec_falls_back_and_still_works(programs, monkeypatc
     assert len(calls) == 2 and calls[0] & 0x10 and not calls[1] & 0x10
 
 
-@pytest.mark.parametrize("refused", [{"executable": "/bin/true"}, {"shell": True}, {"shell": False}])
+@pytest.mark.parametrize(
+    "refused",
+    [{"executable": "/bin/true"}, {"shell": True}, {"shell": False}, {"preexec_fn": lambda: None}],
+    ids=["executable", "shell-true", "shell-false", "preexec_fn"],
+)
 def test_run_refuses_shell_and_executable(programs, refused):
     with open_executable("labtool") as program:
         with pytest.raises(TypeError):
@@ -376,3 +453,14 @@ def test_kill_between_admission_and_entry_is_the_fence(programs):
 def test_combined_digest_rejects_bad_parts(bad):
     with pytest.raises(ValueError):
         combined_digest(*bad)
+
+
+def test_a_handle_that_is_never_closed_releases_its_fd_when_collected(programs):
+    import gc
+
+    before = len(os.listdir("/proc/self/fd"))
+    program = open_executable("labtool")
+    assert len(os.listdir("/proc/self/fd")) == before + 1
+    del program
+    gc.collect()
+    assert len(os.listdir("/proc/self/fd")) == before

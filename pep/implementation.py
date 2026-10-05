@@ -18,7 +18,9 @@ import hashlib
 import marshal
 import os
 import shutil
+import stat
 import subprocess
+import weakref
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -42,7 +44,11 @@ def executable_digest(name: str, path: str | None = None) -> str:
     observer turns into a fail-closed mismatch.
     """
     real = _resolve(name, path)
-    return _program_digest(real, real.read_bytes())
+    src = _open_regular(real)
+    try:
+        return _program_digest(real, src)
+    finally:
+        os.close(src)
 
 
 class ResolvedExecutable:
@@ -50,15 +56,18 @@ class ResolvedExecutable:
 
     Use one handle per invoke: return ``digest`` from the implementation
     observer and call ``run`` from the tool, so the PEP checks exactly the
-    bytes that run. Close it, or use it as a context manager.
+    bytes that run. Close it, or use it as a context manager; a handle that is
+    never closed is closed when collected. It is not thread-safe: do not close
+    it while another thread is running it.
     """
 
-    __slots__ = ("real_path", "digest", "_fd")
+    __slots__ = ("real_path", "digest", "_fd", "_finalizer", "__weakref__")
 
     def __init__(self, real_path: Path, digest: str, fd: int) -> None:
         self.real_path = real_path
         self.digest = digest
         self._fd = fd
+        self._finalizer = weakref.finalize(self, os.close, fd)
 
     def fileno(self) -> int:
         if self._fd < 0:
@@ -80,10 +89,10 @@ class ResolvedExecutable:
 
         ``interpreter`` runs the copy as a script under that interpreter. A
         ``ResolvedExecutable`` interpreter is itself run from its sealed copy.
-        ``shell`` and ``executable`` are refused: either would run something
-        other than the copy. Caller ``pass_fds`` are kept.
+        ``shell``, ``executable`` and ``preexec_fn`` are refused: each can run
+        something other than the copy. Caller ``pass_fds`` are kept.
         """
-        for refused in ("shell", "executable"):
+        for refused in ("shell", "executable", "preexec_fn"):
             if refused in kwargs:
                 raise TypeError(f"run() does not accept {refused}=")
         fds = set(kwargs.pop("pass_fds", ()))
@@ -99,7 +108,7 @@ class ResolvedExecutable:
 
     def close(self) -> None:
         if self._fd >= 0:
-            os.close(self._fd)
+            self._finalizer()
             self._fd = -1
 
     def __enter__(self) -> ResolvedExecutable:
@@ -119,8 +128,9 @@ def open_executable(
     """Copy the program ``name`` resolves to into a sealed memfd and digest the copy.
 
     The digest uses the ``executable_digest`` formula over the real path and
-    the sealed bytes, so a digest frozen at mint matches an unchanged program
-    and a program changed before the copy does not. Linux only: without
+    the whole sealed file, read back after sealing, so a digest frozen at mint
+    matches an unchanged program and anything changed before the seals does
+    not. A source that is not a regular file is refused. Linux only: without
     ``os.memfd_create``, sealing or ``/proc/self/fd``, or under a kernel policy
     that refuses an executable memfd, this raises ``ImplementationUnavailable``.
     ``_before_open`` and ``_after_copy`` are test seams.
@@ -136,10 +146,17 @@ def open_executable(
     real = _resolve(name, path)
     if _before_open is not None:
         _before_open(real)
-    data = _read_all(real)
-    fd = _create_memfd()
+    src = _open_regular(real)
     try:
-        _write_all(fd, data)
+        fd = _create_memfd()
+        try:
+            _copy(src, fd)
+        except BaseException:
+            os.close(fd)
+            raise
+    finally:
+        os.close(src)
+    try:
         try:
             os.fchmod(fd, 0o500)
             fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
@@ -147,8 +164,7 @@ def open_executable(
             raise ImplementationUnavailable(f"cannot seal an executable copy: {exc.strerror}") from exc
         if _after_copy is not None:
             _after_copy(real)
-        copy = _pread_all(fd, len(data))
-        return ResolvedExecutable(real, _program_digest(real, copy), fd)
+        return ResolvedExecutable(real, _program_digest(real, fd), fd)
     except BaseException:
         os.close(fd)
         raise
@@ -197,8 +213,23 @@ def _resolve(name: str, path: str | None) -> Path:
     return Path(resolved).resolve()
 
 
-def _program_digest(real: Path, data: bytes) -> str:
-    return _digest(str(real).encode("utf-8") + b"\0" + data)
+def _program_digest(real: Path, fd: int) -> str:
+    """The executable_digest formula, streamed from ``fd`` to end of file."""
+    h = hashlib.sha256(str(real).encode("utf-8") + b"\0")
+    offset = 0
+    while chunk := os.pread(fd, 1 << 20, offset):
+        h.update(chunk)
+        offset += len(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def _open_regular(real: Path) -> int:
+    # O_NONBLOCK so a FIFO on PATH cannot hang the open.
+    fd = os.open(real, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ImplementationUnavailable(f"not a regular file: {real}")
+    return fd
 
 
 def _create_memfd() -> int:
@@ -217,33 +248,11 @@ def _create_memfd() -> int:
         raise
 
 
-def _read_all(real: Path) -> bytes:
-    fd = os.open(real, os.O_RDONLY | os.O_CLOEXEC)
-    try:
-        chunks = []
-        while chunk := os.read(fd, 1 << 20):
-            chunks.append(chunk)
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
-
-
-def _write_all(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view):]
-
-
-def _pread_all(fd: int, size: int) -> bytes:
-    chunks = []
-    offset = 0
-    while offset < size:
-        chunk = os.pread(fd, size - offset, offset)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        offset += len(chunk)
-    return b"".join(chunks)
+def _copy(src: int, dst: int) -> None:
+    while chunk := os.read(src, 1 << 20):
+        view = memoryview(chunk)
+        while view:
+            view = view[os.write(dst, view):]
 
 
 def _digest(data: bytes) -> str:
