@@ -1,7 +1,7 @@
 # ADR-0005: Execute the artefact that was digested
 
 - **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions".
-- **Implementation:** in progress. Phase 1 (helper and tests) on the ADR-0005 branch.
+- **Implementation:** done in pep 0.7.0, in two phases: phase 1 (helper and tests; pep#19) and phase 2 (docs and version). Phase 1 review added three refinements recorded below: the digest is read back over the whole sealed file, `preexec_fn` is refused, and a source that is not a regular file is refused.
 - **Date:** 2026-10-05
 - **Depends on:** [ADR-0004](ADR-0004-approval-implementation-binding.md) (implementation digest at mint, consume and entry).
 - **Amends:** ADR-0004 "Residuals", the check-to-exec race bullet. Its last remedy sentence ("executing the artefact from the same open file descriptor it digested") is not sufficient on its own; see Context.
@@ -39,17 +39,17 @@ Two corrections follow. First, ADR-0004's remedy, "the same open file descriptor
 
 1. **Open.** `open_executable(name, path=None)` works as follows:
    1. It resolves `name` with `shutil.which` and takes the real path, exactly as `executable_digest` does.
-   2. It opens the file `O_RDONLY | O_CLOEXEC` and copies its bytes into a memfd created with `MFD_ALLOW_SEALING | MFD_CLOEXEC | MFD_EXEC`. `MFD_EXEC` (`0x10`, Linux 6.3+) is passed as a literal, because Python does not export it. If the kernel rejects it as unknown (`EINVAL`, before 6.3), the helper retries without it.
+   2. It opens the file `O_RDONLY | O_CLOEXEC | O_NONBLOCK`, refuses anything that is not a regular file (so a FIFO on `PATH` cannot hang it), and copies its bytes into a memfd created with `MFD_ALLOW_SEALING | MFD_CLOEXEC | MFD_EXEC`. `MFD_EXEC` (`0x10`, Linux 6.3+) is passed as a literal, because Python does not export it. If the kernel rejects it as unknown (`EINVAL`, before 6.3), the helper retries without it.
    3. It sets mode `0o500` and adds `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK` and `F_SEAL_SEAL`.
    4. It returns a `ResolvedExecutable`.
 
    Any `EPERM` or `EACCES` from the create, the `fchmod` or the seal, such as `vm.memfd_noexec = 2`, becomes `ImplementationUnavailable`.
-2. **Digest.** `ResolvedExecutable.digest` is computed from the real path and the bytes read back from the sealed copy, using the same formula as `executable_digest`. A digest frozen at mint with `executable_digest` therefore matches an unchanged program. A file changed between `which` and the copy gives a different digest, so the PEP denies it.
+2. **Digest.** `ResolvedExecutable.digest` is computed from the real path and the whole sealed file, read back to end of file after sealing (so bytes added through the fd before the seals are digested too), using the same formula as `executable_digest`. A digest frozen at mint with `executable_digest` therefore matches an unchanged program. A file changed between `which` and the copy gives a different digest, so the PEP denies it.
 3. **Run.** `ResolvedExecutable.run(args, *, interpreter=None, **subprocess_kwargs)` runs `/proc/self/fd/<fd>` with the memfd in `pass_fds`, and returns the `subprocess.CompletedProcess`:
    - when `interpreter` is a string, it runs `[interpreter, "/proc/self/fd/<fd>", *args]`;
    - when `interpreter` is another `ResolvedExecutable`, it runs that one's fd as the interpreter, and both fds are passed to the child.
 
-   Caller-supplied `pass_fds` are merged, not replaced. `shell=` and `executable=` are refused with `TypeError`, because either would let the caller run something other than the copy. `subprocess.run(["/bin/false"], executable="/bin/true")` runs `/bin/true`.
+   Caller-supplied `pass_fds` are merged, not replaced. `shell=`, `executable=` and `preexec_fn` are refused with `TypeError`, because each would let the caller run something other than the copy. `subprocess.run(["/bin/false"], executable="/bin/true")` runs `/bin/true`.
 4. **Host pattern.** The host opens one handle per invoke. The same handle serves the observer and the tool:
 
    ```python

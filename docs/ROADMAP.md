@@ -2,7 +2,7 @@
 
 Brand: **Agent Control Lab**. Licence: **Apache-2.0**. This is a public-goods reference PEP, not a shipping product.
 
-Versions below are **lab milestones**, not a vendor SKU. Package `0.6.0` lets an approval bind the implementation resolved at mint (ADR-0004). `0.5.0` binds every standing capability token to its policy-listed, host-attested holders, and moves the stub policy to `0.2.0-stub` (ADR-0003). `0.4.0` binds every approval to a host-attested principal (ADR-0002). `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt attests `policy_version: 0.2.0-stub` (it was `0.1.0-stub` before 0.5.0).
+Versions below are **lab milestones**, not a vendor SKU. Package `0.7.0` adds a host helper that executes the sealed copy it digested (ADR-0005). `0.6.0` lets an approval bind the implementation resolved at mint (ADR-0004). `0.5.0` binds every standing capability token to its policy-listed, host-attested holders, and moves the stub policy to `0.2.0-stub` (ADR-0003). `0.4.0` binds every approval to a host-attested principal (ADR-0002). `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt attests `policy_version: 0.2.0-stub` (it was `0.1.0-stub` before 0.5.0).
 
 ## stub (published 0.1)
 
@@ -119,7 +119,7 @@ Same PEP trust domain. [ADR-0003](adr/ADR-0003-capability-token-principal-bindin
 
 Still open at 0.5.0: an in-process caller can pass any principal; the published policy lists every token id, holder and expiry; shared holder lists are shared; expiry policy is unchanged.
 
-## v0.6.0 / approval implementation binding (this tree)
+## v0.6.0 / approval implementation binding
 
 Same PEP trust domain. [ADR-0004](adr/ADR-0004-approval-implementation-binding.md) lets a single-use approval bind the implementation its tool name resolves to at mint. Before this release, a `PATH` reorder between mint and tool entry ran a different program under the same grant (`test_path_resolution_substitution_is_residual`).
 
@@ -133,7 +133,20 @@ Same PEP trust domain. [ADR-0004](adr/ADR-0004-approval-implementation-binding.m
 | Receipt schema stays frozen v1 (new reason code only); corpus receipts and `POLICY_VERSION` unchanged | Required invariant |
 | Measured added cost of a bound `gated_invoke` with `executable_digest`: 129.7 µs median over 2,000 runs, local container | Measured |
 
-Still open: grants minted without a digest; the check-to-exec race after the entry check; implementations that were already unsafe at mint; capability-token invokes, which have no mint moment (a per-tool policy pin is a candidate later ADR); a host that misreports its observation. No sibling pin needs to move, because the change is additive.
+Still open at 0.6.0: grants minted without a digest; the check-to-exec race after the entry check (narrowed in 0.7.0); implementations that were already unsafe at mint; capability-token invokes, which have no mint moment (a per-tool policy pin is a candidate later ADR); a host that misreports its observation. No sibling pin needs to move, because the change is additive.
+
+## v0.7.0 / execute what was digested (this tree)
+
+Same PEP trust domain. [ADR-0005](adr/ADR-0005-execute-the-digested-artefact.md) narrows ADR-0004's check-to-exec race for hosts that use a new helper. The PEP core, reason codes, receipts and `POLICY_VERSION` are unchanged.
+
+| Work | Status |
+| --- | --- |
+| `open_executable(name)` copies the resolved program into a memfd (`MFD_EXEC` passed as a literal, retried without it on `EINVAL`), sets `0o500`, seals write, grow, shrink and seal, and digests the whole sealed file with `executable_digest`'s formula | In tree |
+| `ResolvedExecutable.run()` executes `/proc/self/fd/<n>`, merges caller `pass_fds`, refuses `shell=`, `executable=` and `preexec_fn`, and can run the copy under a pinned interpreter handle; `combined_digest()` binds script and interpreter | In tree |
+| Fail closed: no memfd, sealing or `/proc`, a kernel that refuses an executable memfd, or a source that is not a regular file raises `ImplementationUnavailable`; there is no fallback to exec by path | In tree |
+| Measured added cost of `open_executable` over `executable_digest`: 16 µs median on the test script; 1.1 ms on a 1.4 MB binary, where hashing alone is 1.8 ms (over the provisional 1 ms ceiling for ADR-0004's helper too) | Measured |
+
+Still open: hosts that do not use the helper; what the program loads by path; unpinned `#!/usr/bin/env` interpreters; platforms other than Linux; an LSM that blocks exec from memfd (not observed); equivalent-access attackers.
 
 ## Remaining v1 notes
 
