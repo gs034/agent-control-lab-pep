@@ -115,6 +115,7 @@ def runtime_for_spec(spec: Mapping[str, Any]) -> tuple[PepRuntime, datetime | No
             now=issued_at,
             catalog=None if policy_name == "empty" else policy.allowed_tools(),
             state_digest=grant.get("state_digest"),
+            principal=grant.get("principal"),
         )
         if grant.get("consumed"):
             reason = approvals.try_consume(
@@ -123,6 +124,8 @@ def runtime_for_spec(spec: Mapping[str, Any]) -> tuple[PepRuntime, datetime | No
                 now=issued_at,
                 args=record.frozen_args,
                 state_digest=record.state_digest,
+                principal=record.principal,
+                envelope_identity=record.principal,
             )
             if reason is not None:
                 raise ValueError(f"could not pre-consume fixture approval: {reason}")
@@ -148,7 +151,7 @@ def evaluate_corpus_row(row: CorpusRow) -> Decision:
     if finished is not None:
         decision, _result = finished
         return decision
-    return evaluate(row.envelope, runtime=runtime, now=now)
+    return evaluate(row.envelope, runtime=runtime, now=now, principal=_principal(row))
 
 
 def gated_corpus_row(row: CorpusRow, tool) -> tuple[Decision, Any]:
@@ -156,7 +159,7 @@ def gated_corpus_row(row: CorpusRow, tool) -> tuple[Decision, Any]:
     finished = _finish_after_kill(row, runtime, now, tool)
     if finished is not None:
         return finished
-    return gated_invoke(row.envelope, tool, runtime=runtime, now=now)
+    return gated_invoke(row.envelope, tool, runtime=runtime, now=now, principal=_principal(row))
 
 
 def _finish_after_kill(row: CorpusRow, runtime, now, tool):
@@ -166,9 +169,17 @@ def _finish_after_kill(row: CorpusRow, runtime, now, tool):
         return None
     if marker != "kill":
         raise ValueError(f"unknown corpus complete_after: {marker}")
-    pending = begin_invoke(row.envelope, runtime=runtime, now=now)
+    pending = begin_invoke(row.envelope, runtime=runtime, now=now, principal=_principal(row))
     runtime.kill()
     return complete_invoke(pending, tool)
+
+
+def _principal(row: CorpusRow) -> str | None:
+    """The principal the fixture host attests for this row (ADR-0002)."""
+    principal = row.runtime_spec.get("principal")
+    if principal is not None and not isinstance(principal, str):
+        raise ValueError("corpus runtime principal must be a string")
+    return principal
 
 
 def _refuse_tool() -> None:

@@ -2,7 +2,7 @@
 
 Brand: **Agent Control Lab**. Licence: **Apache-2.0**. This is a public-goods reference PEP, not a shipping product.
 
-Versions below are **lab milestones**, not a vendor SKU. Package `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt still attests `policy_version: 0.1.0-stub`.
+Versions below are **lab milestones**, not a vendor SKU. Package `0.5.0` binds every standing capability token to its policy-listed, host-attested holders, and moves the stub policy to `0.2.0-stub` (ADR-0003). `0.4.0` binds every approval to a host-attested principal (ADR-0002). `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt attests `policy_version: 0.2.0-stub` (it was `0.1.0-stub` before 0.5.0).
 
 ## stub (published 0.1)
 
@@ -88,6 +88,36 @@ Same PEP trust domain. Binding `tool_name` plus canonical args closes the Loopja
 | Official `python -m pep.demo` DENY unchanged | Required invariant |
 
 Still open: the digest is host-computed. With the observer the read happens inside the approval store's consume step, after the grant has passed its other checks, and again at tool entry in `complete_invoke`, which narrows the window between check and use to the re-observation itself; without it the envelope value is whatever the host wrote when it built the envelope. In both cases the PEP does not read the target and cannot verify that the host's observer digests the right object; a host that lies is outside the trust domain like a caller that skips `gated_invoke`. What counts as "the state" is the operator's definition at mint time, not the PEP's.
+
+## v0.4.0 / approval principal binding
+
+Same PEP trust domain. [ADR-0002](adr/ADR-0002-approval-principal-binding.md) closes the Delegation class from Approval Laundering ([arXiv:2609.38983v1](https://arxiv.org/abs/2609.38983v1), class inspiration only; not a measured ASR claim). Before this release, an approval was a bearer grant that any caller presenting the id could spend.
+
+| Work | Status |
+| --- | --- |
+| `issue_approval(..., principal=)` is required; mint without a valid principal raises `ApprovalError` | In tree |
+| Host-attested `principal=` on `evaluate` / `begin_invoke` / `gated_invoke` / `consume` / `try_consume`. It is never read from the envelope. On the `evaluate` route a malformed value is `envelope_invalid`; a direct `consume` call treats it as a mismatch | In tree |
+| Principal check under the store lock, straight after the lookup. A missing or wrong principal, or an envelope identity that disagrees, is `approval_principal_mismatch`, does not consume, and the detail names no identity | In tree |
+| Corpus fixtures name the grant principal and the attested principal; envelopes and expected receipts are unchanged | In tree |
+| Receipt schema stays frozen v1 (new reason code only) | Required invariant |
+| Joint-eval `story.py` passes a principal; joint-eval and console pins move to the 0.4.0 commit | Pending (separate change) |
+
+Still open at 0.4.0: an in-process caller can pass any principal; standing capability tokens were still bearer (closed in 0.5.0); effects below the tool boundary are unchanged.
+
+## v0.5.0 / capability token holders (this tree)
+
+Same PEP trust domain. [ADR-0003](adr/ADR-0003-capability-token-principal-binding.md) removes the bearer property of standing capability tokens. Before this release a token was multi-use, its id was a public policy key, and the deny details told any caller whether a guessed id existed and what state it was in.
+
+| Work | Status |
+| --- | --- |
+| Every `capability_tokens` record lists `principals`, a non-empty array of identities. If it is missing, empty, not an array or holds a malformed entry, the record authorises nobody | In tree |
+| `_capability_deny` checks for a host-attested principal before the lookup (`no attested principal`). An unknown token, a non-holder and a disagreeing envelope identity then all give one detail, `capability token not valid for this caller`. Only holders reach the expiry, coverage and required-capability checks | In tree |
+| Stub tokens list `lab.demo.agent`; `POLICY_VERSION` is `0.2.0-stub`; fixture envelopes carry the new version | In tree |
+| `scripts/regen_corpus_receipts.py` rewrites the compared receipt fields and `envelope_hash` from live evaluation and keeps timestamps; `--check` exits 1 on drift | In tree |
+| Receipt schema stays frozen v1 (no new reason code) | Required invariant |
+| joint-eval and console attest principals for token callers; their pins move to the merged pep commit together with the ADR-0002 change | Pending (one combined sibling change) |
+
+Still open: an in-process caller can pass any principal; the published policy lists every token id, holder and expiry; shared holder lists are shared; expiry policy is unchanged.
 
 ## Remaining v1 notes
 

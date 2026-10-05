@@ -21,12 +21,17 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal, Mapping
 
-from pep.approval import ApprovalRecord, ApprovalStore
+from pep.approval import ApprovalRecord, ApprovalStore, is_principal
 from pep.canonical import sha256_prefixed
 from pep.envelope import EnvelopeError, InvokeEnvelope, parse_envelope
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore, args_match_schema, parse_expiry
-from pep.reasons import ADMISSION_CONSUMED_DETAIL, LATE_EFFECT_FENCE_DETAIL, ReasonCode
+from pep.reasons import (
+    ADMISSION_CONSUMED_DETAIL,
+    LATE_EFFECT_FENCE_DETAIL,
+    NO_ATTESTED_PRINCIPAL_DETAIL,
+    ReasonCode,
+)
 from pep.receipt import Receipt, issue_receipt
 
 
@@ -294,12 +299,14 @@ class PepRuntime:
         approval_id: str | None = None,
         now: datetime | None = None,
         state_digest: str | None = None,
+        principal: str | None = None,
     ) -> ApprovalRecord:
         """Mint a single-use TTL approval bound to one allowlisted invoke.
 
         ``state_digest`` optionally freezes a host-computed digest of the state
         the invoke acts on; consume then requires the host-observed digest to
-        match.
+        match. ``principal`` binds the grant to the one caller the host will
+        attest at consume (ADR-0002).
         """
         return self._approvals.issue(
             tools=(tool_name,),
@@ -309,6 +316,7 @@ class PepRuntime:
             now=now,
             catalog=self._policy.allowed_tools(),
             state_digest=state_digest,
+            principal=principal,
         )
 
     def evaluate(
@@ -317,9 +325,15 @@ class PepRuntime:
         *,
         now: datetime | None = None,
         state_observer: Callable[[], object] | None = None,
+        principal: str | None = None,
         _before_allow: Callable[[], None] | None = None,
     ) -> Decision:
         """Evaluate one structured envelope.
+
+        ``principal`` is the host-attested caller (ADR-0002): the identity the
+        host assigned to this caller session, passed by the host and never
+        read from the envelope. Every approval needs it; a malformed value
+        is ``envelope_invalid``.
 
         ``state_observer`` is the host's read of the current digest of the
         state the invoke acts on. When the referenced approval froze a state
@@ -377,6 +391,15 @@ class PepRuntime:
 
         env_hash = parsed.digest()
 
+        if principal is not None and not is_principal(principal):
+            return _deny(
+                ReasonCode.ENVELOPE_INVALID,
+                "attested principal is malformed; fail-closed deny",
+                env_hash,
+                version,
+                policy.bytes_unchanged(),
+            )
+
         if parsed.has_untrusted_prose():
             return _deny(
                 ReasonCode.AGENT_PROSE_REJECTED,
@@ -432,7 +455,9 @@ class PepRuntime:
 
         required_cap = spec.get("required_capability")
         if token:
-            denied = _capability_deny(policy, parsed, token, required_cap, clock)
+            denied = _capability_deny(
+                policy, parsed, token, required_cap, clock, principal=principal
+            )
             if denied is not None:
                 reason, detail = denied
                 return _deny(reason, detail, env_hash, version, policy.bytes_unchanged())
@@ -472,6 +497,8 @@ class PepRuntime:
                 args=parsed.args,
                 state_digest=parsed.state_digest,
                 observe=state_observer,
+                principal=principal,
+                envelope_identity=parsed.caller_identity,
             )
             frozen_state = consumed.frozen_state_digest
             if consumed.reason is not None:
@@ -541,16 +568,29 @@ class PepRuntime:
             )
 
 
+_CAPABILITY_NOT_FOR_CALLER = "capability token not valid for this caller"
+
+
 def _capability_deny(
     policy: PolicyStore,
     parsed: InvokeEnvelope,
     token: str,
     required_cap: Any,
     clock: datetime,
+    *,
+    principal: str | None,
 ) -> tuple[ReasonCode, str] | None:
+    # ADR-0003: a token may be presented only by a principal its policy
+    # record lists, attested by the host, with an agreeing envelope identity.
+    # The attestation check comes before the lookup, and the lookup and holder
+    # check share one detail, so a non-holder learns nothing from the
+    # response: not whether the id exists, nor its expiry or coverage.
+    if principal is None:
+        return ReasonCode.CAPABILITY_MISSING, NO_ATTESTED_PRINCIPAL_DETAIL
     cap = policy.capability(token)
-    if cap is None:
-        return ReasonCode.CAPABILITY_MISSING, "capability token unknown"
+    holders = _capability_holders(cap.get("principals")) if cap is not None else frozenset()
+    if principal not in holders or parsed.caller_identity != principal:
+        return ReasonCode.CAPABILITY_MISSING, _CAPABILITY_NOT_FOR_CALLER
     expires_at = cap.get("expires_at")
     if not isinstance(expires_at, str):
         return ReasonCode.CAPABILITY_MISSING, "capability record missing expires_at; fail-closed"
@@ -566,6 +606,17 @@ def _capability_deny(
     if required_cap and token != required_cap:
         return ReasonCode.POLICY_MISS, "capability token does not match tool policy"
     return None
+
+
+def _capability_holders(value: Any) -> frozenset[str]:
+    """Valid holder set, or empty (authorises nobody).
+
+    Only a list or tuple of well-formed identities counts; a bare string,
+    mapping, set or any malformed entry authorises nobody.
+    """
+    if not isinstance(value, (list, tuple)) or not all(is_principal(item) for item in value):
+        return frozenset()
+    return frozenset(value)
 
 
 def _mode_to_halt(mode: RuntimeMode) -> HaltMode:
@@ -598,12 +649,17 @@ def evaluate(
     *,
     now: datetime | None = None,
     state_observer: Callable[[], object] | None = None,
+    principal: str | None = None,
     _before_allow: Callable[[], None] | None = None,
 ) -> Decision:
     """Evaluate a structured envelope. Always returns a Decision; never invokes."""
     pep = resolve_runtime(runtime)
     return pep.evaluate(
-        envelope, now=now, state_observer=state_observer, _before_allow=_before_allow
+        envelope,
+        now=now,
+        state_observer=state_observer,
+        principal=principal,
+        _before_allow=_before_allow,
     )
 
 

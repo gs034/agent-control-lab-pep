@@ -1,5 +1,6 @@
 {
   "complete_after": "kill",
   "mode": "active",
-  "policy": "demo"
+  "policy": "demo",
+  "principal": "lab.demo.agent"
 }

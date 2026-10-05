@@ -1,7 +1,7 @@
 {
   "brand": "Agent Control Lab",
   "decision": "ALLOW",
-  "envelope_hash": "sha256:94f59dc185fe976cab53f68a707470e2e4e0e99950c472ec9982b9089496b39c",
+  "envelope_hash": "sha256:ec2b7b75f7ad3da6186da9aa1c33b19130207e7833a404a7c899fb4be783df51",
   "eval_ref": "ACL_PEP_Eval_Row_2609_19587_class_2026-09-18",
   "fail_closed": true,
   "judge": {
@@ -16,7 +16,7 @@
     "tool_invoke_executed": false
   },
   "pep_id": "acl-pep-stub-host-runtime-001",
-  "policy_version": "0.1.0-stub",
+  "policy_version": "0.2.0-stub",
   "reason_code": "allowed",
   "reason_detail": "structured envelope matched static allowlist",
   "receipt_type": "pep_allow",

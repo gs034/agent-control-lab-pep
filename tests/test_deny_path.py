@@ -9,6 +9,9 @@ from pep.gate import gated_invoke
 from pep.policy import DEMO_POLICY, POLICY_VERSION, PolicyStore
 from pep.reasons import ReasonCode
 
+# ADR-0003: the principal the test host attests; a listed holder of lab.cap.echo.demo.
+HOST = "lab.demo.agent"
+
 
 def _base(**overrides):
     env = {
@@ -29,7 +32,7 @@ def test_unknown_tool_with_token_is_unknown_tool():
         called["n"] += 1
         return "nope"
 
-    decision, result = gated_invoke(_base(tool_name="shell.exec"), boom)
+    decision, result = gated_invoke(_base(tool_name="shell.exec"), boom, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.UNKNOWN_TOOL
     assert result is None
@@ -45,38 +48,48 @@ def test_unknown_tool_without_capability_uses_dr_reason():
     assert decision.receipt.reason_code == ReasonCode.TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY
 
 
-def test_caller_is_not_allow_authority():
-    decision = evaluate(_base(caller_identity="lab.other.agent"))
-    assert decision.verdict == "ALLOW"
+def test_caller_identity_string_is_not_allow_authority():
+    """ADR-0003: the envelope identity never authorises. A holder identity in
+    the envelope without host attestation is DENY; an envelope identity that
+    disagrees with the attested holder is DENY; only the attested holder with
+    an agreeing envelope is ALLOW."""
+    unattested = evaluate(_base())
+    assert unattested.verdict == "DENY"
+    assert unattested.receipt.reason_code == ReasonCode.CAPABILITY_MISSING
+    disagreeing = evaluate(_base(caller_identity="lab.other.agent"), principal=HOST)
+    assert disagreeing.verdict == "DENY"
+    assert disagreeing.receipt.reason_code == ReasonCode.CAPABILITY_MISSING
+    attested = evaluate(_base(), principal=HOST)
+    assert attested.verdict == "ALLOW"
 
 
 def test_policy_miss_bad_args():
-    decision = evaluate(_base(args={"message": "hello", "extra": True}))
+    decision = evaluate(_base(args={"message": "hello", "extra": True}), principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.POLICY_MISS
 
 
 def test_policy_miss_empty_store():
     runtime = PepRuntime(policy=PolicyStore.empty())
-    decision = evaluate(_base(), runtime=runtime)
+    decision = evaluate(_base(), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.POLICY_MISS
 
 
 def test_capability_missing():
-    decision = evaluate(_base(capability_token=None))
+    decision = evaluate(_base(capability_token=None), principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.CAPABILITY_MISSING
 
 
 def test_capability_expired():
-    decision = evaluate(_base(capability_token="lab.cap.echo.expired"))
+    decision = evaluate(_base(capability_token="lab.cap.echo.expired"), principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.CAPABILITY_MISSING
 
 
 def test_capability_unknown():
-    decision = evaluate(_base(capability_token="lab.cap.not.issued"))
+    decision = evaluate(_base(capability_token="lab.cap.not.issued"), principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.CAPABILITY_MISSING
 
@@ -88,7 +101,7 @@ def test_allow_structured_echo_invokes():
         called["n"] += 1
         return "ok"
 
-    decision, result = gated_invoke(_base(), echo)
+    decision, result = gated_invoke(_base(), echo, principal=HOST)
     assert decision.verdict == "ALLOW"
     assert decision.receipt.reason_code == ReasonCode.ALLOWED
     assert result == "ok"

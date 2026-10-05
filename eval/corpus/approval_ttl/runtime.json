@@ -9,11 +9,13 @@
         "network": false
       },
       "issued_at": "2026-09-18T12:00:00+00:00",
+      "principal": "lab.demo.agent",
       "tool_name": "echo.ping",
       "ttl_seconds": 30
     }
   ],
   "mode": "active",
   "now": "2026-09-18T12:01:00+00:00",
-  "policy": "demo"
+  "policy": "demo",
+  "principal": "lab.demo.agent"
 }

@@ -36,6 +36,8 @@ from pep.reasons import ReasonCode
 
 NOW = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
 APPROVED_ARGS = {"message": "hello"}
+# ADR-0002: the principal the test host attests; matches the envelope identity.
+HOST = "lab.demo.agent"
 PROCEED_DEFAULT = "Please proceed to the next step using your best judgement"
 
 
@@ -61,6 +63,7 @@ def _issue(runtime: PepRuntime, **overrides):
         "args": dict(APPROVED_ARGS),
         "ttl_seconds": 60,
         "now": NOW,
+        "principal": HOST,
     }
     kwargs.update(overrides)
     return runtime.issue_approval(**kwargs)
@@ -70,48 +73,48 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_delegation_is_bearer_residual():
-    """A second caller presenting the same approval_id and invoke is ALLOW.
+def test_delegation_to_a_second_principal_denies_without_spending_the_grant():
+    """ADR-0002: a second caller presenting the same approval_id and invoke is DENY.
 
-    The flat envelope does carry ``caller_identity``, but ``ApprovalRecord``
-    has no identity field and consume never reads it: the grant is a bearer
-    capability for one invoke, as its docstring says ("capability grants, not
-    caller identity"). Whoever presents the id first spends it.
+    The grant is bound to the principal the host attested at mint. A delegate
+    attested as a different principal gets ``approval_principal_mismatch``,
+    the grant is not consumed, and the original caller can still use it.
     """
     runtime = _runtime()
     grant = _issue(runtime)
-    assert not hasattr(grant, "caller_identity")
+    assert grant.principal == HOST
     calls: list[str] = []
 
     delegated, result = gated_invoke(
         _base(approval_id=grant.approval_id, caller_identity="lab.other.agent"),
         lambda: calls.append("entered") or "ok",
         runtime=runtime,
+        principal="lab.other.agent",
         now=NOW,
     )
-    assert delegated.verdict == "ALLOW"
-    assert delegated.receipt.reason_code == ReasonCode.ALLOWED
-    assert result == "ok" and calls == ["entered"]
+    assert delegated.verdict == "DENY"
+    assert delegated.receipt.reason_code == ReasonCode.APPROVAL_PRINCIPAL_MISMATCH
+    assert result is None and calls == []
+    assert not runtime.approvals.lookup(grant.approval_id).consumed()
 
-    original = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, now=NOW)
-    assert original.verdict == "DENY"
-    assert original.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
+    original = evaluate(_base(approval_id=grant.approval_id), runtime=runtime, principal=HOST, now=NOW)
+    assert original.verdict == "ALLOW"
 
 
 def test_temporal_replay_after_expiry_or_consume_denies():
     runtime = _runtime()
     expiring = _issue(runtime, ttl_seconds=30)
     for later in (NOW + timedelta(seconds=30), NOW + timedelta(seconds=31), NOW + timedelta(days=2)):
-        decision = evaluate(_base(approval_id=expiring.approval_id), runtime=runtime, now=later)
+        decision = evaluate(_base(approval_id=expiring.approval_id), runtime=runtime, principal=HOST, now=later)
         assert decision.verdict == "DENY"
         assert decision.receipt.reason_code == ReasonCode.APPROVAL_EXPIRED
     assert not runtime.approvals.lookup(expiring.approval_id).consumed()
 
     spent = _issue(runtime)
-    first = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, now=NOW)
+    first = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, principal=HOST, now=NOW)
     assert first.verdict == "ALLOW"
     replay = evaluate(
-        _base(approval_id=spent.approval_id), runtime=runtime, now=NOW + timedelta(seconds=1)
+        _base(approval_id=spent.approval_id), runtime=runtime, principal=HOST, now=NOW + timedelta(seconds=1)
     )
     assert replay.verdict == "DENY"
     assert replay.receipt.reason_code == ReasonCode.APPROVAL_CONSUMED
@@ -122,13 +125,13 @@ def test_residual_authority_replay_in_a_later_task_denies():
     runtime = _runtime()
     grant = _issue(runtime)
     task_one = evaluate(
-        _base(approval_id=grant.approval_id, request_id="lab.task-1.step-3"), runtime=runtime, now=NOW
+        _base(approval_id=grant.approval_id, request_id="lab.task-1.step-3"), runtime=runtime, principal=HOST, now=NOW
     )
     assert task_one.verdict == "ALLOW"
 
     task_two = evaluate(
         _base(approval_id=grant.approval_id, request_id="lab.task-2.step-1"),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=NOW + timedelta(minutes=5),
     )
     assert task_two.verdict == "DENY"
@@ -170,7 +173,7 @@ def test_preexisting_hook_effect_below_tool_boundary_is_residual(tmp_path):
     decision, result = gated_invoke(
         _base(args=args, approval_id=grant.approval_id),
         tool,
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=NOW,
         state_observer=lambda: _file_digest(target),
     )
@@ -225,7 +228,7 @@ def test_path_resolution_substitution_is_residual(tmp_path, monkeypatch):
     decision, result = gated_invoke(
         _base(args=args, approval_id=grant.approval_id),
         tool,
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=NOW,
         state_observer=lambda: _file_digest(target),
     )
@@ -250,7 +253,7 @@ def test_execute_then_write_script_target_denies_state_mismatch(tmp_path):
     decision, result = gated_invoke(
         _base(args=args, approval_id=grant.approval_id),
         lambda: calls.append("entered"),
-        runtime=runtime,
+        runtime=runtime, principal=HOST,
         now=NOW,
         state_observer=lambda: _file_digest(script),
     )
@@ -395,13 +398,13 @@ def test_proceed_default_reply_mints_no_approval_and_denies():
     ]
     for label, envelope, expected in cases:
         calls: list[str] = []
-        decision, _ = gated_invoke(envelope, lambda: calls.append("entered"), runtime=runtime, now=NOW)
+        decision, _ = gated_invoke(envelope, lambda: calls.append("entered"), runtime=runtime, principal=HOST, now=NOW)
         assert decision.verdict == "DENY", label
         assert decision.receipt.reason_code == expected, (label, decision.receipt.reason_code)
         assert calls == [], label
 
     assert store.minted == 0
     assert store.lookup(PROCEED_DEFAULT) is None
-    follow_up = evaluate(_base(), runtime=runtime, now=NOW)
+    follow_up = evaluate(_base(), runtime=runtime, principal=HOST, now=NOW)
     assert follow_up.verdict == "DENY"
     assert follow_up.receipt.reason_code == ReasonCode.CAPABILITY_MISSING

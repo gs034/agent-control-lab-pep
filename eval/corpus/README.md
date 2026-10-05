@@ -10,7 +10,7 @@ existence-proof deny remains at the `eval/` root
 Each corpus row is:
 
 - a Lab structured envelope
-- a runtime fixture (policy / halt mode / single-use approvals)
+- a runtime fixture (policy / halt mode / single-use approvals). Since ADR-0002, each approval fixture names the `principal` it is bound to, and the runtime fixture's top-level `principal` is the identity the fixture host attests when it evaluates the row. Since ADR-0003 the attested principal also decides whether a presented capability token may be used, so token rows that reach the capability check (`allow_catalog_bound`, `late_effect_fence`, `capability_spoof`) attest one too. After a fixture change, run `python scripts/regen_corpus_receipts.py` and review the diff.
 - an expected receipt matching frozen schema v1
 
 Enforcement is `pep.evaluate` / `pep.gated_invoke`. This directory is not a

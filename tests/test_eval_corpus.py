@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -105,8 +106,9 @@ def test_exact_approval_bind_allows_then_replay_consumed():
     assert len(rows) == 1
     row = rows[0]
     runtime, now = runtime_for_spec(row.runtime_spec)
-    first = evaluate(row.envelope, runtime=runtime, now=now)
-    replay = evaluate(row.envelope, runtime=runtime, now=now)
+    host = row.runtime_spec["principal"]
+    first = evaluate(row.envelope, runtime=runtime, now=now, principal=host)
+    replay = evaluate(row.envelope, runtime=runtime, now=now, principal=host)
     assert first.verdict == "ALLOW"
     assert first.receipt.reason_code == "allowed"
     assert replay.verdict == "DENY"
@@ -199,6 +201,17 @@ def test_runtime_spec_pre_consumes_a_state_bound_grant():
     spec = json.loads(json.dumps(replay_row.runtime_spec))
     spec["approvals"][0]["state_digest"] = "sha256:" + "ab" * 32
     runtime, now = runtime_for_spec(spec)
-    decision = evaluate(replay_row.envelope, runtime=runtime, now=now)
+    decision = evaluate(
+        replay_row.envelope, runtime=runtime, now=now, principal=spec["principal"]
+    )
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == "approval_consumed"
+
+
+def test_runtime_spec_rejects_non_string_principal():
+    replay_row = next(row for row in list_corpus_rows() if row.row_id == "acl-pep-eval-approval-replay-001")
+    spec = json.loads(json.dumps(replay_row.runtime_spec))
+    spec["principal"] = 7
+    row = replace(replay_row, runtime_spec=spec)
+    with pytest.raises(ValueError):
+        evaluate_corpus_row(row)

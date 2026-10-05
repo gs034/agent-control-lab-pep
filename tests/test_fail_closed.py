@@ -9,6 +9,9 @@ from pep.gate import gated_invoke
 from pep.policy import DEMO_POLICY
 from pep.reasons import ReasonCode
 
+# ADR-0003: the principal the test host attests; a listed holder of lab.cap.echo.demo.
+HOST = "lab.demo.agent"
+
 
 def _valid():
     return {
@@ -28,7 +31,7 @@ def test_kill_active_denies_allowlisted_invoke():
         called["n"] += 1
         return "nope"
 
-    decision, result = gated_invoke(_valid(), boom, runtime=runtime)
+    decision, result = gated_invoke(_valid(), boom, runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
     assert result is None
@@ -38,7 +41,7 @@ def test_kill_active_denies_allowlisted_invoke():
 def test_pep_unavailable_is_kill_active():
     runtime = PepRuntime(policy=DEMO_POLICY)
     runtime.mark_unavailable()
-    decision = evaluate(_valid(), runtime=runtime)
+    decision = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
     assert decision.receipt.policy_file_unchanged is True
@@ -47,7 +50,7 @@ def test_pep_unavailable_is_kill_active():
 def test_activate_kill_after_construct():
     runtime = PepRuntime()
     runtime.activate_kill()
-    decision = evaluate(_valid(), runtime=runtime)
+    decision = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
 
@@ -56,11 +59,11 @@ def test_suspend_denies_and_resume_restores_allow():
     runtime = PepRuntime(policy=DEMO_POLICY)
     runtime.suspend()
     assert runtime.suspend_active is True
-    denied = evaluate(_valid(), runtime=runtime)
+    denied = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert denied.verdict == "DENY"
     assert denied.receipt.reason_code == ReasonCode.SUSPEND_ACTIVE
     runtime.resume()
-    allowed = evaluate(_valid(), runtime=runtime)
+    allowed = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert allowed.verdict == "ALLOW"
     assert allowed.receipt.reason_code == ReasonCode.ALLOWED
 
@@ -69,7 +72,7 @@ def test_resume_cannot_clear_kill():
     runtime = PepRuntime(policy=DEMO_POLICY)
     runtime.kill()
     runtime.resume()
-    decision = evaluate(_valid(), runtime=runtime)
+    decision = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
     assert runtime.kill_active is True
@@ -79,7 +82,7 @@ def test_kill_wins_over_later_suspend():
     runtime = PepRuntime(policy=DEMO_POLICY)
     runtime.kill()
     runtime.suspend()
-    decision = evaluate(_valid(), runtime=runtime)
+    decision = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
     assert runtime.mode.value == "killed"
@@ -90,6 +93,6 @@ def test_suspend_then_kill_stays_killed():
     runtime.suspend()
     runtime.kill()
     runtime.resume()
-    decision = evaluate(_valid(), runtime=runtime)
+    decision = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE

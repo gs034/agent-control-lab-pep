@@ -1,4 +1,5 @@
 {
   "mode": "active",
-  "policy": "demo"
+  "policy": "demo",
+  "principal": "lab.demo.agent"
 }
