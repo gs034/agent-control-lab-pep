@@ -70,10 +70,24 @@ _BINDING_ARGS = {"message": "implementation-binding"}
 
 # scenario, version that introduced the behaviour, then the expected outcome.
 _BINDING_SCENARIOS = (
-    ("unbound grant, PATH changed after approval", "before 0.6.0", "ALLOW", "program-b", True),
-    ("bound grant, PATH changed after approval", "0.6.0 (ADR-0004)", "DENY", None, False),
-    ("bound grant, PATH changed inside the tool, host runs by path", "0.6.0 residual", "ALLOW", "program-b", True),
-    ("bound grant, PATH changed inside the tool, host uses open_executable", "0.7.0 (ADR-0005)", "ALLOW", "program-a", True),
+    ("unbound grant, PATH changed after approval", "before 0.6.0", "ALLOW", "allowed", "program-b", True),
+    (
+        "bound grant, PATH changed after approval",
+        "0.6.0 (ADR-0004)",
+        "DENY",
+        ReasonCode.APPROVAL_IMPLEMENTATION_MISMATCH,
+        None,
+        False,
+    ),
+    ("bound grant, PATH changed inside the tool, host runs by path", "0.6.0 residual", "ALLOW", "allowed", "program-b", True),
+    (
+        "bound grant, PATH changed inside the tool, host uses open_executable",
+        "0.7.0 (ADR-0005)",
+        "ALLOW",
+        "allowed",
+        "program-a",
+        True,
+    ),
 )
 
 
@@ -99,7 +113,7 @@ def exercise_implementation_binding() -> list[dict[str, Any]]:
 
 
 def _binding_scenario(index: int, a_first: str, b_first: str, *, bound: bool, swap_in_tool: bool, helper: bool) -> dict[str, Any]:
-    name, since, verdict, ran, consumed = _BINDING_SCENARIOS[index]
+    name, since, verdict, reason, ran, consumed = _BINDING_SCENARIOS[index]
     search = {"path": a_first}
     runtime = PepRuntime(policy=DEMO_POLICY)
     grant = runtime.issue_approval(
@@ -148,17 +162,12 @@ def _binding_scenario(index: int, a_first: str, b_first: str, *, bound: bool, sw
     validate_receipt(receipt)
     observed = {
         "decision": receipt["decision"],
+        "reason_code": receipt["reason_code"],
         "program_ran": result,
         "grant_consumed": runtime.approvals.lookup(grant.approval_id).consumed(),
     }
-    return {
-        "scenario": name,
-        "since": since,
-        **observed,
-        "reason_code": receipt["reason_code"],
-        "as_expected": observed == {"decision": verdict, "program_ran": ran, "grant_consumed": consumed},
-        "receipt": receipt,
-    }
+    expected = {"decision": verdict, "reason_code": str(reason), "program_ran": ran, "grant_consumed": consumed}
+    return {"scenario": name, "since": since, **observed, "as_expected": observed == expected, "receipt": receipt}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,7 +229,12 @@ def _implementation_binding_main() -> int:
     if sys.platform != "linux":
         print("DEMO FAIL: --implementation-binding needs Linux (sealed memfd exec, ADR-0005)", file=sys.stderr)
         return 1
-    results = exercise_implementation_binding()
+    try:
+        results = exercise_implementation_binding()
+    except OSError as exc:
+        # ImplementationUnavailable (for example vm.memfd_noexec = 2) or a temp dir mounted noexec.
+        print(f"DEMO FAIL: cannot run the implementation-binding demo here: {exc}", file=sys.stderr)
+        return 1
     for result in results:
         print(canonical_dumps(result))
     failed = [r["scenario"] for r in results if not r["as_expected"]]

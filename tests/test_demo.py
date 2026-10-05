@@ -54,3 +54,16 @@ def test_implementation_binding_demo_fails_on_an_unexpected_outcome(capsys, monk
     monkeypatch.setattr(demo, "exercise_implementation_binding", lambda: [wrong])
     assert main(["--implementation-binding"]) == 1
     assert "DEMO FAIL" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the implementation-binding demo is Linux only (ADR-0005)")
+def test_implementation_binding_demo_reports_an_unavailable_helper_cleanly(capsys, monkeypatch):
+    import pep.demo as demo
+    from pep.implementation import ImplementationUnavailable
+
+    def unavailable():
+        raise ImplementationUnavailable("kernel policy refuses an executable memfd")
+
+    monkeypatch.setattr(demo, "exercise_implementation_binding", unavailable)
+    assert main(["--implementation-binding"]) == 1
+    assert "DEMO FAIL" in capsys.readouterr().err

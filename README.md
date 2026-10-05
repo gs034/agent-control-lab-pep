@@ -57,7 +57,7 @@ That admits an allowlisted `echo.ping`, calls `kill()`, then completes the admis
 python -m pep.demo --implementation-binding
 ```
 
-That prints one line per scenario, using two programs both named `labtool` and a `PATH` that changes after the approval:
+That prints one line per scenario, using two programs both named `labtool` and a search path, passed to `shutil.which`, that changes after the approval. The process `PATH` is not touched.
 
 | Scenario | Since | Outcome |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ That prints one line per scenario, using two programs both named `labtool` and a
 | Bound grant, `PATH` changed inside the tool, host runs by path | 0.6.0 residual | ALLOW; program B runs |
 | Bound grant, same change, host uses `open_executable` | 0.7.0 (ADR-0005) | ALLOW; program A runs |
 
-It exits non-zero if any outcome differs. The third row is shown on purpose: it is the residual that 0.7.0 closes, and only for hosts that use the helper. Existence proof on fixtures; not live enforcement and not a measured attack-success rate.
+It exits non-zero if any decision, reason code, program run or grant state differs from the table. Each line also carries the receipt; on the ALLOW rows its `tool_invoke_executed` is `false` because the receipt is issued at the decision, before the tool runs. The third row is shown on purpose: it is the residual that 0.7.0 closes, and only for hosts that use the helper. Existence proof on fixtures; not live enforcement and not a measured attack-success rate.
 
 ## Receipt shape
 
