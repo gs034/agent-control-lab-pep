@@ -2,7 +2,7 @@
 
 Brand: **Agent Control Lab**. Licence: **Apache-2.0**. This is a public-goods reference PEP, not a shipping product.
 
-Versions below are **lab milestones**, not a vendor SKU. Package `0.5.0` binds every standing capability token to its policy-listed, host-attested holders, and moves the stub policy to `0.2.0-stub` (ADR-0003). `0.4.0` binds every approval to a host-attested principal (ADR-0002). `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt attests `policy_version: 0.2.0-stub` (it was `0.1.0-stub` before 0.5.0).
+Versions below are **lab milestones**, not a vendor SKU. Package `0.6.0` lets an approval bind the implementation resolved at mint (ADR-0004). `0.5.0` binds every standing capability token to its policy-listed, host-attested holders, and moves the stub policy to `0.2.0-stub` (ADR-0003). `0.4.0` binds every approval to a host-attested principal (ADR-0002). `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt attests `policy_version: 0.2.0-stub` (it was `0.1.0-stub` before 0.5.0).
 
 ## stub (published 0.1)
 
@@ -104,7 +104,7 @@ Same PEP trust domain. [ADR-0002](adr/ADR-0002-approval-principal-binding.md) cl
 
 Still open at 0.4.0: an in-process caller can pass any principal; standing capability tokens were still bearer (closed in 0.5.0); effects below the tool boundary are unchanged.
 
-## v0.5.0 / capability token holders (this tree)
+## v0.5.0 / capability token holders
 
 Same PEP trust domain. [ADR-0003](adr/ADR-0003-capability-token-principal-binding.md) removes the bearer property of standing capability tokens. Before this release a token was multi-use, its id was a public policy key, and the deny details told any caller whether a guessed id existed and what state it was in.
 
@@ -117,7 +117,23 @@ Same PEP trust domain. [ADR-0003](adr/ADR-0003-capability-token-principal-bindin
 | Receipt schema stays frozen v1 (no new reason code) | Required invariant |
 | joint-eval and console attest principals for token callers; their pins move to the merged pep commit together with the ADR-0002 change | Pending (one combined sibling change) |
 
-Still open: an in-process caller can pass any principal; the published policy lists every token id, holder and expiry; shared holder lists are shared; expiry policy is unchanged.
+Still open at 0.5.0: an in-process caller can pass any principal; the published policy lists every token id, holder and expiry; shared holder lists are shared; expiry policy is unchanged.
+
+## v0.6.0 / approval implementation binding (this tree)
+
+Same PEP trust domain. [ADR-0004](adr/ADR-0004-approval-implementation-binding.md) lets a single-use approval bind the implementation its tool name resolves to at mint. Before this release, a `PATH` reorder between mint and tool entry ran a different program under the same grant (`test_path_resolution_substitution_is_residual`).
+
+| Work | Status |
+| --- | --- |
+| `issue_approval(..., implementation_digest=)` is optional per grant; a malformed value raises `ApprovalError` | In tree |
+| Host-only `implementation_observer=` on `evaluate` / `begin_invoke` / `gated_invoke`, and `observe_implementation=` on `consume` / `try_consume`. No envelope field: a top-level `implementation_digest` key is `envelope_invalid` in both shapes, and one inside a lab envelope's `schema_fields` is dropped and never read | In tree |
+| Consume checks it after the binding and before the state check, under the store lock. Missing, raising, non-digest or different observations, and observer re-entry, are `approval_implementation_mismatch` and do not consume. Earlier exits never call the observer | In tree |
+| `complete_invoke` checks the fence, then whether the admission was already spent, then the implementation, then the state. An entry mismatch, including a missing entry observer, denies with the grant spent | In tree |
+| `pep/implementation.py`: optional host helpers `executable_digest` and `callable_digest` | In tree |
+| Receipt schema stays frozen v1 (new reason code only); corpus receipts and `POLICY_VERSION` unchanged | Required invariant |
+| Measured added cost of a bound `gated_invoke` with `executable_digest`: 129.7 µs median over 2,000 runs, local container | Measured |
+
+Still open: grants minted without a digest; the check-to-exec race after the entry check; implementations that were already unsafe at mint; capability-token invokes, which have no mint moment (a per-tool policy pin is a candidate later ADR); a host that misreports its observation. No sibling pin needs to move, because the change is additive.
 
 ## Remaining v1 notes
 

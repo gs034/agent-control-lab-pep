@@ -1,7 +1,7 @@
 # ADR-0004: Bind single-use approvals to the implementation resolved at mint
 
 - **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions".
-- **Implementation:** in progress. Phase 1 (core, helpers and tests) on the ADR-0004 branch. Measured added cost of a bound `gated_invoke` with `executable_digest` on the test program: 129.7 µs median over 2,000 runs (local container), under the 1 ms provisional ceiling.
+- **Implementation:** done in pep 0.6.0, in two phases: phase 1 (core, helpers and tests; pep#16) and phase 2 (docs and version). No sibling pin needs to move. Measured added cost of a bound `gated_invoke` with `executable_digest` on the test program: 129.7 µs median over 2,000 runs (local container), under the 1 ms provisional ceiling.
 - **Date:** 2026-10-05
 - **Depends on:** [ADR-0002](ADR-0002-approval-principal-binding.md) (principal-bound approvals). Independent of [ADR-0003](ADR-0003-capability-token-principal-binding.md).
 - **Amends:** ADR-0001 "Fail-closed" list, which would gain an implementation mismatch; the `docs/threat-model.md` non-goal on program resolution.
