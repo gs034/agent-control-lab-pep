@@ -1,0 +1,13 @@
+Intent: Tool-entry implementation re-check passes when no implementation observer was kept on the admission
+Property: ADR-0004 decision 4: at tool entry 'no observer: DENY'; _implementation_still_matches docstring 'a frozen digest with no observer fails closed'
+--- a/pep/gate.py
++++ b/pep/gate.py
+@@ -146,7 +146,7 @@
+     if frozen is None:
+         return True
+     if pending.implementation_observer is None:
+-        return False
++        return True
+     try:
+         observed = pending.implementation_observer()
+     except Exception:
