@@ -1,0 +1,13 @@
+Intent: state_matches treats an absent observation (None) as nothing to compare and passes it
+Property: Frozen state digest: 'a missing or different digest, is APPROVAL_STATE_MISMATCH and does not consume' (consume docstring); the same helper guards re-observation at entry in gate.py
+--- a/pep/approval.py
++++ b/pep/approval.py
+@@ -371,7 +371,7 @@
+ 
+ def state_matches(frozen: str | None, observed: Any) -> bool:
+     """True when no digest was frozen, or the observation normalises to it."""
+-    return frozen is None or normalize_state_digest(observed) == frozen
++    return frozen is None or observed is None or normalize_state_digest(observed) == frozen
+ 
+ 
+ def normalize_state_digest(value: Any) -> str | None:

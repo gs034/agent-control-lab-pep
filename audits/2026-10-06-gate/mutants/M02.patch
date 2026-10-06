@@ -1,0 +1,13 @@
+Intent: Principal check drops the envelope-identity agreement test, so an envelope naming a different caller can spend the owner's grant
+Property: ADR-0002: host principal matches but envelope identity differs is DENY approval_principal_mismatch, not consumed ('envelope_identity must then equal it', consume docstring)
+--- a/pep/approval.py
++++ b/pep/approval.py
+@@ -364,7 +364,7 @@
+     """
+     if attested is None:
+         return NO_ATTESTED_PRINCIPAL_DETAIL
+-    if bound is None or attested != bound or envelope_identity != attested:
++    if bound is None or attested != bound:
+         return "principal check failed"
+     return None
+ 

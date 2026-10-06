@@ -1,0 +1,13 @@
+Intent: resume() returns any halted mode to ACTIVE, including KILLED, so a kill can be undone and new envelopes are allowed again
+Property: Kill is irreversible: 'resume() cannot clear a kill' (ADR-0001 Kill and suspend); resume docstring 'A killed PEP stays killed'
+--- a/pep/evaluate.py
++++ b/pep/evaluate.py
+@@ -267,7 +267,7 @@
+     def resume(self) -> None:
+         """Clear suspend only. A killed PEP stays killed."""
+         with self._lock:
+-            if self._mode is RuntimeMode.SUSPENDED:
++            if self._mode is not RuntimeMode.ACTIVE:
+                 self._mode = RuntimeMode.ACTIVE
+                 self._persist_halt()
+ 
