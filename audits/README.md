@@ -35,21 +35,21 @@ python scripts/mutation_audit.py run <id>
 python scripts/mutation_audit.py report <id>
 ```
 
-- `freeze` refuses if tracked tests or `pyproject.toml` differ from the commit, if an untracked file sits under `tests/`, if a mutant is malformed or out of scope, or if the audit is already frozen. Commit the mutants and `freeze.json` together, before any run.
-- `run` refuses unless every sealed hash and the Python minor version still match. It runs the unmutated suite first and aborts if it fails. It extracts a fresh copy of the frozen commit for every mutant, checks that the package under test was imported from that copy, and checks the hashes again after each mutant. A run that stops early records nothing. Each audit runs once.
+- `freeze` refuses if tracked tests or `pyproject.toml` differ from the commit, if an untracked file sits under `tests/`, if a mutant is malformed, out of scope or does more than edit one file in place (no rename, mode change or second file; `a/` and `b/` prefixes required), or if the audit is already frozen. Commit the mutants and `freeze.json` together, before any run.
+- `run` refuses unless `audits/<id>/` is fully committed, `freeze.json` appears in exactly one commit, no mutant changed after it, and every sealed hash and the Python minor version still match. It runs the unmutated suite first and aborts if it fails. It extracts a fresh copy of the frozen commit for every mutant, checks that the package under test was imported from that copy, and checks the hashes again after each mutant. The harness self-test is left out of these runs. A run that stops early records nothing. Each audit runs once.
 - `report` rewrites `results.md` from `results.json` and `equivalent.json`.
 
 ## Outcomes
 
 | Outcome | Meaning |
 | --- | --- |
-| `killed` | At least one test failed, or collection failed. The first failing test ids are recorded. |
+| `killed` | At least one test failed, or collection or the package import failed. The first failing test ids are recorded. |
 | `survived-never-activated` | Every test passed and none ran a changed line. |
 | `survived-oracle-masked` | A changed line ran, and every test still passed. |
 | `timeout` | The suite exceeded the sealed timeout. |
-| `invalid` | The patch did not apply or the mutated file does not compile. Outside the denominator. |
+| `invalid` | The patch did not apply, applied away from its stated lines, or left a file that does not compile. Outside the denominator. |
 
-A changed line is a `+` line that can raise a line event. For a block with none (a deletion, or a comment-only change), it is the first such line after the change. Tracing covers the main thread and threads started by the tests. It does not cover child processes.
+A changed line is a `+` line that can raise a line event, in whatever code runs it, so a changed `def` line, default or module constant counts as activated at import. A block with none (a deletion, or a comment-only change) is anchored in the function that held it: the first such line after the change in that function, or entry into the function when nothing follows. Tracing covers the main thread and threads started by the tests. It does not cover child processes or code that runs before pytest loads the plugin. Which lines can raise a line event differs between Python minor versions, which is why the seal pins it.
 
 ## Reporting rules
 

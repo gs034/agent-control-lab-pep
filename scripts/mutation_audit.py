@@ -33,12 +33,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS_DIR = Path(__file__).resolve().parent
 HARNESS_FILES = ("mutation_audit.py", "mutation_activation.py")
+# The harness self-test cannot observe a PEP mutant; leaving it in would only add time and timing noise.
+HARNESS_SELF_TEST = "tests/test_mutation_audit.py"
 DEFAULT_SCOPE = ("pep/approval.py", "pep/gate.py", "pep/evaluate.py")
 REVIEWER_CLASSES = ("person", "other-family", "same-family")
 OUTCOMES = ("killed", "survived-never-activated", "survived-oracle-masked", "timeout", "invalid")
 MAX_KILLING_TESTS = 5
+MODULE = "<module>"
+ANY_CODE = "*"
 _MUTANT_NAME = re.compile(r"M\d{2}\.patch")
-_HUNK = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_NOT_IN_PLACE = (
+    "rename ", "copy ", "old mode ", "new mode ", "new file mode ", "deleted file mode ",
+    "similarity index ", "dissimilarity index ", "Binary files ", "GIT binary patch",
+)
 
 
 class AuditError(Exception):
@@ -54,15 +62,34 @@ class AuditAborted(AuditError):
 
 
 @dataclass(frozen=True)
+class Block:
+    """One run of ``-``/``+`` lines: where it sits in each file, and its line numbers."""
+
+    old_start: int
+    new_start: int
+    minus: tuple[int, ...]
+    plus: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Mutant:
-    """One sealed mutant. ``blocks`` holds each change block as (its first
-    line in the mutated file, the ``+`` line numbers in it)."""
+    """One sealed mutant. ``hunks`` holds each hunk as (its first line in the
+    mutated file, the lines that must be found there after applying)."""
 
     mutant_id: str
     intent: str
     property: str
     target: str
-    blocks: tuple[tuple[int, tuple[int, ...]], ...]
+    blocks: tuple[Block, ...]
+    hunks: tuple[tuple[int, tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True)
+class Code:
+    key: tuple[str, int]
+    first: int
+    last: int
+    lines: frozenset[int]
 
 
 def parse_mutant(mutant_id: str, text: str) -> Mutant:
@@ -77,67 +104,136 @@ def parse_mutant(mutant_id: str, text: str) -> Mutant:
     for key in ("Intent", "Property"):
         if not meta.get(key):
             raise AuditError(f"{mutant_id}: missing {key}: line")
-    olds = [ln[4:].strip() for ln in lines[i:] if ln.startswith("--- ")]
-    news = [ln[4:].strip() for ln in lines[i:] if ln.startswith("+++ ")]
-    if len(olds) != 1 or len(news) != 1:
-        raise AuditError(f"{mutant_id}: a mutant changes exactly one file")
-    old, new = (_strip_prefix(p) for p in (olds[0], news[0]))
-    if old != new or new == "/dev/null":
-        raise AuditError(f"{mutant_id}: a mutant edits an existing file in place")
-    blocks: list[tuple[int, tuple[int, ...]]] = []
-    new_line = 0
-    in_block = False
-    for line in lines[i:]:
+
+    olds: list[str] = []
+    news: list[str] = []
+    gits: list[str] = []
+    blocks: list[Block] = []
+    hunks: list[tuple[int, tuple[str, ...]]] = []
+    body = lines[i:]
+    j = 0
+    while j < len(body):
+        line = body[j]
         hunk = _HUNK.match(line)
-        if hunk:
-            new_line, in_block = int(hunk.group(1)), False
+        if not hunk:
+            if line.startswith("--- "):
+                olds.append(line[4:])
+            elif line.startswith("+++ "):
+                news.append(line[4:])
+            elif line.startswith("diff --git "):
+                gits.append(line)
+            elif line.startswith(_NOT_IN_PLACE):
+                raise AuditError(f"{mutant_id}: a mutant edits file content in place, nothing else")
+            j += 1
             continue
-        if not new_line or line.startswith(("--- ", "+++ ", "\\")):
-            continue
-        tag = line[:1]
-        if tag in ("-", "+"):
-            if not in_block:
-                blocks.append((new_line, ()))
-                in_block = True
-            if tag == "+":
-                start, plus = blocks[-1]
-                blocks[-1] = (start, (*plus, new_line))
-                new_line += 1
-        else:
-            in_block = False
-            new_line += 1
+        old_line, new_line = int(hunk.group(1)), int(hunk.group(3))
+        old_left = int(hunk.group(2) or 1)
+        new_left = int(hunk.group(4) or 1)
+        new_start = new_line
+        expected: list[str] = []
+        block: Block | None = None
+        j += 1
+        while j < len(body) and (old_left or new_left):
+            line = body[j]
+            tag, rest = line[:1], line[1:]
+            if tag == "\\":
+                j += 1
+                continue
+            if tag in ("-", "+"):
+                if block is None:
+                    block = Block(old_line, new_line, (), ())
+                if tag == "-":
+                    block = Block(block.old_start, block.new_start, (*block.minus, old_line), block.plus)
+                    old_line, old_left = old_line + 1, old_left - 1
+                else:
+                    block = Block(block.old_start, block.new_start, block.minus, (*block.plus, new_line))
+                    expected.append(rest)
+                    new_line, new_left = new_line + 1, new_left - 1
+            elif tag in (" ", ""):
+                if block is not None:
+                    blocks.append(block)
+                    block = None
+                expected.append(rest)
+                old_line, new_line = old_line + 1, new_line + 1
+                old_left, new_left = old_left - 1, new_left - 1
+            else:
+                raise AuditError(f"{mutant_id}: malformed hunk line: {line!r}")
+            j += 1
+        if old_left or new_left:
+            raise AuditError(f"{mutant_id}: a hunk is shorter than its header says")
+        if block is not None:
+            blocks.append(block)
+        hunks.append((new_start, tuple(expected)))
+
+    if len(olds) != 1 or len(news) != 1 or len(gits) > 1:
+        raise AuditError(f"{mutant_id}: a mutant changes exactly one file")
+    old, new = (_strip_tab(p) for p in (olds[0], news[0]))
+    if not (old.startswith("a/") and new.startswith("b/")):
+        raise AuditError(f"{mutant_id}: file headers need a/ and b/ prefixes")
+    target = new[2:]
+    if old[2:] != target or (gits and gits[0] != f"diff --git a/{target} b/{target}"):
+        raise AuditError(f"{mutant_id}: a mutant edits an existing file in place")
     if not blocks:
         raise AuditError(f"{mutant_id}: the patch changes nothing")
-    return Mutant(mutant_id, meta["Intent"], meta["Property"], new, tuple(blocks))
+    return Mutant(mutant_id, meta["Intent"], meta["Property"], target, tuple(blocks), tuple(hunks))
 
 
-def _strip_prefix(path: str) -> str:
-    path = path.split("\t", 1)[0]
-    return path[2:] if path.startswith(("a/", "b/")) else path
+def _strip_tab(path: str) -> str:
+    return path.split("\t", 1)[0].strip()
 
 
-def executable_lines(source: str, filename: str) -> set[int]:
-    pending = [compile(source, filename, "exec")]
-    lines: set[int] = set()
+def code_map(source: str, filename: str) -> list[Code]:
+    """Every code object in a module, with the line range it spans and the lines it can run."""
+    pending = [(compile(source, filename, "exec"), True)]
+    codes = []
     while pending:
-        code = pending.pop()
-        lines.update(ln for _, _, ln in code.co_lines() if ln is not None)
-        pending.extend(c for c in code.co_consts if hasattr(c, "co_lines"))
-    lines.discard(0)
-    return lines
+        code, is_module = pending.pop()
+        lines = frozenset(ln for _, _, ln in code.co_lines() if ln)
+        if is_module:
+            codes.append(Code((MODULE, 0), 0, sys.maxsize, lines))
+        else:
+            first = code.co_firstlineno
+            codes.append(Code((code.co_qualname, first), first, max(lines, default=first), lines))
+        pending.extend((c, False) for c in code.co_consts if hasattr(c, "co_lines"))
+    return codes
 
 
-def activation_lines(mutant: Mutant, executable: set[int]) -> list[int]:
-    """The ``+`` lines that can raise a line event; for a block with none, the next one that can."""
-    ordered = sorted(executable)
-    chosen: set[int] = set()
-    for start, plus in mutant.blocks:
-        hits = [ln for ln in plus if ln in executable]
-        if not hits:
-            after = [ln for ln in ordered if ln >= start]
-            hits = after[:1] or ordered[-1:]
-        chosen.update(hits)
-    return sorted(chosen)
+def _owner(codes: list[Code], line: int) -> Code:
+    # The def or decorator line belongs to the enclosing code, which runs it.
+    return max((c for c in codes if c.first < line <= c.last), key=lambda c: c.first)
+
+
+def activation_targets(mutant: Mutant, original: str, mutated: str, filename: str) -> list[tuple[str, int, int | None]]:
+    """What counts as running the mutation, as (qualname, first line, line or None for entry).
+
+    A ``+`` line that can raise a line event counts in any frame, so a line run
+    at import (a ``def``, a default, a module constant) counts at import. A
+    block with no such line (a deletion, a comment) is anchored in the code
+    object that held it in the original: the first line after the change in
+    that code object, or entry into it when nothing follows.
+    """
+    before = code_map(original, filename)
+    after = code_map(mutated, filename)
+    runnable = frozenset().union(*(c.lines for c in after))
+    targets: set[tuple[str, int, int | None]] = set()
+    for block in mutant.blocks:
+        hits = [ln for ln in block.plus if ln in runnable]
+        if hits:
+            targets.update((ANY_CODE, 0, ln) for ln in hits)
+            continue
+        anchor = block.minus[0] if block.minus else max(block.old_start - 1, 1)
+        key = _owner(before, anchor).key
+        code = next((c for c in after if c.key == key), None) or next(c for c in after if c.key[0] == MODULE)
+        following = sorted(ln for ln in code.lines if ln >= block.new_start)
+        targets.add((*code.key, following[0] if following else None))
+    return sorted(targets, key=lambda t: (t[2] or 0, t[0], t[1]))
+
+
+def describe_target(target: tuple[str, int, int | None]) -> str:
+    name, _, line = target
+    if name == ANY_CODE:
+        return str(line)
+    return f"{name}:{line}" if line is not None else f"{name} (entry)"
 
 
 def freeze(
@@ -184,9 +280,17 @@ def freeze(
 
 
 def verify(root: Path, sealed: dict) -> None:
-    """Refuse unless tests, pyproject, harness, mutants and Python all match the seal."""
+    """Refuse unless the seal is committed once, and everything it names still matches."""
     if _python_version().rsplit(".", 1)[0] != sealed["python"].rsplit(".", 1)[0]:
         raise FreezeMismatch(f"sealed under Python {sealed['python']}, running {_python_version()}")
+    rel = f"audits/{sealed['audit_id']}"
+    if _git(root, "status", "--porcelain", "--untracked-files=all", "--", rel).strip():
+        raise FreezeMismatch(f"{rel} has uncommitted changes; commit the mutants and freeze.json first")
+    history = _git(root, "log", "--format=%H", "--", f"{rel}/freeze.json").split()
+    if len(history) != 1:
+        raise FreezeMismatch(f"{rel}/freeze.json must be committed once and never edited")
+    if _git(root, "log", "--format=%H", f"{history[0]}..HEAD", "--", f"{rel}/mutants").split():
+        raise FreezeMismatch(f"{rel}/mutants changed after the freeze commit")
     _refuse_untracked_tests(root, FreezeMismatch)
     audit = _audit_dir(root, sealed["audit_id"])
     current = {
@@ -223,11 +327,12 @@ def run(
 
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="mutation-audit-") as tmp:
-        baseline = _run_suite(Path(tmp), archive, sealed, None, [])
+        work = Path(tmp)
+        baseline = _run_suite(work, _extract(work, archive, sealed), sealed, [])
     if baseline["outcome"] == "timeout":
         raise AuditAborted("the unmutated suite exceeded the timeout")
     if baseline["outcome"] != "passed":
-        raise AuditAborted(f"the unmutated suite fails: {', '.join(baseline['failed']) or 'see pytest output'}")
+        raise AuditAborted(f"the unmutated suite fails: {', '.join(baseline['failed']) or baseline['detail']}")
     baseline_seconds = round(time.monotonic() - started, 2)
 
     rows = []
@@ -319,15 +424,15 @@ def render(results: dict, equivalents: dict[str, dict]) -> str:
         "",
         "## Mutants",
         "",
-        "| Mutant | File and lines | Intent | Property attacked | Outcome | Killing tests | Seconds |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| Mutant | File | Activation | Intent | Property attacked | Outcome | Killing tests | Seconds |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for r in rows:
-        where = f"`{r['file']}`:{','.join(map(str, r['lines']))}" if r["lines"] else f"`{r['file']}`"
+        activation = ", ".join(f"`{a}`" for a in r["activation"]) or "-"
         killers = "<br>".join(f"`{t}`" for t in r["killing_tests"]) or "-"
         out.append(
-            f"| {r['id']} | {where} | {_cell(r['intent'])} | {_cell(r['property'])} | {r['outcome']} "
-            f"| {killers} | {r['duration_seconds']} |"
+            f"| {r['id']} | `{r['file']}` | {activation} | {_cell(r['intent'])} | {_cell(r['property'])} "
+            f"| {r['outcome']} | {killers} | {r['duration_seconds']} |"
         )
     survivors = [r for r in rows if r["outcome"].startswith("survived")]
     out += ["", "## Survivors", ""]
@@ -335,9 +440,9 @@ def render(results: dict, equivalents: dict[str, dict]) -> str:
         out.append("Each survivor that touches a fail-closed path is filed as a defect.")
         out.append("")
         for r in survivors:
-            note = equivalents.get(r["id"]) if r["id"] in signed else None
             line = f"- {r['id']} ({r['outcome']}): {r['property']}"
-            if note:
+            if r["id"] in signed:
+                note = equivalents[r["id"]]
                 line += f" Equivalent, signed off by {note['signed_off_by']}: {note.get('argument', '')}"
             out.append(line)
     else:
@@ -349,34 +454,44 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
     row = {
         "id": mutant.mutant_id,
         "file": mutant.target,
-        "lines": [],
+        "activation": [],
         "intent": mutant.intent,
         "property": mutant.property,
         "killing_tests": [],
         "detail": "",
     }
     copy = _extract(work, archive, sealed)
-    # The ceiling stops git from finding an enclosing repository, so paths stay relative to the copy.
+    target = copy / mutant.target
+    if not target.is_file():
+        return {**row, "outcome": "invalid", "detail": "the target file is not in the frozen commit"}
+    original = target.read_text(encoding="utf-8")
+    files_before = _tree_files(copy)
+    # The ceiling stops git finding an enclosing repository, whose config (apply.whitespace) could change the result.
     env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(work)}
     applied = subprocess.run(["git", "apply", str(patch)], cwd=copy, env=env, capture_output=True, text=True)
     if applied.returncode != 0:
         return {**row, "outcome": "invalid", "detail": applied.stderr.strip()}
-    target = copy / mutant.target
+    mutated = target.read_text(encoding="utf-8")
+    if not _applied_where_stated(mutant, mutated):
+        return {**row, "outcome": "invalid", "detail": "a hunk applied away from its stated lines"}
+    if _tree_files(copy) != files_before or _sealed_drift(copy, sealed):
+        raise AuditAborted(f"{mutant.mutant_id} changed files other than {mutant.target}")
     try:
-        lines = activation_lines(mutant, executable_lines(target.read_text(encoding="utf-8"), str(target)))
+        targets = activation_targets(mutant, original, mutated, str(target))
     except SyntaxError as exc:
-        return {**row, "outcome": "invalid", "detail": f"mutated file does not compile: {exc.msg}"}
-    result = _run_suite(work, archive, sealed, mutant.target, lines, copy=copy)
+        return {**row, "outcome": "invalid", "detail": f"the mutated file does not compile: {exc.msg}"}
+    row["activation"] = [describe_target(t) for t in targets]
+    result = _run_suite(work, copy, sealed, targets, target=target)
     outcome = result["outcome"]
     if outcome == "passed":
         outcome = "survived-oracle-masked" if result["activated"] else "survived-never-activated"
-    return {**row, "lines": lines, "outcome": outcome, "killing_tests": result["failed"][:MAX_KILLING_TESTS]}
+    return {**row, "outcome": outcome, "killing_tests": result["failed"][:MAX_KILLING_TESTS], "detail": result["detail"]}
 
 
 def _run_suite(
-    work: Path, archive: bytes, sealed: dict, target: str | None, lines: list[int], *, copy: Path | None = None
+    work: Path, copy: Path, sealed: dict, targets: list[tuple[str, int, int | None]], *, target: Path | None = None
 ) -> dict:
-    copy = copy or _extract(work, archive, sealed)
+    """Run pytest in ``copy``. Outcome: passed, killed or timeout; aborts only on a harness fault."""
     out = work / "activation.json"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "MUTATION_AUDIT_"))}
     env.update(
@@ -387,28 +502,39 @@ def _run_suite(
         MUTATION_AUDIT_PACKAGE=sealed["package"],
     )
     if target is not None:
-        env.update(MUTATION_AUDIT_TARGET=str(copy / target), MUTATION_AUDIT_LINES=",".join(map(str, lines)))
-    cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "mutation_activation"]
+        env.update(MUTATION_AUDIT_TARGET=str(target), MUTATION_AUDIT_TARGETS=json.dumps(targets))
+    cmd = [
+        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "mutation_activation",
+        f"--ignore={HARNESS_SELF_TEST}",
+    ]
     proc = subprocess.Popen(
         cmd, cwd=copy, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
     )
     try:
         output, _ = proc.communicate(timeout=sealed["timeout_seconds"])
     except subprocess.TimeoutExpired:
-        _kill(proc)
-        return {"outcome": "timeout", "activated": False, "failed": []}
-    if not out.exists():
-        raise AuditAborted(f"pytest exited {proc.returncode} without a record:\n{_tail(output)}")
-    record = json.loads(out.read_text(encoding="utf-8"))
-    if record["error"]:
+        _kill_group(proc)
+        return {"outcome": "timeout", "activated": False, "failed": [], "detail": "timeout"}
+    except BaseException:
+        _kill_group(proc)
+        raise
+    _kill_group(proc)
+    record = json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
+    if record is not None and record["error"]:
         raise AuditAborted(record["error"])
-    if proc.returncode == 0:
-        outcome = "passed"
-    elif proc.returncode in (1, 2):
-        outcome = "killed"
-    else:
-        raise AuditAborted(f"pytest exited {proc.returncode}:\n{_tail(output)}")
-    return {"outcome": outcome, "activated": record["activated"], "failed": record["failed"]}
+    failed = record["failed"] if record else []
+    if proc.returncode == 0 and not failed:
+        return {"outcome": "passed", "activated": record["activated"], "failed": [], "detail": ""}
+    detail = "" if failed else f"pytest exited {proc.returncode}{'' if record else ' without a record'}:\n{_tail(output)}"
+    return {"outcome": "killed", "activated": bool(record and record["activated"]), "failed": failed, "detail": detail}
+
+
+def _applied_where_stated(mutant: Mutant, mutated: str) -> bool:
+    lines = mutated.splitlines()
+    for start, expected in mutant.hunks:
+        if expected and lines[start - 1 : start - 1 + len(expected)] != list(expected):
+            return False
+    return True
 
 
 def _extract(work: Path, archive: bytes, sealed: dict) -> Path:
@@ -419,20 +545,35 @@ def _extract(work: Path, archive: bytes, sealed: dict) -> Path:
             tar.extractall(copy, filter="data")
         else:
             tar.extractall(copy)
-    for path, digest in sealed["files"].items():
-        if path.startswith("harness/"):
-            continue
-        if not (copy / path).is_file() or _sha256(copy / path) != digest:
-            raise AuditAborted(f"{path} at {sealed['commit'][:7]} does not match the seal")
+    drift = _sealed_drift(copy, sealed)
+    if drift:
+        raise AuditAborted(f"{', '.join(drift)} at {sealed['commit'][:7]} does not match the seal")
     return copy
 
 
-def _kill(proc: subprocess.Popen) -> None:
+def _sealed_drift(copy: Path, sealed: dict) -> list[str]:
+    return [
+        path
+        for path, digest in sealed["files"].items()
+        if not path.startswith("harness/") and (not (copy / path).is_file() or _sha256(copy / path) != digest)
+    ]
+
+
+def _tree_files(copy: Path) -> set[str]:
+    return {str(p.relative_to(copy)) for p in copy.rglob("*") if p.is_file() or p.is_symlink()}
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill the suite's process group, including children a test left running."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except (AttributeError, ProcessLookupError):
-        proc.kill()
-    proc.communicate()
+    except (AttributeError, ProcessLookupError, PermissionError):
+        if proc.poll() is None:
+            proc.kill()
+    try:
+        proc.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _load_mutants(audit: Path, scope: tuple[str, ...]) -> dict[str, Mutant]:
@@ -510,29 +651,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     p_freeze = sub.add_parser("freeze", help="seal tests, harness and mutants before any run")
-    p_freeze.add_argument("audit_id")
     p_freeze.add_argument("--reviewer", required=True, choices=REVIEWER_CLASSES)
     p_freeze.add_argument("--commit", default="HEAD")
     p_freeze.add_argument("--timeout", type=float, default=300.0)
     p_freeze.add_argument("--repair-of")
-    for name in ("run", "report"):
-        sub.add_parser(name).add_argument("audit_id")
+    p_run = sub.add_parser("run", help="run the sealed suite once per mutant")
+    p_report = sub.add_parser("report", help="rewrite results.md")
+    for p in (p_freeze, p_run, p_report):
+        p.add_argument("audit_id")
+        p.add_argument("--root", type=Path, default=ROOT)
     args = parser.parse_args(argv)
     try:
         if args.command == "freeze":
             record = freeze(
                 args.audit_id,
                 reviewer=args.reviewer,
+                root=args.root,
                 commit=args.commit,
                 timeout=args.timeout,
                 repair_of=args.repair_of,
             )
             print(f"froze {args.audit_id} at {record['commit'][:7]}: {len(record['mutants'])} mutants")
+            print(f"commit audits/{args.audit_id}/ before running it")
         elif args.command == "run":
-            summary = run(args.audit_id)["summary"]
+            summary = run(args.audit_id, root=args.root)["summary"]
             print(f"{args.audit_id}: {summary['kill_rate_timeouts_not_killed']} killed; see results.md")
         else:
-            report(args.audit_id)
+            report(args.audit_id, root=args.root)
     except AuditError as exc:
         print(f"mutation audit: {exc}", file=sys.stderr)
         return 1
