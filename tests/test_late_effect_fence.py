@@ -256,6 +256,38 @@ def test_second_complete_denies_and_enters_at_most_once():
     assert payload["negative_controls_observed"]["tool_invoke_executed"] is False
 
 
+def test_claim_entry_refuses_a_spent_admission():
+    # Audit 2026-10-06-gate M09 (#27): claim_entry is the only atomic one-shot check.
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
+    assert runtime.claim_entry(pending.admission_id, pending.admitted_epoch) is None
+    assert runtime.admission_spent(pending.admission_id) is True
+    second = runtime.claim_entry(pending.admission_id, pending.admitted_epoch)
+    assert second == ReasonCode.ADMISSION_CONSUMED
+
+
+def test_completion_racing_past_the_spent_precheck_enters_at_most_once():
+    # Audit 2026-10-06-gate M09 (#27): the admission_spent pre-check in
+    # complete_invoke runs without the lock, so a second completion can pass
+    # it while the first is in the commit gap. Only claim_entry stops it.
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
+    called, boom = _boom_factory()
+    inner: list[tuple] = []
+
+    def complete_again():
+        inner.append(complete_invoke(pending, boom))
+
+    outer, outer_result = complete_invoke(pending, boom, _before_commit=complete_again)
+    inner_decision, inner_result = inner[0]
+    assert inner_decision.verdict == "ALLOW"
+    assert inner_result == "entered"
+    assert outer.verdict == "DENY"
+    assert outer.receipt.reason_code == ReasonCode.ADMISSION_CONSUMED
+    assert outer_result is None
+    assert called["n"] == 1
+
+
 def test_replay_while_tool_is_running_does_not_enter_again():
     runtime = PepRuntime(policy=DEMO_POLICY)
     pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
