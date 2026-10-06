@@ -217,6 +217,28 @@ def test_kill_between_fence_check_and_tool_entry_denies():
     assert called["n"] == 0
 
 
+def test_suspend_between_fence_check_and_tool_entry_denies_and_keeps_the_admission():
+    # Audit 2026-10-06-gate M07 (#26): only claim_entry sees a suspend that
+    # lands after complete_invoke's lock-free entry_blocked read.
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
+    assert pending.decision.verdict == "ALLOW"
+    called, boom = _boom_factory()
+    decision, result = complete_invoke(pending, boom, _before_commit=runtime.suspend)
+    assert runtime.suspend_active is True
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.SUSPEND_ACTIVE
+    assert result is None
+    assert called["n"] == 0
+    assert runtime.admission_spent(pending.admission_id) is False
+
+    runtime.resume()
+    decision, result = complete_invoke(pending, boom)
+    assert decision.verdict == "ALLOW"
+    assert result == "entered"
+    assert called["n"] == 1
+
+
 def test_second_complete_denies_and_enters_at_most_once():
     runtime = PepRuntime(policy=DEMO_POLICY)
     pending = begin_invoke(_valid(), runtime=runtime, principal=HOST)
