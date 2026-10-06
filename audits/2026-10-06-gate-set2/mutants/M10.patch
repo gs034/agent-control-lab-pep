@@ -1,0 +1,23 @@
+Intent: ALLOW even when ApprovalStore.consume returned a fail-closed reason.
+Property: ADR-0001 / evaluate: consumed.reason is not None must DENY with that reason.
+--- a/pep/evaluate.py
++++ b/pep/evaluate.py
+@@ -521,17 +521,7 @@
+             )
+             frozen_state = consumed.frozen_state_digest
+             frozen_implementation = consumed.frozen_implementation_digest
+-            if consumed.reason is not None:
+-                detail = f"single-use TTL approval rejected: {consumed.reason}"
+-                if consumed.detail:
+-                    detail = f"{detail}; {consumed.detail}"
+-                return _deny(
+-                    consumed.reason,
+-                    detail,
+-                    env_hash,
+-                    version,
+-                    policy.bytes_unchanged(),
+-                )
++
+ 
+         return self._finalize_allow(
+             admitted_epoch,

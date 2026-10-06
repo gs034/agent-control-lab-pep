@@ -1,0 +1,14 @@
+Intent: Allow a single-use approval to be consumed after its TTL has elapsed.
+Property: ADR-0001 / consume: expired grant is APPROVAL_EXPIRED and does not consume.
+--- a/pep/approval.py
++++ b/pep/approval.py
+@@ -290,8 +290,7 @@
+                 return ConsumeResult(ReasonCode.APPROVAL_PRINCIPAL_MISMATCH, failed)
+             if record.consumed():
+                 return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
+-            if record.expired(clock):
+-                return ConsumeResult(ReasonCode.APPROVAL_EXPIRED)
++
+             if not record.matches_binding(tool_name, args):
+                 return ConsumeResult(ReasonCode.APPROVAL_BINDING_MISMATCH)
+             if not record.single_use:

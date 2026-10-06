@@ -1,0 +1,20 @@
+Intent: Skip the kill/unavailable fail-closed check so evaluates continue while the PEP is killed.
+Property: ADR-0001 Fail-closed / PepRuntime.evaluate: killed or unavailable returns DENY kill_active.
+--- a/pep/evaluate.py
++++ b/pep/evaluate.py
+@@ -376,14 +376,7 @@
+         version = policy.version if policy.document else POLICY_VERSION
+ 
+         observed_mode, observed_available, admitted_epoch = self._observe()
+-        if (not observed_available) or observed_mode is RuntimeMode.KILLED:
+-            return _deny(
+-                ReasonCode.KILL_ACTIVE,
+-                _KILL_DETAIL,
+-                env_hash,
+-                version,
+-                unchanged,
+-            )
++
+         if observed_mode is RuntimeMode.SUSPENDED:
+             return _deny(
+                 ReasonCode.SUSPEND_ACTIVE,

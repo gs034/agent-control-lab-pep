@@ -1,0 +1,13 @@
+Intent: Pass the entry-time implementation re-observe when no observer was supplied, despite a frozen digest.
+Property: ADR-0004 / _implementation_still_matches: frozen digest with no observer fails closed (returns False).
+--- a/pep/gate.py
++++ b/pep/gate.py
+@@ -146,7 +146,7 @@
+     if frozen is None:
+         return True
+     if pending.implementation_observer is None:
+-        return False
++        return True
+     try:
+         observed = pending.implementation_observer()
+     except Exception:

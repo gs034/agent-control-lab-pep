@@ -1,0 +1,14 @@
+Intent: Accept a capability token from a non-holder or with a disagreeing envelope identity.
+Property: ADR-0003 / _capability_deny: non-holder or disagreeing envelope identity is CAPABILITY_MISSING.
+--- a/pep/evaluate.py
++++ b/pep/evaluate.py
+@@ -612,8 +612,7 @@
+         return ReasonCode.CAPABILITY_MISSING, NO_ATTESTED_PRINCIPAL_DETAIL
+     cap = policy.capability(token)
+     holders = _capability_holders(cap.get("principals")) if cap is not None else frozenset()
+-    if principal not in holders or parsed.caller_identity != principal:
+-        return ReasonCode.CAPABILITY_MISSING, _CAPABILITY_NOT_FOR_CALLER
++
+     expires_at = cap.get("expires_at")
+     if not isinstance(expires_at, str):
+         return ReasonCode.CAPABILITY_MISSING, "capability record missing expires_at; fail-closed"

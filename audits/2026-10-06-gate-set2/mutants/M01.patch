@@ -1,0 +1,15 @@
+Intent: Skip the host-attested principal check so any caller can spend a bound approval.
+Property: ADR-0002 / consume: wrong or unattested principal is APPROVAL_PRINCIPAL_MISMATCH and does not consume.
+--- a/pep/approval.py
++++ b/pep/approval.py
+@@ -285,9 +285,7 @@
+             record = self._records.get(approval_id)
+             if record is None:
+                 return ConsumeResult(ReasonCode.APPROVAL_INVALID)
+-            failed = _principal_failure(record.principal, principal, envelope_identity)
+-            if failed is not None:
+-                return ConsumeResult(ReasonCode.APPROVAL_PRINCIPAL_MISMATCH, failed)
++
+             if record.consumed():
+                 return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
+             if record.expired(clock):

@@ -1,0 +1,13 @@
+Intent: Treat a missing implementation observer as a pass when the grant froze an implementation digest.
+Property: ADR-0004 / _implementation_failure: observe is None returns 'no implementation observer' (mismatch, no consume).
+--- a/pep/approval.py
++++ b/pep/approval.py
+@@ -330,7 +330,7 @@
+     ) -> str | None:
+         """Name the failed implementation check, or None. Called with the lock held."""
+         if observe is None:
+-            return "no implementation observer"
++            return None
+         self._observing.active = True
+         try:
+             observed = observe()

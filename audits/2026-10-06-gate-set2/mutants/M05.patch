@@ -1,0 +1,15 @@
+Intent: Skip the pre-claim fence read so a completion after kill can still reach claim_entry and the tool path.
+Property: ADR-0001 late-effect fence / complete_invoke: cut after admission is DENY late_effect_fence and does not call tool.
+--- a/pep/gate.py
++++ b/pep/gate.py
+@@ -113,9 +113,7 @@
+         return decision, None
+     # Fence first: no host read after the cut, and kill keeps precedence over a
+     # state mismatch. claim_entry re-decides under the lock below.
+-    cut = pending.runtime.entry_blocked(pending.admitted_epoch)
+-    if cut is not None:
+-        return supersede(decision, cut), None
++
+     # A replayed completion must not call back into the host.
+     if pending.runtime.admission_spent(pending.admission_id):
+         return supersede(decision, ReasonCode.ADMISSION_CONSUMED), None

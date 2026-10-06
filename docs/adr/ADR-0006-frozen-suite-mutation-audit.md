@@ -1,7 +1,19 @@
 # ADR-0006: Audit the PEP test suite against independently specified mutants
 
 - **Status:** Accepted, 2026-10-06 (owner), with the four recommendations under "Owner decisions".
-- **Implementation:** phase 1 (harness and self-test) in pep#22. Phase 1 and its independent review refined decisions 3 to 5 as recorded below: the seal must be committed once and never edited; a patch must edit one file in place and apply exactly where it says; a mutant that breaks the package import counts as killed; and activation for a deletion or comment-only change is anchored in the function that held it.
+- **Implementation:** done, all four phases.
+  - Phase 1, the harness and self-test, is pep#22, with a scoring fix in pep#24. Phase 1 and its independent review refined decisions 3 to 5 as recorded below:
+    - the seal must be committed once and never edited;
+    - a patch must edit one file in place and apply exactly where it says;
+    - a mutant that breaks the package import counts as killed;
+    - activation for a deletion or comment-only change is anchored in the function that held it.
+  - Phase 2 is pep#23: ten mutants written by a fresh-context agent, reviewer class `same-family`, approved by the owner and sealed against `5189e13`.
+  - Phase 3 is pep#25: audit `2026-10-06-gate`, 8 of 10 killed. M07 and M09 survived as oracle-masked and were filed as pep#26 and pep#27; both were test gaps, not PEP bugs.
+  - Phase 4 is the test-only repairs in pep#28 and pep#29, and the repair re-run `2026-10-06-gate-r1` in pep#30: 10 of 10, a repair result on the same set.
+  - Two departures from the phase text below:
+    - one same-set re-run followed both repairs, not one per repair;
+    - the re-run's seal and results arrived in one PR, with the seal commit pushed before the run.
+  - A new estimate needs a new, independently specified set.
 - **Date:** 2026-10-06
 - **Depends on:** nothing. It audits the tests behind ADR-0002 to ADR-0005; it changes no PEP behaviour.
 - **Origin:** research-loop work package WP-RL-010 (run `acl-rl-2026-10-05-1400`, finding RF-20261005-07).
