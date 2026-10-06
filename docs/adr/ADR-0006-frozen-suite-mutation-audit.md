@@ -1,6 +1,7 @@
 # ADR-0006: Audit the PEP test suite against independently specified mutants
 
-- **Status:** Proposed, 2026-10-06. Awaiting owner decision; see "Owner decisions" below.
+- **Status:** Accepted, 2026-10-06 (owner), with the four recommendations under "Owner decisions".
+- **Implementation:** phase 1 (harness and self-test) in progress. Phase 1 refined decision 5: an activation line must be one that can raise a line event, so a comment-only change falls back like a deletion. It also added a check that each extracted copy matches the seal.
 - **Date:** 2026-10-06
 - **Depends on:** nothing. It audits the tests behind ADR-0002 to ADR-0005; it changes no PEP behaviour.
 - **Origin:** research-loop work package WP-RL-010 (run `acl-rl-2026-10-05-1400`, finding RF-20261005-07).
@@ -46,7 +47,7 @@ Run a frozen-suite mutation audit of the PEP gate, with mutants specified indepe
    - Each mutant runs in a fresh copy of the tree at the frozen commit, extracted with `git archive` into a temporary directory, so no mutant can affect another and the repository's own git metadata is not touched. The patch is applied with `git apply`; a patch that does not apply is recorded as `invalid`, never as killed.
    - The suite runs in a subprocess from the copy, with `PYTHONDONTWRITEBYTECODE=1`, the pytest cache disabled and a per-mutant timeout. Before any test runs, the plugin checks that `pep` was imported from the copy. CI installs the package in editable mode, and without this check every mutant could silently test the original tree.
    - Hashes are checked again after each mutant. Drift aborts the run.
-5. **Activation.** A pytest plugin in `scripts/` uses `sys.settrace` and `threading.settrace`, limited to the mutated file, to record whether any test executed a line the patch changed. Several gate tests run the gate in worker threads, so the thread hook is required. The changed lines are the `+` lines in the patch body, not the hunk-header ranges, which include context lines. For a hunk that only deletes lines, the activation line is the first line after the deletion point in the mutated file. Each mutant gets exactly one outcome:
+5. **Activation.** A pytest plugin in `scripts/` uses `sys.settrace` and `threading.settrace`, limited to the mutated file, to record whether any test executed a line the patch changed. Several gate tests run the gate in worker threads, so the thread hook is required. The changed lines are the `+` lines in the patch body, not the hunk-header ranges, which include context lines. A `+` line counts only if it can raise a line event (a comment or a bare `else:` cannot). For a change block with no such line, including one that only deletes lines, the activation line is the first line after the change that can. Each mutant gets exactly one outcome:
    - `killed`: at least one test failed. The first failing test ids are recorded.
    - `survived-never-activated`: no test executed a changed line.
    - `survived-oracle-masked`: a changed line ran and every test still passed.
@@ -73,15 +74,17 @@ Run a frozen-suite mutation audit of the PEP gate, with mutants specified indepe
 
 ## Owner decisions
 
+Settled on 2026-10-06: the owner accepted all four recommendations.
+
 1. **Who specifies the mutants?** The ADR-0004 and ADR-0005 tests were written by an AI assistant, which also wrote their review mutants. The earlier tests arrived on `cursor/*` agent branches, which suggests AI authorship there too, though the repository does not record it. A reviewer of the same model family is therefore not independent in the sense the paper means. The options, strongest first:
    - the owner, or another person;
    - a model from a different family;
    - a fresh-context agent of the same family that is given only `pep/*.py` and the ADRs, with that limit stated in the report.
 
-   Recommend the owner or another person. If that is not practical, use the fresh-context agent with the limit recorded. In every case the owner reviews and seals the list before the run.
-2. **Timeouts.** Recommend a separate `timeout` column. The kill rate is reported twice: once counting timeouts as killed, once without.
-3. **Equivalent mutants.** A mutant the reviewer later argues is behaviour-identical stays in the raw denominator. Recommend reporting a second rate that excludes it only with the owner's written sign-off on the argument.
-4. **First-audit scope.** Recommend the three gate files named in decision 1. Include `pep/implementation.py` now only if the owner wants ADR-0005 audited in the same round.
+   Decided: the owner or another person. If that is not practical, a fresh-context agent with the limit recorded. In every case the owner reviews and seals the list before the run.
+2. **Timeouts.** Decided: a separate `timeout` column. The kill rate is reported twice: once counting timeouts as killed, once without.
+3. **Equivalent mutants.** A mutant the reviewer later argues is behaviour-identical stays in the raw denominator. Decided: a second rate excludes it only with the owner's written sign-off on the argument.
+4. **First-audit scope.** Decided: the three gate files named in decision 1. `pep/implementation.py` waits for a later round.
 
 ## Residuals (what this does not fix)
 
@@ -135,7 +138,8 @@ None in this ADR. The research work package names supply-gate as a later target 
 | Two mutants on the same file | Independent results; the second does not see the first |
 | Plugin imports `pep` from outside the mutant copy (simulated) | The run aborts; no outcome is recorded |
 | A test that reaches the mutated line only in a worker thread | Counted as activated |
-| The PEP working tree after a run | No tracked file changed and no new untracked file (`git status --porcelain` identical before and after) |
+| `freeze.json` edited to name a different commit | The run aborts: the extracted copy does not match the seal |
+| The PEP working tree after a run | No tracked file changed; the only new files are `audits/<id>/results.json` and `results.md` |
 
 Phase 1 also requires that the full PEP suite and the brand-wall checks pass, and gets an independent review.
 
