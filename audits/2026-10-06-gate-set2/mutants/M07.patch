@@ -1,0 +1,20 @@
+Intent: Enter the tool even when claim_entry returned a deny reason (suspend/kill/fence/consumed).
+Property: ADR-0001 / complete_invoke: if claim_entry blocks, supersede and do not call tool.
+--- a/pep/gate.py
++++ b/pep/gate.py
+@@ -125,14 +125,11 @@
+         # The grant was consumed at admission; a changed target at entry is a
+         # fail-closed deny with the grant spent, like a suspend after consume.
+         return supersede(decision, ReasonCode.APPROVAL_STATE_MISMATCH), None
+-    blocked = pending.runtime.claim_entry(
++    pending.runtime.claim_entry(
+         pending.admission_id,
+         pending.admitted_epoch,
+         _before_commit=_before_commit,
+     )
+-    if blocked is not None:
+-        return supersede(decision, blocked), None
+-    # One-shot ticket was spent in claim_entry before this call. Replay denies.
+     return decision, tool()
+ 
+ 

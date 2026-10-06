@@ -1,0 +1,14 @@
+Intent: Ignore a post-mint tool/args substitution against the frozen invoke binding.
+Property: ADR-0001 / consume: binding mismatch is APPROVAL_BINDING_MISMATCH and does not consume.
+--- a/pep/approval.py
++++ b/pep/approval.py
+@@ -292,8 +292,7 @@
+                 return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
+             if record.expired(clock):
+                 return ConsumeResult(ReasonCode.APPROVAL_EXPIRED)
+-            if not record.matches_binding(tool_name, args):
+-                return ConsumeResult(ReasonCode.APPROVAL_BINDING_MISMATCH)
++
+             if not record.single_use:
+                 return ConsumeResult(ReasonCode.APPROVAL_INVALID)
+             if record.implementation_digest is not None:
