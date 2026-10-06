@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+import pytest
+
 from pep.evaluate import PepRuntime, evaluate
 from pep.gate import gated_invoke
 from pep.policy import DEMO_POLICY
@@ -53,6 +57,49 @@ def test_activate_kill_after_construct():
     decision = evaluate(_valid(), runtime=runtime, principal=HOST)
     assert decision.verdict == "DENY"
     assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
+
+
+def _killed() -> PepRuntime:
+    return PepRuntime(policy=DEMO_POLICY, kill_active=True)
+
+
+def _unavailable() -> PepRuntime:
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    runtime.mark_unavailable()
+    return runtime
+
+
+@pytest.mark.parametrize("halted", [_killed, _unavailable], ids=["killed", "unavailable"])
+@pytest.mark.parametrize(
+    ("override", "principal"),
+    [
+        ({"capability_token": "lab.cap.not.issued"}, HOST),
+        ({}, "lab.other.agent"),
+        ({"tool_name": "not.in.catalog"}, HOST),
+    ],
+    ids=["bad-token", "non-holder", "unknown-tool"],
+)
+def test_kill_is_the_reason_before_any_other_deny(halted, override, principal):
+    # Audit 2026-10-06-gate-set2 M08: the first kill check in evaluate is the
+    # only one before the policy and approval checks. Without it a halted PEP
+    # still reports other reasons, and spends a grant before the later check.
+    decision = evaluate({**_valid(), **override}, runtime=halted(), principal=principal)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
+
+
+def test_kill_denies_without_spending_an_approval():
+    runtime = PepRuntime(policy=DEMO_POLICY)
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    grant = runtime.issue_approval(
+        tool_name="echo.ping", args={"message": "hello"}, ttl_seconds=60, principal=HOST, now=now
+    )
+    runtime.activate_kill()
+    envelope = {**_valid(), "capability_token": None, "approval_id": grant.approval_id}
+    decision = evaluate(envelope, runtime=runtime, principal=HOST, now=now)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.KILL_ACTIVE
+    assert runtime.approvals.lookup(grant.approval_id).consumed() is False
 
 
 def test_suspend_denies_and_resume_restores_allow():

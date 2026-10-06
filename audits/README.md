@@ -15,7 +15,7 @@ audits/<id>/
 
 ## Writing a mutant
 
-Each mutant is one change to one file in scope. The default scope is `pep/approval.py`, `pep/gate.py` and `pep/evaluate.py`. The file starts with two lines, then a unified diff against the frozen commit:
+Each mutant is one change to one file in scope. The default scope is `pep/approval.py`, `pep/gate.py` and `pep/evaluate.py`; `freeze --scope`, repeated, sets another. The file starts with two lines, then a unified diff against the frozen commit:
 
 ```
 Intent: what the fault is, in one line
@@ -30,7 +30,7 @@ The reviewer writes mutants from the code and the ADRs only, without reading `te
 ## Commands
 
 ```
-python scripts/mutation_audit.py freeze <id> --reviewer person [--commit HEAD] [--timeout 300]
+python scripts/mutation_audit.py freeze <id> --reviewer person [--commit HEAD] [--timeout 300] [--scope pep/x.py ...]
 python scripts/mutation_audit.py run <id>
 python scripts/mutation_audit.py report <id>
 ```

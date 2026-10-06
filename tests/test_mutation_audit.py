@@ -671,3 +671,12 @@ def test_shallow_clone_is_refused(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert "shallow clone" in err
+
+
+def test_cli_freeze_takes_the_scope(tmp_path):
+    root = _toy(tmp_path)
+    _mutant(root, "C1", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    assert ma.main(["freeze", "C1", "--reviewer", "person", "--root", str(root)]) == 1
+    assert not (root / "audits" / "C1" / "freeze.json").exists()
+    assert ma.main(["freeze", "C1", "--reviewer", "person", "--scope", "toy/calc.py", "--root", str(root)]) == 0
+    assert ma._read_json(root / "audits" / "C1" / "freeze.json")["scope"] == ["toy/calc.py"]

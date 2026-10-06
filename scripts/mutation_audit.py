@@ -754,6 +754,7 @@ def main(argv: list[str] | None = None) -> int:
     p_freeze.add_argument("--commit", default="HEAD")
     p_freeze.add_argument("--timeout", type=float, default=300.0)
     p_freeze.add_argument("--repair-of")
+    p_freeze.add_argument("--scope", action="append", help="in-scope file; repeat for several (default: the gate files)")
     p_run = sub.add_parser("run", help="run the sealed suite once per mutant")
     p_report = sub.add_parser("report", help="rewrite results.md")
     for p in (p_freeze, p_run, p_report):
@@ -769,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
                 commit=args.commit,
                 timeout=args.timeout,
                 repair_of=args.repair_of,
+                scope=tuple(args.scope) if args.scope else DEFAULT_SCOPE,
             )
             print(f"froze {args.audit_id} at {record['commit'][:7]}: {len(record['mutants'])} mutants")
             print(f"commit audits/{args.audit_id}/ before running it")
