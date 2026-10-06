@@ -1,0 +1,199 @@
+{
+  "audit_id": "2026-10-06-gate-set2",
+  "baseline_seconds": 2.69,
+  "commit": "0bac0f678bbc8688e20ab6ed5fe6d0dbc84060df",
+  "mutants": [
+    {
+      "activation": [
+        "ApprovalStore.consume:289"
+      ],
+      "detail": "",
+      "duration_seconds": 4.4,
+      "file": "pep/approval.py",
+      "id": "M01",
+      "intent": "Skip the host-attested principal check so any caller can spend a bound approval.",
+      "killing_tests": [
+        "tests/test_approval_implementation_binding.py::test_earlier_exits_return_their_own_code_and_never_call_the_observer",
+        "tests/test_approval_laundering_classes.py::test_delegation_to_a_second_principal_denies_without_spending_the_grant",
+        "tests/test_approval_principal_binding.py::test_delegation_to_a_second_principal_denies_and_does_not_consume",
+        "tests/test_approval_principal_binding.py::test_copied_identity_string_without_host_attestation_denies",
+        "tests/test_approval_principal_binding.py::test_envelope_identity_disagreeing_with_host_denies"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0002 / consume: wrong or unattested principal is APPROVAL_PRINCIPAL_MISMATCH and does not consume."
+    },
+    {
+      "activation": [
+        "ApprovalStore.consume:296"
+      ],
+      "detail": "",
+      "duration_seconds": 3.96,
+      "file": "pep/approval.py",
+      "id": "M02",
+      "intent": "Ignore a post-mint tool/args substitution against the frozen invoke binding.",
+      "killing_tests": [
+        "tests/test_approval.py::test_approval_wrong_tool_denies_even_if_id_exists",
+        "tests/test_approval.py::test_mutated_args_deny_binding_mismatch_without_consume",
+        "tests/test_approval.py::test_args_mismatch_is_reported_before_state_mismatch",
+        "tests/test_approval.py::test_state_observer_not_called_when_grant_fails_an_earlier_check",
+        "tests/test_approval_implementation_binding.py::test_earlier_exits_return_their_own_code_and_never_call_the_observer"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0001 / consume: binding mismatch is APPROVAL_BINDING_MISMATCH and does not consume."
+    },
+    {
+      "activation": [
+        "ApprovalStore.consume:294"
+      ],
+      "detail": "",
+      "duration_seconds": 3.62,
+      "file": "pep/approval.py",
+      "id": "M03",
+      "intent": "Allow a single-use approval to be consumed after its TTL has elapsed.",
+      "killing_tests": [
+        "tests/test_approval.py::test_expired_approval_denies",
+        "tests/test_approval.py::test_state_observer_not_called_when_grant_fails_an_earlier_check",
+        "tests/test_approval_implementation_binding.py::test_earlier_exits_return_their_own_code_and_never_call_the_observer",
+        "tests/test_approval_laundering_classes.py::test_temporal_replay_after_expiry_or_consume_denies",
+        "tests/test_approval_principal_binding.py::test_wrong_principal_learns_nothing_about_grant_state"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0001 / consume: expired grant is APPROVAL_EXPIRED and does not consume."
+    },
+    {
+      "activation": [
+        "333"
+      ],
+      "detail": "",
+      "duration_seconds": 3.46,
+      "file": "pep/approval.py",
+      "id": "M04",
+      "intent": "Treat a missing implementation observer as a pass when the grant froze an implementation digest.",
+      "killing_tests": [
+        "tests/test_approval_implementation_binding.py::test_consume_failures_deny_without_spending[no-observer]",
+        "tests/test_approval_implementation_binding.py::test_lab_envelope_schema_field_implementation_digest_is_never_read"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0004 / _implementation_failure: observe is None returns 'no implementation observer' (mismatch, no consume)."
+    },
+    {
+      "activation": [
+        "complete_invoke:118"
+      ],
+      "detail": "",
+      "duration_seconds": 3.73,
+      "file": "pep/gate.py",
+      "id": "M05",
+      "intent": "Skip the pre-claim fence read so a completion after kill can still reach claim_entry and the tool path.",
+      "killing_tests": [
+        "tests/test_approval.py::test_kill_between_admission_and_entry_denies_fence_first_and_skips_observer",
+        "tests/test_approval_implementation_binding.py::test_kill_between_admission_and_entry_is_the_fence_and_skips_the_entry_observer"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0001 late-effect fence / complete_invoke: cut after admission is DENY late_effect_fence and does not call tool."
+    },
+    {
+      "activation": [
+        "149"
+      ],
+      "detail": "",
+      "duration_seconds": 3.23,
+      "file": "pep/gate.py",
+      "id": "M06",
+      "intent": "Pass the entry-time implementation re-observe when no observer was supplied, despite a frozen digest.",
+      "killing_tests": [
+        "tests/test_approval_implementation_binding.py::test_admission_without_an_entry_observer_fails_closed"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0004 / _implementation_still_matches: frozen digest with no observer fails closed (returns False)."
+    },
+    {
+      "activation": [
+        "128",
+        "complete_invoke:133"
+      ],
+      "detail": "",
+      "duration_seconds": 3.39,
+      "file": "pep/gate.py",
+      "id": "M07",
+      "intent": "Enter the tool even when claim_entry returned a deny reason (suspend/kill/fence/consumed).",
+      "killing_tests": [
+        "tests/test_late_effect_fence.py::test_kill_between_fence_check_and_tool_entry_denies",
+        "tests/test_late_effect_fence.py::test_suspend_between_fence_check_and_tool_entry_denies_and_keeps_the_admission",
+        "tests/test_late_effect_fence.py::test_completion_racing_past_the_spent_precheck_enters_at_most_once"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0001 / complete_invoke: if claim_entry blocks, supersede and do not call tool."
+    },
+    {
+      "activation": [
+        "PepRuntime.evaluate:380"
+      ],
+      "detail": "",
+      "duration_seconds": 3.53,
+      "file": "pep/evaluate.py",
+      "id": "M08",
+      "intent": "Skip the kill/unavailable fail-closed check so evaluates continue while the PEP is killed.",
+      "killing_tests": [
+        "tests/test_eval_corpus.py::test_corpus_row_matches_expected_receipt[acl-pep-eval-kill-001]"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0001 Fail-closed / PepRuntime.evaluate: killed or unavailable returns DENY kill_active."
+    },
+    {
+      "activation": [
+        "_capability_deny:616"
+      ],
+      "detail": "",
+      "duration_seconds": 3.67,
+      "file": "pep/evaluate.py",
+      "id": "M09",
+      "intent": "Accept a capability token from a non-holder or with a disagreeing envelope identity.",
+      "killing_tests": [
+        "tests/test_approval.py::test_invalid_capability_does_not_consume_valid_approval",
+        "tests/test_capability_principal_binding.py::test_unlisted_principal_gets_the_uniform_detail",
+        "tests/test_capability_principal_binding.py::test_envelope_identity_disagreeing_with_host_gets_the_uniform_detail",
+        "tests/test_capability_principal_binding.py::test_non_holder_learns_nothing_about_token_state",
+        "tests/test_capability_principal_binding.py::test_malformed_principals_authorise_nobody"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0003 / _capability_deny: non-holder or disagreeing envelope identity is CAPABILITY_MISSING."
+    },
+    {
+      "activation": [
+        "PepRuntime.evaluate:526"
+      ],
+      "detail": "",
+      "duration_seconds": 4.39,
+      "file": "pep/evaluate.py",
+      "id": "M10",
+      "intent": "ALLOW even when ApprovalStore.consume returned a fail-closed reason.",
+      "killing_tests": [
+        "tests/test_approval.py::test_approval_is_single_use_replay_denies",
+        "tests/test_approval.py::test_expired_approval_denies",
+        "tests/test_approval.py::test_unknown_approval_denies",
+        "tests/test_approval.py::test_stale_approval_denies_even_when_standing_capability_is_valid",
+        "tests/test_approval.py::test_concurrent_consume_is_single_use"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0001 / evaluate: consumed.reason is not None must DENY with that reason."
+    }
+  ],
+  "python": "3.11.15",
+  "repair_of": null,
+  "reviewer": "other-family",
+  "summary": {
+    "counts": {
+      "harness-fault": 0,
+      "invalid": 0,
+      "killed": 10,
+      "survived-never-activated": 0,
+      "survived-oracle-masked": 0,
+      "timeout": 0
+    },
+    "kill_rate_timeouts_as_killed": "10 of 10 (100%)",
+    "kill_rate_timeouts_not_killed": "10 of 10 (100%)",
+    "valid": 10
+  },
+  "timeout_seconds": 120.0
+}
