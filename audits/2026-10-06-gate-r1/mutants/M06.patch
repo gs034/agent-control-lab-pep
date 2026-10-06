@@ -1,0 +1,13 @@
+Intent: A state observer that raises at tool entry is treated as a match, so the tool runs on an unverified target
+Property: 'A raising observer is a mismatch' (_state_still_matches docstring); complete_invoke docstring: a change is DENY approval_state_mismatch
+--- a/pep/gate.py
++++ b/pep/gate.py
+@@ -166,7 +166,7 @@
+     try:
+         observed = pending.state_observer()
+     except Exception:
+-        return False
++        return True
+     return state_matches(frozen, observed)
+ 
+ 

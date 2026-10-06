@@ -1,0 +1,13 @@
+Intent: Successful consume marks a local copy as consumed but never writes it back to the store, so the grant can be replayed
+Property: Single-use: 'Single-use is enforced under the lock so two concurrent allows cannot share one grant' (consume docstring); ADR-0001 item 3 one-shot grant
+--- a/pep/approval.py
++++ b/pep/approval.py
+@@ -318,7 +318,7 @@
+                         self._observing.active = False
+                 if not record.matches_state(observed):
+                     return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, f"{source} mismatch")
+-            self._records[approval_id] = replace(record, consumed_at=clock)
++            record = replace(record, consumed_at=clock)
+             return ConsumeResult(
+                 None,
+                 frozen_state_digest=record.state_digest,

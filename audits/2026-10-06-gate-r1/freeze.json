@@ -1,0 +1,52 @@
+{
+  "audit_id": "2026-10-06-gate-r1",
+  "commit": "d4fe12835455c4e0ca064429202869bd8977aaf2",
+  "files": {
+    "harness/mutation_activation.py": "sha256:9f704fb1adeae4a35a3ade2852b6de3b3d11c839bff94d4ae4df3a4776da5e3d",
+    "harness/mutation_audit.py": "sha256:48d21fba2c72aec735f6f9845db9bee84e293a3aff47d748197db6f7eef611c4",
+    "pyproject.toml": "sha256:d49cb5028d0b036a430685501cc9e8f8df12b6bd04509c69be72c6f4f924a972",
+    "tests/test_approval.py": "sha256:fc01e7616f3e6659b9a5da1d54b2fc91da4a6e5513f80ca0248113f5d2576a2f",
+    "tests/test_approval_implementation_binding.py": "sha256:7f502eb6cfe35278a6adbf6afb257c0ae8505e2637a1d7af9c3b962548fb8355",
+    "tests/test_approval_laundering_classes.py": "sha256:d601f19e676d63ef8d721fcfcd88d538c4117726d6464f7820dfa8f4742db6af",
+    "tests/test_approval_principal_binding.py": "sha256:12d399e0f0a43dfb4403a08cae824d48e3d73bc4f0105f9b11ba3254ce130f6a",
+    "tests/test_capability_principal_binding.py": "sha256:c163b0d6ae4fbff4f1a18e5b6f85e0fa3f9bc0dfe7f6db775dce6e8cf68c975e",
+    "tests/test_demo.py": "sha256:d2398afd8315ada26fb10e07cb7163d7eb12866ec8b7104479e2184411155d2c",
+    "tests/test_deny_path.py": "sha256:31da6b849e5e061b2d8ea43c3b21552b98147917e5e4471c6ecff81f7946f604",
+    "tests/test_envelope.py": "sha256:2886d53f8e1df4d68648aa86acf483c1156619dc8fb0a2c2010c8b61a0b73bd8",
+    "tests/test_eval_corpus.py": "sha256:e5aeca189c11e9edd712fcb1ccde47d438d131f63ef0de90469792777042b706",
+    "tests/test_eval_row.py": "sha256:999180d804690e087563c3fd820f0f848fe6f3616ff7671d3a5f3f496e95e6b1",
+    "tests/test_execute_digested.py": "sha256:c31642e8b21b76a7d943afe6c33194f65ae113d42fa4162cad550d09c0d2b714",
+    "tests/test_fail_closed.py": "sha256:b235ebaf4716bd6740a5e0a6c6cae30b6f61e8fbd5c98a5812514ebe8a05df11",
+    "tests/test_halt_store.py": "sha256:efb9ba3da69aa8ddcbbed29e3a03cfbf6c32f9545c93197a235ef7e496f54b3f",
+    "tests/test_implementation_helpers.py": "sha256:b0fe5f608aa758b451543ae4de21933df75b7a0e3ee621d7d0df8471263ba211",
+    "tests/test_lab_brand_wall.py": "sha256:8902f67af557c36b5ed2468b3ac571237fa6ce1f4391d266838820689f737e3b",
+    "tests/test_late_effect_fence.py": "sha256:a15ee08e1387e32ce341ed89d70939aeb9a206e3547ef2b2912b900e34c96af9",
+    "tests/test_mutation_audit.py": "sha256:da851fb6ff139461a371398cf2fd2e557e77c2b930ff32d4ff8cc5c9816cbb55",
+    "tests/test_no_llm_path.py": "sha256:601899c7b12c1fa47f8c4d21c2786a36eef508276d51cba13c2368d678998df8",
+    "tests/test_prose_ignored.py": "sha256:fab6c904dda7984091bd4f770413c282f4ccb080fc168a36f4bb53d1813a679c",
+    "tests/test_receipt_schema.py": "sha256:9cb3f5875157fc92754bf9048486a5c9cc0d9e9f8e833bcdc154f1e290e98e39",
+    "tests/test_spdx.py": "sha256:725ad199962f45d5338ff5bb80ccfe052315aa4fd2e5f14abfa43f684e001902"
+  },
+  "mutants": {
+    "mutants/M01.patch": "sha256:6a003a1b224db65b09440c0bd3fbedddd90abd911087c127dd43d78019abe2cf",
+    "mutants/M02.patch": "sha256:3144e7c3a216fb17657e0664f37889dfa40c63ac3c76c6443e790716a16819d7",
+    "mutants/M03.patch": "sha256:8b3585f8b657d5c5a070f845810bbaa0ab7ec0bf6a455ccce88cdc18f561ff35",
+    "mutants/M04.patch": "sha256:9a05d9ca2cf57bfc7b7aaf45e95ff6a0d30473faa146f3b5b3f460e987988965",
+    "mutants/M05.patch": "sha256:356ebf921c3bbc0ce40153ab439743f351e6eb9fe322ca94c1d4b289ee7c28b3",
+    "mutants/M06.patch": "sha256:585c36b52dcc0ae90b949fde45b43e4ee8a0ba8ddaf997345a827bcc7f445781",
+    "mutants/M07.patch": "sha256:f368760e31e7f2603c0dd68549387d80d189cf54076b50b6ce6222379da1beb5",
+    "mutants/M08.patch": "sha256:ef4d85450576809a3d25abb67463f76b3dd7464d639998e43537ad8c88ec2cde",
+    "mutants/M09.patch": "sha256:f1dafdf54fb4d104adfda004504a23947eeb40e720cd3a2e45512c59173a7826",
+    "mutants/M10.patch": "sha256:3f3c44da9e7b6a97ca9ded72c7b089be5d3693c4d1f020c2cbe90476dfa37323"
+  },
+  "package": "pep",
+  "python": "3.11.15",
+  "repair_of": "2026-10-06-gate",
+  "reviewer": "same-family",
+  "scope": [
+    "pep/approval.py",
+    "pep/gate.py",
+    "pep/evaluate.py"
+  ],
+  "timeout_seconds": 120.0
+}

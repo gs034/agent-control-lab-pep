@@ -1,0 +1,13 @@
+Intent: claim_entry under the lock no longer refuses an admission that already holds a permit, so a second or concurrent claim gets another permit
+Property: One-shot permit: 'a replay cannot take a second permit' (ADR-0001 fence section); 'A second complete on the same admission is DENY admission_consumed' (gate.py docstring)
+--- a/pep/evaluate.py
++++ b/pep/evaluate.py
+@@ -195,8 +195,6 @@
+ 
+     def _claim_entry_unlocked(self, admission_id: int, admitted_epoch: int) -> ReasonCode | None:
+         """Spend the ticket or refuse. Caller holds ``self._lock``."""
+-        if admission_id in self._spent_admissions:
+-            return ReasonCode.ADMISSION_CONSUMED
+         blocked = self._entry_block_unlocked(admitted_epoch)
+         if blocked is not None:
+             # Suspend is reversible, so the ticket stays open across resume.
