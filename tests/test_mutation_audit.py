@@ -216,6 +216,7 @@ def test_controls_get_one_outcome_each(tmp_path):
     markdown = (root / "audits" / "A1" / "results.md").read_text()
     assert "There is no pass threshold." in markdown
     assert "Mutants specified by: person" in markdown
+    assert "a hunk applied away from its stated lines" in markdown
     with pytest.raises(ma.AuditError, match="already run"):
         ma.run("A1", root=root)
     assert ma.main(["report", "A1", "--root", str(root)]) == 0
@@ -516,3 +517,157 @@ def test_report_adds_a_rate_only_for_owner_signed_equivalents():
 def test_repair_results_are_labelled_as_the_same_set():
     text = ma.render(_results(repair_of="A1"), {})
     assert "Repair result on the same set as `A1`. This is not a new estimate." in text
+
+
+def _exit_zero_without_record(real_popen, *, skip_first: int = 0):
+    """Stand in for pytest: exit 0 and write no activation record."""
+    seen = {"n": 0}
+
+    def popen(cmd, **kwargs):
+        if isinstance(cmd, list) and "pytest" in cmd:
+            seen["n"] += 1
+            if seen["n"] > skip_first:
+                return real_popen(
+                    ["true"],
+                    stdout=kwargs.get("stdout"),
+                    stderr=kwargs.get("stderr"),
+                    start_new_session=kwargs.get("start_new_session", False),
+                )
+        return real_popen(cmd, **kwargs)
+
+    return popen
+
+
+def test_nonzero_pytest_without_a_failed_test_is_not_killed(tmp_path):
+    """An internal error, interrupt or crash with no failed test is not a kill."""
+    tests = TESTS.replace(
+        "def test_add():\n    assert calc.add(2, 3) == 5\n",
+        "def test_add():\n"
+        "    if calc.add(2, 3) == 999:\n"
+        "        pytest.exit('stop the session', returncode=3)\n"
+        "    assert calc.add(2, 3) == 5\n",
+    )
+    root = _toy(tmp_path, tests=tests)
+    _mutant(
+        root, "H1", "M01", CALC,
+        CALC.replace("def add(a, b):\n    return a + b\n", "def add(a, b):\n    import os\n    os._exit(1)\n"),
+    )
+    _mutant(root, "H1", "M02", CALC, CALC.replace("return a + b", "return 999"))
+    _mutant(root, "H1", "M03", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "H1")
+
+    results = ma.run("H1", root=root)
+
+    rows = {r["id"]: r for r in results["mutants"]}
+    assert rows["M01"]["outcome"] == "harness-fault"
+    assert rows["M02"]["outcome"] == "harness-fault"
+    assert rows["M01"]["killing_tests"] == []
+    assert rows["M02"]["killing_tests"] == []
+    assert "recorded no failed test" in rows["M01"]["detail"]
+    assert "without a record" in rows["M01"]["detail"]
+    assert "recorded no failed test" in rows["M02"]["detail"]
+    assert "without a record" not in rows["M02"]["detail"]
+    assert rows["M03"]["outcome"] == "killed"
+    assert rows["M03"]["killing_tests"] == ["tests/test_calc.py::test_add"]
+    summary = results["summary"]
+    assert summary["counts"]["killed"] == 1
+    assert summary["counts"]["harness-fault"] == 2
+    assert summary["valid"] == 1
+    assert summary["kill_rate_timeouts_not_killed"] == "1 of 1 (100%)"
+    assert summary["kill_rate_timeouts_as_killed"] == "1 of 1 (100%)"
+    markdown = (root / "audits" / "H1" / "results.md").read_text()
+    assert "pytest exited" in markdown
+    assert "recorded no failed test" in markdown
+    assert "harness-fault" in markdown
+
+
+def test_a_failed_setup_is_still_killed(tmp_path):
+    tests = TESTS + (
+        "\n\n@pytest.fixture\n"
+        "def armed():\n"
+        "    if calc.describe(1) == 'boom':\n"
+        "        raise RuntimeError('setup failed')\n"
+        "\n\n"
+        "def test_armed(armed):\n"
+        "    pass\n"
+    )
+    root = _toy(tmp_path, tests=tests)
+    _mutant(root, "H4", "M01", CALC, CALC.replace('f"value {x}"', '"boom"'))
+    _freeze(root, "H4")
+    row = ma.run("H4", root=root)["mutants"][0]
+    assert row["outcome"] == "killed"
+    assert row["killing_tests"] == ["tests/test_calc.py::test_armed"]
+
+
+def test_success_without_an_activation_record_aborts(tmp_path, monkeypatch, capsys):
+    root = _toy(tmp_path)
+    _mutant(root, "H2", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "H2")
+    real = subprocess.Popen
+    monkeypatch.setattr(subprocess, "Popen", _exit_zero_without_record(real))
+    with pytest.raises(ma.AuditAborted, match="the unmutated suite: pytest exited 0 without an activation record"):
+        ma.run("H2", root=root)
+    assert not (root / "audits" / "H2" / "results.json").exists()
+
+    assert ma.main(["run", "H2", "--root", str(root)]) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "without an activation record" in err
+    assert err.startswith("mutation audit:")
+
+
+def test_mutant_success_without_an_activation_record_aborts(tmp_path, monkeypatch):
+    root = _toy(tmp_path)
+    _mutant(root, "H3", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "H3")
+    real = subprocess.Popen
+    monkeypatch.setattr(subprocess, "Popen", _exit_zero_without_record(real, skip_first=1))
+    with pytest.raises(ma.AuditAborted, match="M01: pytest exited 0 without an activation record"):
+        ma.run("H3", root=root)
+    assert not (root / "audits" / "H3" / "results.json").exists()
+
+
+def test_system_and_global_git_config_cannot_change_how_a_patch_applies(tmp_path, monkeypatch):
+    root = _toy(tmp_path)
+    _mutant(root, "G1", "M01", CALC, CALC.replace("return a + b", "return a - b  "))
+    _freeze(root, "G1")
+    config = tmp_path / "gitconfig"
+    config.write_text("[apply]\n\twhitespace = error\n")
+    xdg = tmp_path / "xdg" / "git"
+    xdg.mkdir(parents=True)
+    (xdg / "config").write_text("[apply]\n\twhitespace = error\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "apply.whitespace")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "error")
+    assert ma.run("G1", root=root)["mutants"][0]["outcome"] == "killed"
+
+
+def test_shallow_clone_is_refused(tmp_path, capsys):
+    root = _toy(tmp_path)
+    _mutant(root, "S1", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "S1")
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "--depth", "1", f"file://{root}", str(shallow)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    history = _git(shallow, "log", "--format=%H", "--", "audits/S1/freeze.json").split()
+    assert history, "the shallow clone should still see the freeze commit"
+    with pytest.raises(ma.AuditError, match="shallow clone"):
+        ma.freeze("S2", reviewer="person", root=shallow, scope=SCOPE, package="toy")
+    sealed = ma._read_json(shallow / "audits" / "S1" / "freeze.json")
+    with pytest.raises(ma.FreezeMismatch, match="shallow clone"):
+        ma.verify(shallow, sealed)
+    with pytest.raises(ma.FreezeMismatch, match="shallow clone"):
+        ma.run("S1", root=shallow)
+    assert not (shallow / "audits" / "S1" / "results.json").exists()
+    assert ma.main(["freeze", "S2", "--reviewer", "person", "--root", str(shallow)]) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "shallow clone" in err

@@ -37,7 +37,9 @@ HARNESS_FILES = ("mutation_audit.py", "mutation_activation.py")
 HARNESS_SELF_TEST = "tests/test_mutation_audit.py"
 DEFAULT_SCOPE = ("pep/approval.py", "pep/gate.py", "pep/evaluate.py")
 REVIEWER_CLASSES = ("person", "other-family", "same-family")
-OUTCOMES = ("killed", "survived-never-activated", "survived-oracle-masked", "timeout", "invalid")
+OUTCOMES = (
+    "killed", "survived-never-activated", "survived-oracle-masked", "timeout", "invalid", "harness-fault",
+)
 MAX_KILLING_TESTS = 5
 MODULE = "<module>"
 ANY_CODE = "*"
@@ -262,6 +264,7 @@ def freeze(
     timeout: float = 300.0,
     repair_of: str | None = None,
 ) -> dict:
+    _refuse_shallow(root)
     if reviewer not in REVIEWER_CLASSES:
         raise AuditError(f"reviewer must be one of {', '.join(REVIEWER_CLASSES)}")
     audit = _audit_dir(root, audit_id)
@@ -296,6 +299,7 @@ def freeze(
 
 def verify(root: Path, sealed: dict) -> None:
     """Refuse unless the seal is committed once, and everything it names still matches."""
+    _refuse_shallow(root, FreezeMismatch)
     if _python_version().rsplit(".", 1)[0] != sealed["python"].rsplit(".", 1)[0]:
         raise FreezeMismatch(f"sealed under Python {sealed['python']}, running {_python_version()}")
     rel = f"audits/{sealed['audit_id']}"
@@ -343,9 +347,15 @@ def run(
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="mutation-audit-") as tmp:
         work = Path(tmp)
-        baseline = _run_suite(work, _extract(work, archive, sealed), sealed, [])
+        copy = _extract(work, archive, sealed)
+        try:
+            baseline = _run_suite(work, copy, sealed, [])
+        except AuditAborted as exc:
+            raise AuditAborted(f"the unmutated suite: {exc}") from exc
     if baseline["outcome"] == "timeout":
         raise AuditAborted("the unmutated suite exceeded the timeout")
+    if baseline["outcome"] == "harness-fault":
+        raise AuditAborted(f"the unmutated suite did not finish: {baseline['detail']}")
     if baseline["outcome"] != "passed":
         raise AuditAborted(f"the unmutated suite fails: {', '.join(baseline['failed']) or baseline['detail']}")
     baseline_seconds = round(time.monotonic() - started, 2)
@@ -389,7 +399,8 @@ def report(audit_id: str, *, root: Path = ROOT) -> str:
 
 def summarise(rows: list[dict], equivalent: set[str] | frozenset[str] = frozenset()) -> dict:
     counts = {outcome: sum(r["outcome"] == outcome for r in rows) for outcome in OUTCOMES}
-    valid = len(rows) - counts["invalid"]
+    # Invalid patches and harness faults are not measurements, so they stay out of the rate.
+    valid = len(rows) - counts["invalid"] - counts["harness-fault"]
     summary = {
         "counts": counts,
         "valid": valid,
@@ -434,7 +445,8 @@ def render(results: dict, equivalents: dict[str, dict]) -> str:
         )
     out += [
         "",
-        "Outcomes: " + ", ".join(f"{o} {counts[o]}" for o in OUTCOMES) + f". Invalid patches ({counts['invalid']}) "
+        "Outcomes: " + ", ".join(f"{o} {counts[o]}" for o in OUTCOMES) + ". "
+        f"Invalid patches ({counts['invalid']}) and harness faults ({counts['harness-fault']}) "
         "are outside the denominator.",
         "",
         "## Mutants",
@@ -449,6 +461,10 @@ def render(results: dict, equivalents: dict[str, dict]) -> str:
             f"| {r['id']} | `{r['file']}` | {activation} | {_cell(r['intent'])} | {_cell(r['property'])} "
             f"| {r['outcome']} | {killers} | {r['duration_seconds']} |"
         )
+    reasons = [line for r in rows for line in _reason_lines(r)]
+    if reasons:
+        out += ["", "## Reasons", ""]
+        out.extend(reasons)
     survivors = [r for r in rows if r["outcome"].startswith("survived")]
     out += ["", "## Survivors", ""]
     if survivors:
@@ -481,9 +497,9 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
         return {**row, "outcome": "invalid", "detail": "the target file is not in the frozen commit"}
     original = target.read_text(encoding="utf-8")
     files_before = _tree_digests(copy, mutant.target)
-    # The ceiling stops git finding an enclosing repository, whose config (apply.whitespace) could change the result.
-    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(work)}
-    applied = subprocess.run(["git", "apply", str(patch)], cwd=copy, env=env, capture_output=True, text=True)
+    applied = subprocess.run(
+        ["git", "apply", str(patch)], cwd=copy, env=_git_apply_env(work), capture_output=True, text=True
+    )
     if applied.returncode != 0:
         return {**row, "outcome": "invalid", "detail": applied.stderr.strip()}
     mutated = target.read_text(encoding="utf-8")
@@ -498,7 +514,10 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
     except ValueError as exc:
         return {**row, "outcome": "invalid", "detail": str(exc)}
     row["activation"] = [describe_target(t) for t in targets]
-    result = _run_suite(work, copy, sealed, targets, target=target)
+    try:
+        result = _run_suite(work, copy, sealed, targets, target=target)
+    except AuditAborted as exc:
+        raise AuditAborted(f"{mutant.mutant_id}: {exc}") from exc
     outcome = result["outcome"]
     if outcome == "passed":
         outcome = "survived-oracle-masked" if result["activated"] else "survived-never-activated"
@@ -508,7 +527,12 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
 def _run_suite(
     work: Path, copy: Path, sealed: dict, targets: list[tuple[str, int, int | None]], *, target: Path | None = None
 ) -> dict:
-    """Run pytest in ``copy``. Outcome: passed, killed or timeout; aborts only on a harness fault."""
+    """Run pytest in ``copy``.
+
+    Outcomes are passed, killed, harness-fault or timeout. A zero exit with no
+    activation record aborts: there is nothing to score. A non-zero exit that
+    recorded no failed test is harness-fault, not a kill.
+    """
     out = work / "activation.json"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "MUTATION_AUDIT_"))}
     env.update(
@@ -539,11 +563,24 @@ def _run_suite(
     record = json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
     if record is not None and record["error"]:
         raise AuditAborted(record["error"])
+    if record is None and proc.returncode == 0:
+        raise AuditAborted(f"pytest exited 0 without an activation record:\n{_tail(output)}")
     failed = record["failed"] if record else []
-    if proc.returncode == 0 and not failed:
-        return {"outcome": "passed", "activated": record["activated"], "failed": [], "detail": ""}
-    detail = "" if failed else f"pytest exited {proc.returncode}{'' if record else ' without a record'}:\n{_tail(output)}"
-    return {"outcome": "killed", "activated": bool(record and record["activated"]), "failed": failed, "detail": detail}
+    if failed:
+        # Collection errors, package-import errors and failed setup, teardown or call
+        # reports are recorded by the activation plugin and count as kills.
+        return {"outcome": "killed", "activated": bool(record["activated"]), "failed": failed, "detail": ""}
+    if proc.returncode != 0:
+        # Not evidence the suite caught the mutant: an internal error, interrupt or crash.
+        where = "" if record else " without a record"
+        detail = f"pytest exited {proc.returncode}{where} and recorded no failed test:\n{_tail(output)}"
+        return {
+            "outcome": "harness-fault",
+            "activated": bool(record and record["activated"]),
+            "failed": [],
+            "detail": detail,
+        }
+    return {"outcome": "passed", "activated": record["activated"], "failed": [], "detail": ""}
 
 
 def _applied_where_stated(mutant: Mutant, mutated: str) -> bool:
@@ -647,6 +684,46 @@ def _cell(text: str) -> str:
 
 def _tail(output: bytes, lines: int = 20) -> str:
     return "\n".join(output.decode("utf-8", "replace").splitlines()[-lines:])
+
+
+def _git_apply_env(work: Path) -> dict[str, str]:
+    """Environment for ``git apply`` that cannot see ambient git config.
+
+    The ceiling stops git finding an enclosing repository. The empty config files
+    and ``GIT_CONFIG_COUNT=0`` stop system, global and environment config (for
+    example ``apply.whitespace``) from changing whether the patch applies.
+    """
+    empty = work / "empty-gitconfig"
+    empty.write_text("")
+    env = dict(os.environ)
+    env.update(
+        GIT_CEILING_DIRECTORIES=str(work),
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=str(empty),
+        GIT_CONFIG_SYSTEM=str(empty),
+        GIT_CONFIG_COUNT="0",
+    )
+    return env
+
+
+def _refuse_shallow(root: Path, error: type[AuditError] = AuditError) -> None:
+    if _git(root, "rev-parse", "--is-shallow-repository").strip() == "true":
+        raise error(
+            "this repository is a shallow clone; freeze and verify need the full history, "
+            "and a partial history can make that check pass or fail for the wrong reason"
+        )
+
+
+def _reason_lines(row: dict) -> list[str]:
+    """Lines for ``results.md``. ``render`` used to drop ``detail``, so a harness fault looked like a bare outcome."""
+    detail = str(row.get("detail") or "").strip()
+    if not detail or detail == "timeout":
+        return []
+    lines = detail.splitlines()
+    head = f"- {row['id']} ({row['outcome']}): {lines[0]}"
+    if len(lines) == 1:
+        return [head]
+    return [head, "", *[f"      {line}" for line in lines[1:]], ""]
 
 
 def _git(root: Path, *args: str) -> str:
