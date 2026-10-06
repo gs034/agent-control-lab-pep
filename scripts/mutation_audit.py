@@ -198,9 +198,14 @@ def code_map(source: str, filename: str) -> list[Code]:
     return codes
 
 
-def _owner(codes: list[Code], line: int) -> Code:
+def _owner(codes: list[Code], *lines: int) -> Code:
     # The def or decorator line belongs to the enclosing code, which runs it.
-    return max((c for c in codes if c.first < line <= c.last), key=lambda c: c.first)
+    return max((c for c in codes for ln in lines if c.first < ln <= c.last), key=lambda c: c.first)
+
+
+def _new_line(mutant: Mutant, old: int) -> int:
+    """Where an unchanged line of the original sits in the mutated file."""
+    return old + sum(len(b.plus) - len(b.minus) for b in mutant.blocks if b.old_start + len(b.minus) <= old)
 
 
 def activation_targets(mutant: Mutant, original: str, mutated: str, filename: str) -> list[tuple[str, int, int | None]]:
@@ -210,7 +215,9 @@ def activation_targets(mutant: Mutant, original: str, mutated: str, filename: st
     at import (a ``def``, a default, a module constant) counts at import. A
     block with no such line (a deletion, a comment) is anchored in the code
     object that held it in the original: the first line after the change in
-    that code object, or entry into it when nothing follows.
+    that code object, or entry into it when nothing follows. An insertion is
+    anchored in the innermost code around either side of it. Raises
+    ``ValueError`` when that code object cannot be found in the mutated file.
     """
     before = code_map(original, filename)
     after = code_map(mutated, filename)
@@ -221,9 +228,17 @@ def activation_targets(mutant: Mutant, original: str, mutated: str, filename: st
         if hits:
             targets.update((ANY_CODE, 0, ln) for ln in hits)
             continue
-        anchor = block.minus[0] if block.minus else max(block.old_start - 1, 1)
-        key = _owner(before, anchor).key
-        code = next((c for c in after if c.key == key), None) or next(c for c in after if c.key[0] == MODULE)
+        if block.minus:
+            owner = _owner(before, block.minus[0])
+        else:
+            owner = _owner(before, block.old_start, max(block.old_start - 1, 1))
+        if owner.key[0] == MODULE:
+            key = owner.key
+        else:
+            key = (owner.key[0], _new_line(mutant, owner.first))
+        code = next((c for c in after if c.key == key), None)
+        if code is None:
+            raise ValueError(f"cannot find {owner.key[0]}, which held a change, in the mutated file")
         following = sorted(ln for ln in code.lines if ln >= block.new_start)
         targets.add((*code.key, following[0] if following else None))
     return sorted(targets, key=lambda t: (t[2] or 0, t[0], t[1]))
@@ -465,7 +480,7 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
     if not target.is_file():
         return {**row, "outcome": "invalid", "detail": "the target file is not in the frozen commit"}
     original = target.read_text(encoding="utf-8")
-    files_before = _tree_files(copy)
+    files_before = _tree_digests(copy, mutant.target)
     # The ceiling stops git finding an enclosing repository, whose config (apply.whitespace) could change the result.
     env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(work)}
     applied = subprocess.run(["git", "apply", str(patch)], cwd=copy, env=env, capture_output=True, text=True)
@@ -474,12 +489,14 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
     mutated = target.read_text(encoding="utf-8")
     if not _applied_where_stated(mutant, mutated):
         return {**row, "outcome": "invalid", "detail": "a hunk applied away from its stated lines"}
-    if _tree_files(copy) != files_before or _sealed_drift(copy, sealed):
+    if _tree_digests(copy, mutant.target) != files_before or _sealed_drift(copy, sealed):
         raise AuditAborted(f"{mutant.mutant_id} changed files other than {mutant.target}")
     try:
         targets = activation_targets(mutant, original, mutated, str(target))
     except SyntaxError as exc:
         return {**row, "outcome": "invalid", "detail": f"the mutated file does not compile: {exc.msg}"}
+    except ValueError as exc:
+        return {**row, "outcome": "invalid", "detail": str(exc)}
     row["activation"] = [describe_target(t) for t in targets]
     result = _run_suite(work, copy, sealed, targets, target=target)
     outcome = result["outcome"]
@@ -559,8 +576,13 @@ def _sealed_drift(copy: Path, sealed: dict) -> list[str]:
     ]
 
 
-def _tree_files(copy: Path) -> set[str]:
-    return {str(p.relative_to(copy)) for p in copy.rglob("*") if p.is_file() or p.is_symlink()}
+def _tree_digests(copy: Path, target: str) -> dict[str, str]:
+    """Every file in the copy except the target, by digest, so any other change shows."""
+    return {
+        rel: _sha256(path) if path.is_file() and not path.is_symlink() else f"link:{os.readlink(path)}"
+        for path in copy.rglob("*")
+        if (path.is_file() or path.is_symlink()) and (rel := str(path.relative_to(copy))) != target
+    }
 
 
 def _kill_group(proc: subprocess.Popen) -> None:

@@ -12,6 +12,7 @@ import importlib.util
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -287,14 +288,22 @@ def test_copy_that_differs_from_the_seal_aborts(tmp_path):
         ma._extract(work, archive, sealed)
 
 
-def test_patch_that_touches_another_file_aborts_after_apply(tmp_path):
+@pytest.mark.parametrize(
+    "extra",
+    [
+        lambda: RENAME_TESTS,
+        lambda: _diff("from toy import calc\n", "from toy import calc\nX = 1\n", "toy/__init__.py"),
+    ],
+    ids=["rename", "content"],
+)
+def test_patch_that_touches_another_file_aborts_after_apply(tmp_path, extra):
     root = _toy(tmp_path)
     good = _diff(CALC, CALC.replace("return a + b", "return a - b"))
     _write_mutant(root, "A10", "M01", good)
     sealed = _freeze(root, "A10")
     mutant = ma.parse_mutant("M01", (root / "audits" / "A10" / "mutants" / "M01.patch").read_text())
     smuggled = tmp_path / "smuggled.patch"
-    smuggled.write_text("diff --git a/toy/calc.py b/toy/calc.py\n" + good + RENAME_TESTS)
+    smuggled.write_text("diff --git a/toy/calc.py b/toy/calc.py\n" + good + extra())
     archive = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=root, check=True, capture_output=True).stdout
     work = tmp_path / "work"
     work.mkdir()
@@ -311,6 +320,40 @@ def test_an_enclosing_repository_cannot_change_how_a_patch_applies(tmp_path, mon
     scratch.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     assert ma.run("A11", root=root)["mutants"][0]["outcome"] == "killed"
+
+
+def test_namespace_package_aborts_the_run(tmp_path):
+    root = _toy(tmp_path)
+    _git(root, "rm", "-q", "toy/__init__.py")
+    _git(root, "commit", "-q", "-m", "namespace package")
+    _mutant(root, "A12", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "A12")
+    with pytest.raises(ma.AuditAborted, match="has no __file__"):
+        ma.run("A12", root=root)
+
+
+@pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
+def test_children_a_test_leaves_running_are_killed(tmp_path):
+    marker = f"mutation-audit-leftover-{uuid.uuid4().hex}"
+    spawn = (
+        "\n\ndef test_leaves_a_child():\n"
+        "    import subprocess, sys\n"
+        f"    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', {marker!r}],\n"
+        "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    )
+    root = _toy(tmp_path, tests=TESTS + spawn)
+    _mutant(root, "A13", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "A13")
+    ma.run("A13", root=root)
+    left = [p for p in Path("/proc").glob("[0-9]*") if marker.encode() in _cmdline(p)]
+    assert left == []
+
+
+def _cmdline(proc: Path) -> bytes:
+    try:
+        return (proc / "cmdline").read_bytes()
+    except OSError:
+        return b""
 
 
 def test_edit_during_run_aborts_at_next_hash_check(tmp_path):
@@ -433,6 +476,13 @@ def test_activation_targets():
     assert _targets(source, source.replace("return 2", "return 3")) == ["5"]
     assert _targets(source, source.replace("    return y\n", "")) == ["g (entry)"]
     assert _targets(source, source.replace("def h():", "def h(z=1):")) == ["13"]
+    assert _targets(source, source.replace("def h():\n", "def h():\n    global Y\n")) == ["h:15"]
+
+
+def test_activation_targets_follow_earlier_hunks_that_shift_lines():
+    source = "X = 1\n" + "\n" * 8 + "def g(x):\n    y = x\n    return y\n\n\ndef h():\n    pass\n"
+    mutated = source.replace("X = 1\n", "").replace("    return y\n", "")
+    assert set(_targets(source, mutated)) == {"<module>:9", "g (entry)"}
 
 
 def _results(**overrides) -> dict:
