@@ -1,0 +1,13 @@
+Intent: Capability check no longer requires the token to match the tool's required_capability
+Property: ADR-0001 item 2: a capability token must 'match the tool's required capability when present'; ADR-0003 table keeps policy_miss for a mismatched token
+--- a/pep/evaluate.py
++++ b/pep/evaluate.py
+@@ -626,8 +626,6 @@
+     cap_tools = cap.get("tools", [])
+     if parsed.tool_name not in cap_tools:
+         return ReasonCode.CAPABILITY_MISSING, "capability token does not cover tool"
+-    if required_cap and token != required_cap:
+-        return ReasonCode.POLICY_MISS, "capability token does not match tool policy"
+     return None
+ 
+ 
