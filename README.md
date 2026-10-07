@@ -4,7 +4,7 @@ This repository is a public-goods, Apache-2.0 **reference Policy Enforcement Poi
 
 The official eval row lives under `eval/` (Deep Research artefacts). The PEP loads `eval/structured_envelope.example.json` as the sole policy-relevant input. `eval/malicious_agent_prose.txt` is untrusted data and is never policy.
 
-**Architecture.** Callers (agent, optional monitor, HITL UI, or MCP/tool host) submit a structured invoke envelope to `pep.evaluate` / `pep.gated_invoke`. That function boundary *is* the PEP: frozen allowlist, capability tokens, and operator-issued single-use TTL approvals in the `pep` package decide ALLOW or DENY, emit a frozen-schema receipt, and on DENY never enter the tool. Kill and suspend fail closed; `kill()` also fences in-process late effects so a queued or in-flight admission cannot complete as ALLOW. Optional `HaltStore` persists halt mode across process restart. Model output, monitor scores, and agent prose sit outside this plane and cannot rewrite policy. ADR: [`docs/adr/ADR-0001-lab-pep-architecture.md`](docs/adr/ADR-0001-lab-pep-architecture.md). Roadmap (stub → v0.2 → v0.3 / EOI M1 → v0.3.2 late-effect fence → v0.3.3 state digest → v0.4.0 principal binding → v0.5.0 capability holders → v0.6.0 implementation binding → v0.7.0 execute what was digested): [`docs/ROADMAP.md`](docs/ROADMAP.md). Public threat model: [`docs/threat-model.md`](docs/threat-model.md). Reporting: [`SECURITY.md`](SECURITY.md). Contributing / Lab-only keep-out: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+**Architecture.** Callers (agent, optional monitor, HITL UI, or MCP/tool host) submit a structured invoke envelope to `pep.evaluate` / `pep.gated_invoke`. Those in-process functions decide ALLOW or DENY for tests and corpus rows. They are **not a security boundary**: the caller supplies the function, the clock and the identity. Package **v0.8.0** adds a separate reference host process, `python -m pep.host`, that owns them ([ADR-0007](docs/adr/ADR-0007-reference-host-process.md)). Frozen allowlist, capability tokens, and operator-issued single-use TTL approvals in the `pep` package decide ALLOW or DENY, emit a frozen-schema receipt, and on DENY never enter the tool. Kill and suspend fail closed; `kill()` also fences in-process late effects so a queued or in-flight admission cannot complete as ALLOW. Optional `HaltStore` persists halt mode across process restart. Model output, monitor scores, and agent prose sit outside this plane and cannot rewrite policy. ADR: [`docs/adr/ADR-0001-lab-pep-architecture.md`](docs/adr/ADR-0001-lab-pep-architecture.md). Roadmap (stub → v0.2 → v0.3 / EOI M1 → v0.3.2 late-effect fence → v0.3.3 state digest → v0.4.0 principal binding → v0.5.0 capability holders → v0.6.0 implementation binding → v0.7.0 execute what was digested → v0.8.0 reference host): [`docs/ROADMAP.md`](docs/ROADMAP.md). Public threat model: [`docs/threat-model.md`](docs/threat-model.md). Reporting: [`SECURITY.md`](SECURITY.md). Contributing / Lab-only keep-out: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## What this is
 
@@ -21,7 +21,7 @@ The official eval row lives under `eval/` (Deep Research artefacts). The PEP loa
 ## Four PEP lines (demonstrated in code)
 
 1. **Non-goal.** The deny path is deterministic host/runtime policy. It is **not** an LLM/CoT/transcript judge. `evaluate()` does not call a model.
-2. **Separate trust domain.** The `pep` package is the PEP. Agents and optional monitors are callers. In-process import is allowed; `evaluate()` / `gated_invoke()` is the boundary.
+2. **Separate trust domain.** The `pep` package is the PEP. Agents and optional monitors are callers. In-process import is allowed for tests and corpus rows; `evaluate()` / `gated_invoke()` is not a security boundary. The reference host process is the boundary that owns the function, the clock and the identity.
 3. **Structured envelopes only.** The PEP consumes the structured envelope. Agent free-text / “please allow” is **untrusted data** and never becomes policy.
 4. **Fail-closed.** Missing policy, unknown tool, expired/missing capability, a capability token presented by a principal that is not a listed holder, invalid/expired/consumed/binding-mismatched/state-mismatched/principal-mismatched/implementation-mismatched approval, PEP unavailable, kill, suspend, or a late effect after kill, parse failure → **DENY** + receipt; `gated_invoke` does not enter the tool. Halt mode can persist in a JSON file so a restarted process still denies. A pre-cut admission that completes after `kill()` denies as `late_effect_fence`.
 
@@ -68,6 +68,75 @@ That prints one line per scenario, using two programs both named `labtool` and a
 
 It exits non-zero if any decision, reason code, program run or grant state differs from the table. Each line also carries the receipt; on the ALLOW rows its `tool_invoke_executed` is `false` because the receipt is issued at the decision, before the tool runs. The third row is shown on purpose: it is the residual that 0.7.0 closes, and only for hosts that use the helper. Existence proof on fixtures; not live enforcement and not a measured attack-success rate.
 
+## Reference host under its own user
+
+The reference host is a separate process. The agent talks to it through a Unix socket and sends only a tool name and arguments. The host decides. This is a reference prototype. It is not a measured reduction in attack success, and it is not a product.
+
+The in-process calls `pep.evaluate` and `pep.gated_invoke` still work. Use them for the corpus and the unit tests. Do not treat them as the gate in front of a real tool: the caller of those functions picks the function that runs, the clock, and the identity string.
+
+What the host keeps to itself:
+
+- the registry (the functions that actually run)
+- the clock
+- who the caller is, taken from the connection, not from a name in the message
+- the policy
+- the halt file (killed, suspended, or active)
+- an append-only decision log
+
+Run it as a user the agent does not share. The process does not switch user by itself. You start it as that user.
+
+1. Create a user for the host, for example `acl-pep`, and a group for the agent, for example `acl-agent`. The agent user is in `acl-agent`. It is not `acl-pep`.
+2. Create a directory the agent cannot list or write. The halt file and the decision log live here.
+
+```bash
+sudo install -d -o acl-pep -g acl-pep -m 0700 /var/lib/acl-pep
+```
+
+3. Create a directory the agent can enter, so it can connect to the socket, but cannot replace files in. The host user owns it. The agent group can traverse it.
+
+```bash
+sudo install -d -o acl-pep -g acl-agent -m 0750 /run/acl-pep
+```
+
+4. Initialise the halt file as the host user. If this file is missing, unreadable, or damaged, the gate stays halted. It does not start active to fill the gap.
+
+```bash
+sudo -u acl-pep python -m pep.host init-halt --halt /var/lib/acl-pep/halt.json
+```
+
+5. Start the host as that same user.
+
+```bash
+sudo -u acl-pep python -m pep.host serve \
+  --socket /run/acl-pep/pep.sock \
+  --halt /var/lib/acl-pep/halt.json \
+  --log /var/lib/acl-pep/decisions.log
+```
+
+The socket is created mode 0660, so the agent group can connect. The halt file and the log are mode 0600, owned by the host user. The agent can send bytes to the socket. It cannot rewrite the halt file or the log unless it is the host user or it can write the directory.
+
+6. From the agent, send one JSON object per line. The only keys are `tool_name` and `args`.
+
+```json
+{"tool_name": "echo.ping", "args": {"message": "hi"}}
+```
+
+Anything else (`now`, `principal`, `session_id`, `tool`, a capability token, an approval id) is denied. The host reads the connecting process's user id, group id and process id from the socket (on Linux, the kernel's peer credentials) and assigns a session to that connection. The agent never sends the session name. A second connection is a different session, so it cannot use a grant that was minted for the first one.
+
+A call is allowed only when the operator has minted a grant on the host for that connection, for that tool and those arguments, and the grant has not expired on the host's clock. The built-in registry runs `echo.ping`. The agent does not supply the function.
+
+To halt the gate:
+
+```bash
+sudo -u acl-pep python -m pep.host kill --halt /var/lib/acl-pep/halt.json
+```
+
+If that write fails, the command exits non-zero. A host process that was already running and fails to write a kill stays halted. Deleting `halt.json` does not turn the gate back on. The next process treats a missing file as halted.
+
+The decision log is JSON lines in `/var/lib/acl-pep/decisions.log`. Each line lists the checks that ran for that call. It does not contain a field that is true by construction, such as "policy unchanged". Denials are in this file even when the agent throws away the reply.
+
+Full decision: [`docs/adr/ADR-0007-reference-host-process.md`](docs/adr/ADR-0007-reference-host-process.md).
+
 ## Receipt shape
 
 Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v1 schema (`eval/receipt.schema.json`):
@@ -88,7 +157,8 @@ Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v
 | `pep/approval.py` | Single-use TTL approval store (operator-issued grants bound to tool + canonical args and to a host-attested principal, optionally to a host state digest) |
 | `pep/halt.py` | Durable kill / suspend JSON store (optional; survives restart) |
 | `pep/evaluate.py` | PEP trust domain: `evaluate(envelope) -> Decision`; kill/suspend API |
-| `pep/gate.py` | Never invoke on DENY; `begin_invoke` / `complete_invoke` fence late effects |
+| `pep/gate.py` | Never invoke on DENY; `begin_invoke` / `complete_invoke` fence late effects. The callable argument is not a security boundary |
+| `pep/host/` | Reference host process: Unix socket, registry, clock, connection identity, halt file, append-only decision log |
 | `pep/receipt.py` | Frozen v1 receipt (`validate_receipt`) |
 | `pep/row.py` | Loader for the official `eval/` row |
 | `pep/corpus.py` | Loader for M1 `eval/corpus/` rows (same `evaluate()` path) |
@@ -96,6 +166,7 @@ Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v
 | `eval/` | Official Deep Research row, envelope, prose, expected receipt, frozen receipt schema |
 | `eval/corpus/` | M1 structured envelopes + expected receipts (deny classes + catalog-bound ALLOW + approval binding) |
 | `docs/adr/ADR-0001-lab-pep-architecture.md` | Architecture decision: trust domain, grants, fail-closed, halt, receipts |
+| `docs/adr/ADR-0007-reference-host-process.md` | The gate runs as its own process under its own user. The in-process library is not a security boundary |
 | `docs/ROADMAP.md` | stub → v0.2 → v0.3 / EOI M1 → v0.3.1 approval binding → v0.3.2 late-effect fence → v0.3.3 state digest → v0.4.0 principal binding → v0.5.0 capability holders → v0.6.0 implementation binding → v0.7.0 execute what was digested |
 | `docs/threat-model.md` | Public host/runtime PEP threat model and control taxonomy |
 | `docs/DILIGENCE-HISTORY.md` | Residual historical PR refs by SHA/ref (tip stays Lab-clean) |

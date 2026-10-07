@@ -2,7 +2,7 @@
 
 Brand: **Agent Control Lab**. Licence: **Apache-2.0**. This is a public-goods reference PEP, not a shipping product.
 
-Versions below are **lab milestones**, not a vendor SKU. Package `0.7.0` adds a host helper that executes the sealed copy it digested (ADR-0005). `0.6.0` lets an approval bind the implementation resolved at mint (ADR-0004). `0.5.0` binds every standing capability token to its policy-listed, host-attested holders, and moves the stub policy to `0.2.0-stub` (ADR-0003). `0.4.0` binds every approval to a host-attested principal (ADR-0002). `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt attests `policy_version: 0.2.0-stub` (it was `0.1.0-stub` before 0.5.0).
+Versions below are **lab milestones**, not a vendor SKU. Package `0.8.0` runs the gate as a separate reference host (ADR-0007). The in-process library remains for tests and is not a security boundary. Package `0.7.0` adds a host helper that executes the sealed copy it digested (ADR-0005). `0.6.0` lets an approval bind the implementation resolved at mint (ADR-0004). `0.5.0` binds every standing capability token to its policy-listed, host-attested holders, and moves the stub policy to `0.2.0-stub` (ADR-0003). `0.4.0` binds every approval to a host-attested principal (ADR-0002). `0.3.3` adds an optional state digest to approval binding. `0.3.2` is a patch on v0.3.1 (in-process late-effect fence after kill). `0.3.1` remains the approval-binding patch on v0.3 / EOI **M1**. The official allowlist / eval receipt attests `policy_version: 0.2.0-stub` (it was `0.1.0-stub` before 0.5.0).
 
 ## stub (published 0.1)
 
@@ -126,7 +126,7 @@ Same PEP trust domain. [ADR-0004](adr/ADR-0004-approval-implementation-binding.m
 | Work | Status |
 | --- | --- |
 | `issue_approval(..., implementation_digest=)` is optional per grant; a malformed value raises `ApprovalError` | In tree |
-| Host-only `implementation_observer=` on `evaluate` / `begin_invoke` / `gated_invoke`, and `observe_implementation=` on `consume` / `try_consume`. No envelope field: a top-level `implementation_digest` key is `envelope_invalid` in both shapes, and one inside a lab envelope's `schema_fields` is dropped and never read | In tree |
+| Host-only `implementation_observer=` on `evaluate` / `begin_invoke` / `gated_invoke`, and `observe_implementation=` on `consume` / `try_consume`. No envelope field: a top-level `implementation_digest` key is `envelope_invalid` in both shapes. An unknown key inside a lab envelope's `schema_fields` was dropped until 0.8.0; [ADR-0007](adr/ADR-0007-reference-host-process.md) rejects it as `envelope_invalid` | In tree |
 | Consume checks it after the binding and before the state check, under the store lock. Missing, raising, non-digest or different observations, and observer re-entry, are `approval_implementation_mismatch` and do not consume. Earlier exits never call the observer | In tree |
 | `complete_invoke` checks the fence, then whether the admission was already spent, then the implementation, then the state. An entry mismatch, including a missing entry observer, denies with the grant spent | In tree |
 | `pep/implementation.py`: optional host helpers `executable_digest` and `callable_digest` | In tree |
@@ -135,7 +135,7 @@ Same PEP trust domain. [ADR-0004](adr/ADR-0004-approval-implementation-binding.m
 
 Still open at 0.6.0: grants minted without a digest; the check-to-exec race after the entry check (narrowed in 0.7.0); implementations that were already unsafe at mint; capability-token invokes, which have no mint moment (a per-tool policy pin is a candidate later ADR); a host that misreports its observation. No sibling pin needs to move, because the change is additive.
 
-## v0.7.0 / execute what was digested (this tree)
+## v0.7.0 / execute what was digested
 
 Same PEP trust domain. [ADR-0005](adr/ADR-0005-execute-the-digested-artefact.md) narrows ADR-0004's check-to-exec race for hosts that use a new helper. The PEP core, reason codes, receipts and `POLICY_VERSION` are unchanged.
 
@@ -147,6 +147,21 @@ Same PEP trust domain. [ADR-0005](adr/ADR-0005-execute-the-digested-artefact.md)
 | Measured added cost, local container: `open_executable` over `executable_digest` is 16 µs median on the test script and 1.1 ms on a 1.4 MB binary (whose hash alone is 1.8 ms); `open_executable` plus `run` over exec by path is 194 µs median on a two-line shell script (1.74 ms against 1.54 ms, 300 runs). The provisional 1 ms ceiling is set for the stub test program, which is under it | Measured |
 
 Still open: hosts that do not use the helper; what the program loads by path; unpinned `#!/usr/bin/env` interpreters; platforms other than Linux; an LSM that blocks exec from memfd (not observed; it would fail after the grant is spent); what the child sees (`argv[0]` is `/proc/self/fd/<n>`, the sealed fd is inherited, `interpreter=` drops the script's shebang flags); equivalent-access attackers.
+
+## v0.8.0 / reference host process (this tree)
+
+[ADR-0007](adr/ADR-0007-reference-host-process.md). The in-process library stays for tests and corpus rows and is not a security boundary. A separate process owns the registry, the clock, the connection identity, the policy, the halt file and an append-only decision log. The agent sends `tool_name` and `args` only. A missing or unreadable halt file, or a failed kill write, leaves the gate halted. Decision records list checks that ran and do not carry a boolean that is true by construction.
+
+This is a reference prototype. It is not a measured attack-success reduction and not a product.
+
+| Work | Status |
+| --- | --- |
+| `python -m pep.host serve` on a Unix socket; peer credentials name the connection | In tree |
+| Unknown envelope keys, including unknown `invoke` and `schema_fields` keys, are `envelope_invalid` | In tree |
+| Halt file missing, unreadable, or a failed kill write: gate halted | In tree |
+| Append-only decision log, mode 0600, no agent command to write or delete it | In tree |
+| Regressions in `tests/test_reference_host.py` | In tree |
+| Frozen receipt schema v1 unchanged. The host log does not copy `policy_file_unchanged` | Required invariant |
 
 ## Remaining v1 notes
 

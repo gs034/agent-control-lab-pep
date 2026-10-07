@@ -464,8 +464,8 @@ def test_lab_envelope_top_level_implementation_digest_is_envelope_invalid():
     assert not runtime.approvals.lookup(grant.approval_id).consumed()
 
 
-def test_lab_envelope_schema_field_implementation_digest_is_never_read():
-    """Unknown ``schema_fields`` keys are dropped; the observation still comes only from the host."""
+def test_lab_envelope_schema_field_unknown_key_is_envelope_invalid():
+    """Unknown ``schema_fields`` keys are rejected, not dropped and not read."""
     runtime = _runtime()
     grant = _issue(runtime, {"argv": []}, implementation_digest=FROZEN)
 
@@ -473,8 +473,8 @@ def test_lab_envelope_schema_field_implementation_digest_is_never_read():
         _lab_envelope(grant.approval_id, implementation_digest=FROZEN), runtime=runtime, now=NOW, principal=HOST
     )
 
-    assert decision.receipt.reason_code == MISMATCH
-    assert decision.receipt.reason_detail.endswith("; no implementation observer")
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
+    assert "implementation_digest" in decision.receipt.reason_detail
     assert not runtime.approvals.lookup(grant.approval_id).consumed()
 
 

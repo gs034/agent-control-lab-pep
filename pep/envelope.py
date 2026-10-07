@@ -43,6 +43,21 @@ TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_.]{0,127}$")
 IDENTITY_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
+# Keys the lab envelope actually evaluates. Anything else is rejected.
+# ``schema_fields`` used to drop unknown keys; that let a later host treat
+# unchecked input as approved. ADR-0007 closes that gap.
+INVOKE_KEYS = frozenset({"argv", "schema_fields", "tool_name"})
+SCHEMA_FIELD_KEYS = frozenset(
+    {
+        "approval_id",
+        "capability_token",
+        "cwd",
+        "env_allowlist",
+        "network",
+        "state_digest",
+    }
+)
+
 PROSE_COAX_KEYS = frozenset(
     {
         "please_allow",
@@ -179,6 +194,8 @@ def _parse_lab_envelope(raw: Mapping[str, Any]) -> InvokeEnvelope:
     if not isinstance(invoke, Mapping):
         raise EnvelopeError(ReasonCode.ENVELOPE_INVALID, "invoke must be a JSON object")
 
+    _reject_unknown_keys(invoke.keys(), INVOKE_KEYS, "invoke")
+
     tool_name = invoke.get("tool_name")
     _require_tool_name(tool_name)
 
@@ -187,6 +204,7 @@ def _parse_lab_envelope(raw: Mapping[str, Any]) -> InvokeEnvelope:
         schema = {}
     if not isinstance(schema, Mapping):
         raise EnvelopeError(ReasonCode.ENVELOPE_INVALID, "schema_fields must be a JSON object")
+    _reject_unknown_keys(schema.keys(), SCHEMA_FIELD_KEYS, "schema_fields")
 
     token = _optional_string(schema.get("capability_token"), "capability_token")
     approval = _optional_string(schema.get("approval_id"), "approval_id")
@@ -306,6 +324,22 @@ def _parse_flat_envelope(raw: Mapping[str, Any]) -> InvokeEnvelope:
         source=dict(raw),
         state_digest=state_digest,
     )
+
+
+def _reject_unknown_keys(present: Any, allowed: frozenset[str], where: str) -> None:
+    """Fail closed. Unknown keys are not dropped and not treated as approved."""
+    extra = set(present) - allowed
+    coax = extra & PROSE_COAX_KEYS
+    if coax:
+        raise EnvelopeError(
+            ReasonCode.AGENT_PROSE_REJECTED,
+            f"policy-coax key rejected in {where}: {sorted(coax)}",
+        )
+    if extra:
+        raise EnvelopeError(
+            ReasonCode.ENVELOPE_INVALID,
+            f"unknown {where} keys rejected: {sorted(extra)}",
+        )
 
 
 def _optional_string(value: Any, field: str) -> str | None:

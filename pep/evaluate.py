@@ -4,12 +4,16 @@
 
 Trust domain
 ------------
-This module *is* the Policy Enforcement Point. Agents, optional monitors,
-and any HITL UI are callers on the other side of ``evaluate()``. In-process
-import is allowed; the function boundary is the trust boundary. There is
+``evaluate()`` decides ALLOW or DENY for one structured envelope. There is
 no LLM, CoT, or transcript judge on this path — policy is a frozen
 allowlist plus capability tokens and single-use TTL approvals bound
 to a frozen invoke (tool_name + canonical args).
+
+This in-process function is not a security boundary. The caller supplies
+the clock (``now``), the principal, the observers, and, through
+``gated_invoke``, the callable that runs. A process that can call
+``evaluate()`` can choose those. The reference host in ``pep.host`` is a
+separate process that owns them. See ADR-0007.
 """
 
 from __future__ import annotations
