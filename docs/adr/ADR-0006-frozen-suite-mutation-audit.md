@@ -13,7 +13,10 @@
   - Two departures from the phase text below:
     - one same-set re-run followed both repairs, not one per repair;
     - the re-run's seal and results arrived in one PR, with the seal commit pushed before the run.
-  - A new estimate needs a new, independently specified set.
+  - Follow-up rounds, each sealed before its run, by an independently specified writer:
+    - `2026-10-06-gate-set2` (pep#31 seal, pep#32 results): ten mutants of the same three gate files by a non-Claude model, reviewer class `other-family`, sealed against `0bac0f6`: 10 of 10 killed. It is the new estimate for the gate after the repairs. Its M08 had only one killing test, which led to the kill-precedence tests in pep#33.
+    - `2026-10-07-impl` (pep#34): ten mutants of `pep/implementation.py` (ADR-0005) written by Grok and reviewed by the owner before the seal, reviewer class `other-family`, sealed against `95cf2c6` and run there: 10 of 10 killed, all by `tests/test_execute_digested.py`.
+  - These sets do not establish that the gate or the helper is correct, nor anything about faults outside them. The other-family writers' training data was not verified, and the repository is public.
 - **Date:** 2026-10-06
 - **Depends on:** nothing. It audits the tests behind ADR-0002 to ADR-0005; it changes no PEP behaviour.
 - **Origin:** research-loop work package WP-RL-010 (run `acl-rl-2026-10-05-1400`, finding RF-20261005-07).
