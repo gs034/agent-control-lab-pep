@@ -1,0 +1,14 @@
+Intent: Drop the regular-file check so a FIFO or other non-regular PATH hit is opened and copied.
+Property: ADR-0005 Decision §1.2 / open_executable docstring: a source that is not a regular file is refused (O_NONBLOCK open alone is not enough).
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -226,9 +226,6 @@
+ def _open_regular(real: Path) -> int:
+     # O_NONBLOCK so a FIFO on PATH cannot hang the open.
+     fd = os.open(real, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+-    if not stat.S_ISREG(os.fstat(fd).st_mode):
+-        os.close(fd)
+-        raise ImplementationUnavailable(f"not a regular file: {real}")
+     return fd
+ 
+ 

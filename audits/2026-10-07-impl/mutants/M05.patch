@@ -1,0 +1,13 @@
+Intent: Stop refusing executable= so subprocess can exec a different binary than the sealed copy.
+Property: ADR-0005 Decision §3 / acceptance 'executable= passed through'; run docstring: executable= is refused because it can run something other than the copy.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -92,7 +92,7 @@
+         ``shell``, ``executable`` and ``preexec_fn`` are refused: each can run
+         something other than the copy. Caller ``pass_fds`` are kept.
+         """
+-        for refused in ("shell", "executable", "preexec_fn"):
++        for refused in ("shell", "preexec_fn"):
+             if refused in kwargs:
+                 raise TypeError(f"run() does not accept {refused}=")
+         fds = set(kwargs.pop("pass_fds", ()))

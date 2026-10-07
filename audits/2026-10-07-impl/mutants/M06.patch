@@ -1,0 +1,17 @@
+Intent: On EINVAL from memfd_create with MFD_EXEC, raise instead of retrying without MFD_EXEC.
+Property: ADR-0005 Decision §1.2 / acceptance 'the MFD_EXEC retry removed': pre-6.3 kernels reject MFD_EXEC with EINVAL and the helper must retry without it.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -238,11 +238,7 @@
+         return os.memfd_create("pep-exec", base | _MFD_EXEC)
+     except OSError as exc:
+         if exc.errno == errno.EINVAL:
+-            # Kernels before 6.3 do not know MFD_EXEC; they never exec-seal.
+-            try:
+-                return os.memfd_create("pep-exec", base)
+-            except OSError as retry:
+-                raise ImplementationUnavailable(f"memfd_create failed: {retry.strerror}") from retry
++            raise ImplementationUnavailable(f"memfd_create failed: {exc.strerror}") from exc
+         if exc.errno in (errno.EPERM, errno.EACCES):
+             raise ImplementationUnavailable("kernel policy refuses an executable memfd") from exc
+         raise

@@ -1,0 +1,12 @@
+Intent: Skip F_ADD_SEALS so the memfd copy is never write-sealed after fchmod.
+Property: ADR-0005 Decision §1.3 / acceptance 'no seal': the copy must be sealed (F_SEAL_WRITE|GROW|SHRINK|SEAL) so it cannot change after digest.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -159,7 +159,6 @@
+     try:
+         try:
+             os.fchmod(fd, 0o500)
+-            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+         except OSError as exc:
+             raise ImplementationUnavailable(f"cannot seal an executable copy: {exc.strerror}") from exc
+         if _after_copy is not None:

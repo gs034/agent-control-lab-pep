@@ -1,0 +1,16 @@
+Intent: On seal failure, close the memfd and fall back to an on-disk O_RDONLY fd instead of raising.
+Property: ADR-0005 Decision §6 / acceptance 'path fallback on failure': open_executable must raise ImplementationUnavailable and never fall back to the path/disk artefact.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -160,8 +160,9 @@
+         try:
+             os.fchmod(fd, 0o500)
+             fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+-        except OSError as exc:
+-            raise ImplementationUnavailable(f"cannot seal an executable copy: {exc.strerror}") from exc
++        except OSError:
++            os.close(fd)
++            fd = _open_regular(real)
+         if _after_copy is not None:
+             _after_copy(real)
+         return ResolvedExecutable(real, _program_digest(real, fd), fd)

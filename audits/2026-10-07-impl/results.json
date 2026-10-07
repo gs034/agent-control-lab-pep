@@ -1,0 +1,188 @@
+{
+  "audit_id": "2026-10-07-impl",
+  "baseline_seconds": 2.41,
+  "commit": "95cf2c666f00e26348d2f7e8d78d42b42cd00656",
+  "mutants": [
+    {
+      "activation": [
+        "open_executable:162"
+      ],
+      "detail": "",
+      "duration_seconds": 4.7,
+      "file": "pep/implementation.py",
+      "id": "M01",
+      "intent": "Skip F_ADD_SEALS so the memfd copy is never write-sealed after fchmod.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_the_sealed_copy_refuses_write_grow_and_shrink"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a71.3 / acceptance 'no seal': the copy must be sealed (F_SEAL_WRITE|GROW|SHRINK|SEAL) so it cannot change after digest."
+    },
+    {
+      "activation": [
+        "167",
+        "168",
+        "169",
+        "171",
+        "172"
+      ],
+      "detail": "",
+      "duration_seconds": 3.96,
+      "file": "pep/implementation.py",
+      "id": "M02",
+      "intent": "Digest the on-disk file after copy instead of reading back the sealed memfd.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_bytes_added_to_the_memfd_before_sealing_are_digested",
+        "tests/test_execute_digested.py::test_file_rewritten_after_the_copy_is_not_what_gets_digested"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a72 / acceptance 'digest from disk instead of the copy': digest must be of the sealed copy, not the path on disk."
+    },
+    {
+      "activation": [
+        "163",
+        "164",
+        "165"
+      ],
+      "detail": "",
+      "duration_seconds": 4.2,
+      "file": "pep/implementation.py",
+      "id": "M03",
+      "intent": "On seal failure, close the memfd and fall back to an on-disk O_RDONLY fd instead of raising.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_refused_fchmod_is_unavailable_and_closes_the_memfd"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a76 / acceptance 'path fallback on failure': open_executable must raise ImplementationUnavailable and never fall back to the path/disk artefact."
+    },
+    {
+      "activation": [
+        "98"
+      ],
+      "detail": "",
+      "duration_seconds": 4.14,
+      "file": "pep/implementation.py",
+      "id": "M04",
+      "intent": "Use caller pass_fds as the whole set (defaulting to the handle) instead of merging the handle into the caller set.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_caller_pass_fds_are_kept_alongside_the_handle"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a73 / acceptance 'pass_fds replaced instead of merged': caller pass_fds must be merged with the sealed-copy fd, not replaced."
+    },
+    {
+      "activation": [
+        "95"
+      ],
+      "detail": "",
+      "duration_seconds": 4.29,
+      "file": "pep/implementation.py",
+      "id": "M05",
+      "intent": "Stop refusing executable= so subprocess can exec a different binary than the sealed copy.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_run_refuses_shell_and_executable[executable]"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a73 / acceptance 'executable= passed through'; run docstring: executable= is refused because it can run something other than the copy."
+    },
+    {
+      "activation": [
+        "241"
+      ],
+      "detail": "",
+      "duration_seconds": 3.82,
+      "file": "pep/implementation.py",
+      "id": "M06",
+      "intent": "On EINVAL from memfd_create with MFD_EXEC, raise instead of retrying without MFD_EXEC.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_kernel_without_mfd_exec_falls_back_and_still_works"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a71.2 / acceptance 'the MFD_EXEC retry removed': pre-6.3 kernels reject MFD_EXEC with EINVAL and the helper must retry without it."
+    },
+    {
+      "activation": [
+        "101",
+        "104",
+        "106"
+      ],
+      "detail": "",
+      "duration_seconds": 3.96,
+      "file": "pep/implementation.py",
+      "id": "M07",
+      "intent": "Build argv from real_path strings instead of /proc/self/fd sealed paths.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_in_place_write_after_open_runs_the_digested_program",
+        "tests/test_execute_digested.py::test_file_rewritten_after_the_copy_is_not_what_gets_digested",
+        "tests/test_execute_digested.py::test_pinned_interpreter_runs_under_a_combined_digest"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a73\u20134 and module docstring: run must exec the sealed copy via /proc/self/fd so nothing is resolved by path after the copy."
+    },
+    {
+      "activation": [
+        "95"
+      ],
+      "detail": "",
+      "duration_seconds": 4.2,
+      "file": "pep/implementation.py",
+      "id": "M08",
+      "intent": "Stop refusing preexec_fn= so the caller can run arbitrary code in the child before exec.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_run_refuses_shell_and_executable[preexec_fn]"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a73 and run docstring: preexec_fn= is refused because it can run something other than the copy."
+    },
+    {
+      "activation": [
+        "_open_regular:229"
+      ],
+      "detail": "",
+      "duration_seconds": 3.99,
+      "file": "pep/implementation.py",
+      "id": "M09",
+      "intent": "Drop the regular-file check so a FIFO or other non-regular PATH hit is opened and copied.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_a_fifo_on_path_is_refused_without_hanging"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a71.2 / open_executable docstring: a source that is not a regular file is refused (O_NONBLOCK open alone is not enough)."
+    },
+    {
+      "activation": [
+        "160",
+        "161",
+        "162",
+        "168"
+      ],
+      "detail": "",
+      "duration_seconds": 3.83,
+      "file": "pep/implementation.py",
+      "id": "M10",
+      "intent": "Compute the digest before fchmod/seals so bytes written through the fd after digest and before seal are what run.",
+      "killing_tests": [
+        "tests/test_execute_digested.py::test_bytes_added_to_the_memfd_before_sealing_are_digested"
+      ],
+      "outcome": "killed",
+      "property": "ADR-0005 Decision \u00a72: digest is read back over the whole sealed file after sealing, so bytes present when sealed match the digest."
+    }
+  ],
+  "python": "3.12.3",
+  "repair_of": null,
+  "reviewer": "other-family",
+  "summary": {
+    "counts": {
+      "harness-fault": 0,
+      "invalid": 0,
+      "killed": 10,
+      "survived-never-activated": 0,
+      "survived-oracle-masked": 0,
+      "timeout": 0
+    },
+    "kill_rate_timeouts_as_killed": "10 of 10 (100%)",
+    "kill_rate_timeouts_not_killed": "10 of 10 (100%)",
+    "valid": 10
+  },
+  "timeout_seconds": 300.0
+}
