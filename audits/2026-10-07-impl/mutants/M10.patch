@@ -1,0 +1,23 @@
+Intent: Compute the digest before fchmod/seals so bytes written through the fd after digest and before seal are what run.
+Property: ADR-0005 Decision §2: digest is read back over the whole sealed file after sealing, so bytes present when sealed match the digest.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -157,14 +157,15 @@
+     finally:
+         os.close(src)
+     try:
++        if _after_copy is not None:
++            _after_copy(real)
++        digest = _program_digest(real, fd)
+         try:
+             os.fchmod(fd, 0o500)
+             fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+         except OSError as exc:
+             raise ImplementationUnavailable(f"cannot seal an executable copy: {exc.strerror}") from exc
+-        if _after_copy is not None:
+-            _after_copy(real)
+-        return ResolvedExecutable(real, _program_digest(real, fd), fd)
++        return ResolvedExecutable(real, digest, fd)
+     except BaseException:
+         os.close(fd)
+         raise

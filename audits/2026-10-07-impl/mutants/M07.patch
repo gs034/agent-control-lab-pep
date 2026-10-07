@@ -1,0 +1,20 @@
+Intent: Build argv from real_path strings instead of /proc/self/fd sealed paths.
+Property: ADR-0005 Decision §3–4 and module docstring: run must exec the sealed copy via /proc/self/fd so nothing is resolved by path after the copy.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -98,12 +98,12 @@
+         fds = set(kwargs.pop("pass_fds", ()))
+         fds.add(self.fileno())
+         if interpreter is None:
+-            argv = [self.exec_path]
++            argv = [str(self.real_path)]
+         elif isinstance(interpreter, ResolvedExecutable):
+             fds.add(interpreter.fileno())
+-            argv = [interpreter.exec_path, self.exec_path]
++            argv = [str(interpreter.real_path), str(self.real_path)]
+         else:
+-            argv = [os.fspath(interpreter), self.exec_path]
++            argv = [os.fspath(interpreter), str(self.real_path)]
+         return subprocess.run([*argv, *args], pass_fds=tuple(sorted(fds)), **kwargs)
+ 
+     def close(self) -> None:

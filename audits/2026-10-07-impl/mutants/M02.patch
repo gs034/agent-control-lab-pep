@@ -1,0 +1,18 @@
+Intent: Digest the on-disk file after copy instead of reading back the sealed memfd.
+Property: ADR-0005 Decision §2 / acceptance 'digest from disk instead of the copy': digest must be of the sealed copy, not the path on disk.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -164,7 +164,12 @@
+             raise ImplementationUnavailable(f"cannot seal an executable copy: {exc.strerror}") from exc
+         if _after_copy is not None:
+             _after_copy(real)
+-        return ResolvedExecutable(real, _program_digest(real, fd), fd)
++        disk = _open_regular(real)
++        try:
++            digest = _program_digest(real, disk)
++        finally:
++            os.close(disk)
++        return ResolvedExecutable(real, digest, fd)
+     except BaseException:
+         os.close(fd)
+         raise

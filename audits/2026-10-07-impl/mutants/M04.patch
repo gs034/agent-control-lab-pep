@@ -1,0 +1,14 @@
+Intent: Use caller pass_fds as the whole set (defaulting to the handle) instead of merging the handle into the caller set.
+Property: ADR-0005 Decision §3 / acceptance 'pass_fds replaced instead of merged': caller pass_fds must be merged with the sealed-copy fd, not replaced.
+--- a/pep/implementation.py
++++ b/pep/implementation.py
+@@ -95,8 +95,7 @@
+         for refused in ("shell", "executable", "preexec_fn"):
+             if refused in kwargs:
+                 raise TypeError(f"run() does not accept {refused}=")
+-        fds = set(kwargs.pop("pass_fds", ()))
+-        fds.add(self.fileno())
++        fds = set(kwargs.pop("pass_fds", (self.fileno(),)))
+         if interpreter is None:
+             argv = [self.exec_path]
+         elif isinstance(interpreter, ResolvedExecutable):
