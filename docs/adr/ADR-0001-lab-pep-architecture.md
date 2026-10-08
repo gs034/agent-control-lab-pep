@@ -1,6 +1,6 @@
 # ADR-0001 — Lab host/runtime PEP architecture
 
-- **Status:** Accepted (v0.3.3 / approval state digest; v0.3.2 late-effect fence and v0.3.1 approval invoke binding remain). Amended by [ADR-0002](ADR-0002-approval-principal-binding.md) in v0.4.0, which binds approvals to a host-attested principal, by [ADR-0003](ADR-0003-capability-token-principal-binding.md) in v0.5.0, which binds standing capability tokens to policy-listed, host-attested holders, by [ADR-0004](ADR-0004-approval-implementation-binding.md) in v0.6.0, which lets an approval bind the implementation resolved at mint, and by [ADR-0005](ADR-0005-execute-the-digested-artefact.md) in v0.7.0, whose host helper executes the sealed copy it digested, so its entry observation confirms that copy rather than re-resolving.
+- **Status:** Accepted (v0.3.3 / approval state digest; v0.3.2 late-effect fence and v0.3.1 approval invoke binding remain). Amended by [ADR-0002](ADR-0002-approval-principal-binding.md) in v0.4.0, which binds approvals to a host-attested principal, by [ADR-0003](ADR-0003-capability-token-principal-binding.md) in v0.5.0, which binds standing capability tokens to policy-listed, host-attested holders, by [ADR-0004](ADR-0004-approval-implementation-binding.md) in v0.6.0, which lets an approval bind the implementation resolved at mint, by [ADR-0005](ADR-0005-execute-the-digested-artefact.md) in v0.7.0, whose host helper executes the sealed copy it digested, so its entry observation confirms that copy rather than re-resolving, and by [ADR-0007](ADR-0007-reference-host-process.md) in v0.8.0, which runs the gate as a separate process. The in-process function boundary is not a security boundary.
 - **Date:** 2026-09-21
 - **Brand:** Agent Control Lab
 - **Licence:** Apache-2.0
@@ -9,7 +9,7 @@
 
 This repository is a public-goods **host/runtime Policy Enforcement Point (PEP)**. Callers submit a structured invoke envelope. The PEP is the only allow authority for tool entry. The official `eval/` row is an existence-proof **DENY** for the monitor-bypass / policy-rewrite-coax *class* (inspiration: arXiv:2609.19587). It is not a measured attack-success-rate result.
 
-v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same trust boundary. v0.3.1 keeps that plane and binds single-use TTL approvals to the approved invoke. v0.3.2 keeps that plane and fences late effects after `kill()`.
+v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same plane. v0.3.1 keeps that plane and binds single-use TTL approvals to the approved invoke. v0.3.2 keeps that plane and fences late effects after `kill()`.
 
 ## Decision
 
@@ -17,7 +17,7 @@ The `pep` package is a **trust domain independent of the model, an optional moni
 
 | Plane | Role relative to this PEP |
 | --- | --- |
-| **PEP** | `pep.evaluate` / `pep.gated_invoke`. In-process import is allowed; the function boundary is the trust boundary. |
+| **PEP** | `pep.host` is the reference gate: a separate process (ADR-0007). `pep.evaluate` / `pep.gated_invoke` remain for tests and corpus rows. In-process, the caller supplies the callable, the clock and the principal. |
 | **Model** | Not on the evaluate path. Output is caller material, not policy. |
 | **Monitor** | Optional caller or observer. A monitor “SAFE” / allow coax is not an allow authority. |
 | **MCP / tool host** | Downstream of ALLOW only. Hosting a tool does not mint policy, capability, or approval. |

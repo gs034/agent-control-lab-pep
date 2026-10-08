@@ -64,7 +64,7 @@ An approval is bound, at mint, to one **principal**. Only a call whose principal
 
 ## Residuals (what this does not fix)
 
-- **In-process callers can claim any principal.** Code that calls `PepRuntime.evaluate` directly can pass any `principal`. ADR-0001 puts the trust boundary at the function boundary. This binding defends routes where the host, not the agent, supplies the principal; it does not defend against an agent with equivalent process access (joint-eval `docs/lab-threat-model.md`).
+- **In-process callers can claim any principal.** Code that calls `PepRuntime.evaluate` directly can pass any `principal`. The reference gate is the separate host process (ADR-0007), which supplies the principal from the connection. This binding defends that route. It does not defend against an agent with equivalent process access (joint-eval `docs/lab-threat-model.md`).
 - **`PendingInvoke` is still a bearer handle in process.** An ALLOW admission from `begin_invoke` can be completed by whoever holds it. The in-process residual above covers this; this ADR does not change it.
 - **Standing capability tokens are still bearer** (at 0.4.0; [ADR-0003](ADR-0003-capability-token-principal-binding.md) closes this in 0.5.0). `capability_token` is checked for existence, expiry, tool coverage and the tool's `required_capability`, but not for who presents it. ADR-0003 is that follow-up decision.
 - **The owner's grant can still be spent without the tool running.** This happens when, after the owner's consume, `complete_invoke` re-observes a changed state or a kill or suspend intervenes. That is existing behaviour ("a grant can be spent and the decision still DENY") and is unchanged here. The guarantee is that a *wrong* caller cannot spend it.

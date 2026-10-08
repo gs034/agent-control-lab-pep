@@ -5,6 +5,10 @@
 This package is the PEP trust domain. It is not an agent, not a monitor,
 and not an LLM/CoT/transcript judge. There are no model calls on the
 evaluate path.
+
+``evaluate`` and ``gated_invoke`` are an in-process library. They are not
+a security boundary: the caller supplies the callable, the clock and the
+principal. The separate reference host is ``pep.host`` (ADR-0007).
 """
 
 from pep.approval import ApprovalRecord, ApprovalStore
@@ -36,4 +40,4 @@ __all__ = [
     "validate_receipt",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

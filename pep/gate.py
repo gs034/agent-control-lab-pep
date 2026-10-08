@@ -2,6 +2,11 @@
 # Copyright 2026 Agent Control Lab contributors
 """Invoke gate: DENY means the tool function is never called.
 
+The ``tool`` argument is not a security boundary. ``gated_invoke`` runs
+whatever callable the caller passes after an ALLOW. The reference host
+(``pep.host``) does not take a callable from the agent; it runs the
+function in its own registry. See ADR-0007.
+
 ``begin_invoke`` admits a structured envelope (no tool entry). ``complete_invoke``
 enters the tool only after ``PepRuntime.claim_entry`` records a one-shot permit
 under the runtime lock. ``kill()`` cuts the runtime and refuses new permits, so

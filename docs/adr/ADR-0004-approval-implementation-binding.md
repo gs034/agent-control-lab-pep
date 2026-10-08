@@ -1,6 +1,6 @@
 # ADR-0004: Bind single-use approvals to the implementation resolved at mint
 
-- **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions".
+- **Status:** Accepted, 2026-10-05 (owner), with the three recommendations under "Owner decisions". Amended by [ADR-0007](ADR-0007-reference-host-process.md): an unknown key inside `schema_fields` or `invoke` is `envelope_invalid`, not dropped.
 - **Implementation:** done in pep 0.6.0, in two phases: phase 1 (core, helpers and tests; pep#16) and phase 2 (docs and version). No sibling pin needs to move. Measured added cost of a bound `gated_invoke` with `executable_digest` on the test program: 129.7 µs median over 2,000 runs (local container), under the 1 ms provisional ceiling.
 - **Date:** 2026-10-05
 - **Depends on:** [ADR-0002](ADR-0002-approval-principal-binding.md) (principal-bound approvals). Independent of [ADR-0003](ADR-0003-capability-token-principal-binding.md).
@@ -34,7 +34,7 @@ Neither paper tests a local `PATH` substitution. This ADR takes the mechanism fr
 A grant may freeze a host-computed digest of the implementation that the tool name resolves to at mint. If it does, the PEP requires the same digest, observed by the host, at consume and again at tool entry.
 
 1. **Mint.** `PepRuntime.issue_approval` and `ApprovalStore.issue` take an optional `implementation_digest`, in the same `sha256:<64 hex>` form as the state digest. A malformed value is an `ApprovalError` at mint. The digest is stored on `ApprovalRecord`.
-2. **Observation is host-only.** `evaluate`, `begin_invoke` and `gated_invoke` take an optional `implementation_observer: Callable[[], object]`, the host's re-resolution of the implementation. There is no envelope field, and no envelope value is ever used as the observation. This differs deliberately from the state digest. A top-level `implementation_digest` key is rejected as `envelope_invalid` by the existing unknown-key check, in both envelope shapes. Inside a lab envelope's `schema_fields` an unknown key is dropped, as today, and is never read.
+2. **Observation is host-only.** `evaluate`, `begin_invoke` and `gated_invoke` take an optional `implementation_observer: Callable[[], object]`, the host's re-resolution of the implementation. There is no envelope field, and no envelope value is ever used as the observation. This differs deliberately from the state digest. A top-level `implementation_digest` key is rejected as `envelope_invalid` by the existing unknown-key check, in both envelope shapes. Inside a lab envelope's `schema_fields` an unknown key was dropped, and never read, until [ADR-0007](ADR-0007-reference-host-process.md). From that ADR it is `envelope_invalid`.
 3. **Consume.** In `ApprovalStore.consume` the check runs after the binding check and before the state check, under the store lock:
    - grant froze no implementation digest: no check, and the observer is not called;
    - grant froze one and no observer was given: DENY;

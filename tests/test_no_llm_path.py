@@ -35,7 +35,7 @@ BANNED_NAMES = {
 
 
 def test_pep_sources_have_no_model_or_http_imports():
-    for path in PEP_DIR.glob("*.py"):
+    for path in PEP_DIR.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

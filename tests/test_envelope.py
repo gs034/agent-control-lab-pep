@@ -40,6 +40,44 @@ def test_args_must_be_object():
     assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
 
 
+def test_unknown_invoke_key_is_invalid():
+    decision = evaluate(
+        {
+            "caller": {"identity": "lab.demo.agent"},
+            "envelope_version": "1.0",
+            "invoke": {
+                "tool_name": "echo.ping",
+                "argv": [],
+                "schema_fields": {"capability_token": "lab.cap.echo.demo"},
+                "injected": True,
+            },
+            "pep_eval_id": "test-unknown-invoke",
+        }
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
+
+
+def test_unknown_schema_field_key_is_invalid():
+    decision = evaluate(
+        {
+            "caller": {"identity": "lab.demo.agent"},
+            "envelope_version": "1.0",
+            "invoke": {
+                "tool_name": "echo.ping",
+                "argv": [],
+                "schema_fields": {
+                    "capability_token": "lab.cap.echo.demo",
+                    "injected": True,
+                },
+            },
+            "pep_eval_id": "test-unknown-schema-field",
+        }
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.ENVELOPE_INVALID
+
+
 def test_unknown_field_is_invalid_not_policy():
     decision = evaluate(
         {
