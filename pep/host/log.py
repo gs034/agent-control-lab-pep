@@ -11,8 +11,11 @@ The log is opened with ``O_NOFOLLOW``. The descriptor is checked with
 planted link cannot receive the records.
 
 Only the immediate parent directory is checked, not its parents. At
-startup the existing file is read, up to ``MAX_LOG_STARTUP_BYTES``, so
-sequence numbers continue. A larger file is refused.
+startup the host counts existing lines by reading the file in chunks,
+so sequence numbers continue without holding the whole file. One line
+longer than ``MAX_LOG_STARTUP_BYTES`` is refused. A file of shorter
+lines may be larger than that and the host still starts. The host does
+not rotate the log.
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ from typing import Any, Mapping
 from pep.host.fsguard import PathGuardError, require_directory
 
 DECISION_SCHEMA = "acl-pep-host-decision-v1"
+# Maximum bytes of one existing line read at startup. Not a maximum
+# file size: many shorter lines can add up to more than this.
 MAX_LOG_STARTUP_BYTES = 1_048_576
 
 # Names that would claim a check the host did not perform, or a boolean
@@ -46,6 +51,45 @@ FORBIDDEN_KEYS = frozenset(
 
 class DecisionLogError(OSError):
     """The host could not append a decision. Callers must not allow the tool."""
+
+
+def _count_log_lines(fd: int) -> int:
+    """Count non-empty lines without keeping the file in memory.
+
+    A single line longer than ``MAX_LOG_STARTUP_BYTES`` is refused. The
+    file itself may be larger.
+    """
+    count = 0
+    tail = b""
+    while True:
+        block = os.read(fd, 65536)
+        if not block:
+            break
+        data = tail + block
+        if b"\n" not in data:
+            if len(data) > MAX_LOG_STARTUP_BYTES:
+                raise DecisionLogError("decision log line exceeds the startup read limit")
+            tail = data
+            continue
+        parts = data.split(b"\n")
+        tail = parts.pop()
+        if len(tail) > MAX_LOG_STARTUP_BYTES:
+            raise DecisionLogError("decision log line exceeds the startup read limit")
+        for line in parts:
+            count += _line_counts(line)
+    if tail:
+        count += _line_counts(tail)
+    return count
+
+
+def _line_counts(line: bytes) -> int:
+    if len(line) > MAX_LOG_STARTUP_BYTES:
+        raise DecisionLogError("decision log line exceeds the startup read limit")
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DecisionLogError("decision log is not utf-8") from exc
+    return 1 if text.strip() else 0
 
 
 def reject_unrun_claims(value: Any) -> None:
@@ -95,17 +139,7 @@ class DecisionLog:
             os.lseek(fd, 0, os.SEEK_SET)
             read_fd = os.dup(fd)
             try:
-                chunks: list[bytes] = []
-                total = 0
-                while True:
-                    block = os.read(read_fd, 65536)
-                    if not block:
-                        break
-                    total += len(block)
-                    if total > MAX_LOG_STARTUP_BYTES:
-                        raise DecisionLogError("decision log exceeds the startup read limit")
-                    chunks.append(block)
-                existing = b"".join(chunks).decode("utf-8")
+                seq = _count_log_lines(read_fd)
             finally:
                 os.close(read_fd)
             self._fp = os.fdopen(fd, "a", encoding="utf-8")
@@ -115,7 +149,7 @@ class DecisionLog:
                 os.close(fd)
             raise
         # Count lines already there so a restarted host does not reuse seq.
-        self._seq = sum(1 for line in existing.splitlines() if line.strip())
+        self._seq = seq
 
     def append(self, record: Mapping[str, Any]) -> dict[str, Any]:
         """Append one record. Returns the stored object, including ``seq``."""
@@ -161,7 +195,10 @@ class DecisionLog:
         return records
 
     def close(self) -> None:
-        self._fp.close()
+        with self._lock:
+            if self._fp.closed:
+                return
+            self._fp.close()
 
     @staticmethod
     def _prepare_parent(parent: Path) -> None:

@@ -12,8 +12,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -81,6 +84,25 @@ def _host(
 
 def _peer(pid: int = 10, uid: int = 1000) -> PeerCred:
     return PeerCred(pid=pid, uid=uid, gid=1000)
+
+
+def _denial_tally(records: list[dict[str, Any]]) -> int:
+    """Individual denial lines plus the counts carried on summary lines."""
+    total = 0
+    for record in records:
+        if record.get("reason_code") == "rate_limited":
+            total += int(record["suppressed_count"])
+        elif record.get("decision") == "DENY":
+            total += 1
+    return total
+
+
+def _load_log(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
 
 
 class _Mono:
@@ -671,6 +693,241 @@ def test_denial_log_is_coalesced(tmp_path: Path):
         _assert_record_claims_only_what_ran(record)
 
 
+def test_held_count_flushes_when_the_window_closes_without_another_denial(tmp_path: Path):
+    clock = _Mono()
+    host = _host(tmp_path, deny_log_burst=2, deny_log_window=10, monotonic=clock)
+    session = host.open_session(_peer())
+    for _ in range(5):
+        denied = host.handle_request(b"[]", session)
+        assert denied["decision"] == "DENY"
+    assert all(record["reason_code"] != "rate_limited" for record in host.decision_records())
+
+    clock.now = 10
+    host._flush_expired_window()
+    records = host.decision_records()
+    summaries = [record for record in records if record["reason_code"] == "rate_limited"]
+    assert [record["suppressed_count"] for record in summaries] == [3]
+    assert _denial_tally(records) == 5
+    assert host.halted() is False
+    host.close()
+    assert [record["suppressed_count"] for record in host.decision_records() if record["reason_code"] == "rate_limited"] == [3]
+
+
+def test_quiet_flood_flushes_from_the_accept_loop(tmp_path: Path):
+    host = _listen(tmp_path, deny_log_burst=2, deny_log_window=1.0)
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        for _ in range(5):
+            client.sendall(b"[]\n")
+            reply = _recv(client)
+            assert reply["decision"] == "DENY"
+            assert reply["reason_code"] == "envelope_invalid"
+        deadline = time.monotonic() + 3
+        records: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            try:
+                records = host.decision_records()
+            except (json.JSONDecodeError, DecisionLogError, OSError, UnicodeError):
+                time.sleep(0.05)
+                continue
+            if _denial_tally(records) == 5 and any(record["reason_code"] == "rate_limited" for record in records):
+                break
+            time.sleep(0.05)
+        assert _denial_tally(records) == 5
+        summaries = [record for record in records if record["reason_code"] == "rate_limited"]
+        assert sum(record["suppressed_count"] for record in summaries) == 3
+        assert host.sessions()
+        for record in records:
+            _assert_record_claims_only_what_ran(record)
+    finally:
+        client.close()
+        host.close()
+
+
+def test_denial_in_flight_at_shutdown_is_folded_into_the_summary(tmp_path: Path):
+    class _Clock:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def __call__(self) -> datetime:
+            self.calls += 1
+            if self.calls >= 5:
+                self.entered.set()
+                self.release.wait(timeout=5)
+            return NOW
+
+    clock = _Clock()
+    host = _host(tmp_path, clock=clock, deny_log_burst=2, deny_log_window=60)
+    session = host.open_session(_peer())
+    for _ in range(4):
+        denied = host.handle_request(b"[]", session)
+        assert denied["reason_code"] == "envelope_invalid"
+    assert all(record["reason_code"] != "rate_limited" for record in host.decision_records())
+
+    box: list[dict[str, Any]] = []
+
+    def call() -> None:
+        box.append(host.handle_request(b"[]", session))
+
+    worker = threading.Thread(target=call)
+    closer = threading.Thread(target=host.close)
+    worker.start()
+    try:
+        assert clock.entered.wait(timeout=2)
+        closer.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not closer.is_alive():
+            time.sleep(0.01)
+        time.sleep(0.05)
+        assert closer.is_alive()
+    finally:
+        clock.release.set()
+        worker.join(timeout=5)
+        closer.join(timeout=5)
+    assert not worker.is_alive()
+    assert not closer.is_alive()
+    assert box[0]["decision"] == "DENY"
+    assert box[0]["reason_code"] == "envelope_invalid"
+    records = host.decision_records()
+    summaries = [record for record in records if record["reason_code"] == "rate_limited"]
+    assert [record["suppressed_count"] for record in summaries] == [3]
+    assert _denial_tally(records) == 5
+    for record in records:
+        _assert_record_claims_only_what_ran(record)
+
+
+@pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGHUP])
+def test_stop_signal_flushes_held_denial_counts(tmp_path: Path, stop_signal: int):
+    os.chmod(tmp_path, 0o700)
+    sock_dir = tmp_path / "run"
+    sock_dir.mkdir()
+    os.chmod(sock_dir, 0o2750)
+    halt = tmp_path / "halt.json"
+    log_path = tmp_path / "decisions.log"
+    sock = sock_dir / "pep.sock"
+    init_active(halt)
+    err_path = tmp_path / "serve.err"
+    root = str(Path(__file__).resolve().parents[1])
+    env = os.environ.copy()
+    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+    with err_path.open("w", encoding="utf-8") as err:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "pep.host",
+                "serve",
+                "--socket",
+                str(sock),
+                "--halt",
+                str(halt),
+                "--log",
+                str(log_path),
+            ],
+            cwd=root,
+            env=env,
+            stdout=err,
+            stderr=subprocess.STDOUT,
+        )
+    client: socket.socket | None = None
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if sock.exists():
+                try:
+                    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    client.connect(str(sock))
+                    break
+                except OSError:
+                    if client is not None:
+                        client.close()
+                        client = None
+                    time.sleep(0.02)
+            else:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.02)
+        assert client is not None, err_path.read_text(encoding="utf-8")
+        sent = 80
+        payload = b"[]\n" * sent
+        client.sendall(payload)
+        client.settimeout(5)
+        buf = b""
+        replies = 0
+        while replies < sent:
+            chunk = client.recv(65536)
+            assert chunk, err_path.read_text(encoding="utf-8")
+            buf += chunk
+            while b"\n" in buf and replies < sent:
+                line, buf = buf.split(b"\n", 1)
+                reply = json.loads(line)
+                assert reply["decision"] == "DENY"
+                replies += 1
+        client.close()
+        client = None
+        proc.send_signal(stop_signal)
+        assert proc.wait(timeout=5) == 0, err_path.read_text(encoding="utf-8")
+    finally:
+        if client is not None:
+            client.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    records = _load_log(log_path)
+    assert _denial_tally(records) == 80
+    assert any(record["reason_code"] == "rate_limited" for record in records)
+    for record in records:
+        _assert_record_claims_only_what_ran(record)
+
+
+def test_socket_open_without_a_path_raises_host_error(tmp_path: Path):
+    host = _host(tmp_path)
+    host.socket_path = None
+    with pytest.raises(HostError, match="socket path is required"):
+        host._open_agent_socket()
+    host.admin_path = None
+    with pytest.raises(HostError, match="admin socket path is required"):
+        host._open_admin_socket()
+
+
+def test_reconnect_needs_a_free_slot_and_is_a_new_session(tmp_path: Path):
+    host = _listen(tmp_path, max_connections=1)
+    held = _connect(host.socket_path)
+    extra: socket.socket | None = None
+    again: socket.socket | None = None
+    try:
+        _wait_sessions(host, 1)
+        first_id = host.sessions()[0].connection_id
+        extra = _connect(host.socket_path)
+        denied = _recv(extra)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "connection_limit"
+        extra.close()
+        extra = None
+        held.close()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and host.sessions():
+            time.sleep(0.01)
+        assert host.sessions() == ()
+        again = _connect(host.socket_path)
+        _wait_sessions(host, 1)
+        assert host.sessions()[0].connection_id != first_id
+        _send(again, {"tool_name": "echo.ping", "args": ARGS})
+        reply = _recv(again)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] != "connection_limit"
+    finally:
+        held.close()
+        if extra is not None:
+            extra.close()
+        if again is not None:
+            again.close()
+        host.close()
+
+
 def test_admitted_denials_are_logged_during_a_flood(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     clock = _Mono()
 
@@ -747,6 +1004,51 @@ def test_decision_log_refuses_a_file_over_the_startup_limit(tmp_path: Path, monk
     with pytest.raises(DecisionLogError, match="startup read limit"):
         DecisionLog(path)
     assert MAX_LOG_STARTUP_BYTES == 1_048_576
+
+
+def test_decision_log_streams_many_short_lines_past_the_line_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("pep.host.log.MAX_LOG_STARTUP_BYTES", 32)
+    path = tmp_path / "decisions.log"
+    line = b'{"decision":"DENY"}\n'
+    assert len(line) < 32
+    path.write_bytes(line * 3 + b"\n\n")
+    log = DecisionLog(path)
+    stored = log.append(
+        {
+            "decision": "DENY",
+            "reason_code": "envelope_invalid",
+            "reason_detail": "x",
+            "checks": [{"name": "json_object", "outcome": "deny"}],
+        }
+    )
+    assert stored["seq"] == 4
+    log.close()
+
+
+def test_host_restarts_when_the_decision_log_exceeds_one_mebibyte(tmp_path: Path):
+    path = tmp_path / "decisions.log"
+    seed = {
+        "decision": "DENY",
+        "reason_code": "envelope_invalid",
+        "reason_detail": "seed",
+        "checks": [{"name": "json_object", "outcome": "deny"}],
+    }
+    line = (json.dumps(seed, separators=(",", ":")) + "\n").encode("utf-8")
+    count = (MAX_LOG_STARTUP_BYTES // len(line)) + 5
+    path.write_bytes(line * count)
+    assert path.stat().st_size > MAX_LOG_STARTUP_BYTES
+    halt = tmp_path / "halt.json"
+    init_active(halt)
+    host = ReferenceHost(halt_path=halt, log_path=path)
+    try:
+        session = host.open_session(_peer())
+        denied = host.handle_request(b"[]", session)
+        assert denied["decision"] == "DENY"
+        last = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+        assert last["seq"] == count + 1
+        assert last["reason_code"] == "envelope_invalid"
+    finally:
+        host.close()
 
 
 def test_decision_log_refuses_a_symlink_and_does_not_chmod_the_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
