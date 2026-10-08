@@ -16,6 +16,7 @@ from pep.envelope import PROSE_COAX_KEYS, TOOL_NAME_RE
 
 HOST_KEYS = frozenset({"args", "tool_name"})
 MAX_REQUEST_BYTES = 65_536
+MAX_JSON_DEPTH = 32
 
 
 class ProtocolError(ValueError):
@@ -73,12 +74,18 @@ def _decode_json(text: str) -> Any:
             "request is empty",
             [{"name": "json_object", "outcome": "deny"}],
         )
-    try:
-        return json.loads(stripped, object_pairs_hook=_reject_duplicate_keys)
-    except (json.JSONDecodeError, ValueError) as exc:
+    if _nesting_exceeds(stripped, MAX_JSON_DEPTH):
         raise ProtocolError(
             "envelope_invalid",
-            f"json decode failed: {exc}",
+            "request nesting exceeds the host limit",
+            [{"name": "json_object", "outcome": "deny"}],
+        )
+    try:
+        return json.loads(stripped, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ValueError, RecursionError, OverflowError, MemoryError) as exc:
+        raise ProtocolError(
+            "envelope_invalid",
+            "json decode failed",
             [{"name": "json_object", "outcome": "deny"}],
         ) from exc
 
@@ -88,6 +95,39 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate keys rejected")
     return dict(pairs)
+
+
+def _nesting_exceeds(text: str, limit: int) -> bool:
+    """True when ``[`` / ``{`` nesting is deeper than ``limit``.
+
+    ``json.loads`` raises ``RecursionError`` on a deep array and that used
+    to kill the connection with no reply. The depth is counted here, outside
+    the parser, and strings are skipped so a bracket inside a string does
+    not count.
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+            continue
+        if char in "]}":
+            depth = max(0, depth - 1)
+    return False
 
 
 def _copy_mapping(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -164,8 +204,13 @@ def _interpret(body: Any) -> tuple[str, dict[str, Any], list[dict[str, str]]]:
         raise ProtocolError("envelope_invalid", "args must be a JSON object", checks)
     try:
         encoded = json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if len(encoded.encode("utf-8")) > MAX_REQUEST_BYTES:
+            checks.append({"name": "args_json", "outcome": "deny"})
+            raise ProtocolError("envelope_invalid", "request exceeds the host limit", checks)
         args = json.loads(encoded)
-    except (TypeError, ValueError) as exc:
+    except ProtocolError:
+        raise
+    except (TypeError, ValueError, RecursionError, OverflowError, MemoryError) as exc:
         checks.append({"name": "args_json", "outcome": "deny"})
         raise ProtocolError(
             "envelope_invalid",

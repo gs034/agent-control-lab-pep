@@ -5,15 +5,22 @@
 The agent has no command that writes or deletes this file. Records list
 checks that ran. They do not carry a boolean that is true by construction
 (for example "policy unchanged").
+
+The log is opened with ``O_NOFOLLOW`` and the mode is set with ``fchmod``
+on that descriptor. A symlink at the log path is refused, so a planted
+link cannot receive the records.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import Any, Mapping
+
+from pep.host.fsguard import PathGuardError, require_directory
 
 DECISION_SCHEMA = "acl-pep-host-decision-v1"
 
@@ -56,22 +63,38 @@ class DecisionLog:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._prepare_parent(self.path.parent)
         self._lock = threading.Lock()
         self._seq = 0
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        fd = os.open(self.path, flags, 0o600)
+        flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         try:
-            os.chmod(self.path, 0o600)
-            self._fp = os.fdopen(fd, "a", encoding="utf-8")
-        except Exception:
-            os.close(fd)
-            raise
-        # Count lines already there so a restarted host does not reuse seq.
-        try:
-            existing = self.path.read_text(encoding="utf-8")
+            fd = os.open(self.path, flags, 0o600)
         except OSError as exc:
             raise DecisionLogError(f"decision log unreadable: {exc}") from exc
+        try:
+            os.fchmod(fd, 0o600)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise DecisionLogError("decision log is not a regular file")
+            if info.st_uid != os.getuid():
+                raise DecisionLogError("decision log is not owned by this user")
+            if stat.S_IMODE(info.st_mode) & 0o777 != 0o600:
+                raise DecisionLogError("decision log mode is not 0600")
+            os.lseek(fd, 0, os.SEEK_SET)
+            reader = os.fdopen(os.dup(fd), "r", encoding="utf-8")
+            try:
+                existing = reader.read()
+            finally:
+                reader.close()
+            self._fp = os.fdopen(fd, "a", encoding="utf-8")
+            fd = -1
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            raise
+        # Count lines already there so a restarted host does not reuse seq.
         self._seq = sum(1 for line in existing.splitlines() if line.strip())
 
     def append(self, record: Mapping[str, Any]) -> dict[str, Any]:
@@ -95,7 +118,18 @@ class DecisionLog:
 
     def read_records(self) -> list[dict[str, Any]]:
         """Operator read of the file the host wrote. Not an agent command."""
-        text = self.path.read_text(encoding="utf-8")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.path, flags)
+        except OSError as exc:
+            raise DecisionLogError(f"decision log unreadable: {exc}") from exc
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError as exc:
+            raise DecisionLogError(f"decision log unreadable: {exc}") from exc
         records: list[dict[str, Any]] = []
         for line in text.splitlines():
             if not line.strip():
@@ -108,3 +142,21 @@ class DecisionLog:
 
     def close(self) -> None:
         self._fp.close()
+
+    @staticmethod
+    def _prepare_parent(parent: Path) -> None:
+        try:
+            os.lstat(parent)
+        except FileNotFoundError:
+            os.mkdir(parent, 0o700)
+            dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fchmod(dirfd, 0o700)
+            finally:
+                os.close(dirfd)
+        except OSError as exc:
+            raise DecisionLogError(f"decision log directory unreadable: {exc}") from exc
+        try:
+            require_directory(parent, allow_group_traverse=False)
+        except PathGuardError as exc:
+            raise DecisionLogError(str(exc)) from exc

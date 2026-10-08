@@ -25,8 +25,8 @@ The host process owns:
 2. **The clock.** Expiry uses the host's clock. A time in the request is an unknown key and is denied.
 3. **Identity.** On Linux the host reads the kernel's peer credentials for the connection (process id, user id, group id). It then assigns a session to that connection. The session name is not a token the agent can send. A second connection is a different session, even when the user id is the same, so session B cannot spend a grant minted for session A.
 4. **The policy.** The host loads it. The agent cannot pass a document. When the policy was loaded from a file, each call that reaches the policy check re-reads the file and records the digest it saw. A changed or unreadable file denies the call.
-5. **Halt state.** A missing, unreadable, or ill-formed halt file means the gate is halted. The host does not create an active file to fill the gap. `kill` writes a killed file and raises if that write does not land; the process stays halted either way. Deleting the file does not make a new process active. The older `HaltStore` behaviour, where a missing file is active, remains on the in-process library only.
-6. **The decision log.** Every decision is appended to a file the host opens append-only, mode 0600. The agent socket has no command that writes or deletes it. A record lists the checks that ran on that call. It has no boolean field, and it does not contain `policy_file_unchanged` or any other claim that is true by construction. If the log cannot be appended, the tool is not entered.
+5. **Halt state.** A missing, unreadable, or ill-formed halt file means the gate is halted. The host does not create an active file to fill the gap, including when the file disappears in the moment the process is opening. `python -m pep.host kill` writes a killed file and raises if that write does not land; the process stays halted either way. A running host reads the file again immediately before the tool runs. If that read is not active, the host calls `runtime.kill()` and returns DENY, and the tool does not run. That is the same in-process fence, reached through the documented command. A tool body that has already started is not unwound. Deleting the file does not make a new process active. A file that already says suspended at startup is denied as suspended and is not latched for the life of the process. The latch is for killed, missing, and corrupt files. The halt file is read once per check. The store writes through a unique temporary name. The older `HaltStore` behaviour, where a missing file is active, remains on the in-process library only.
+6. **The decision log.** Each decision is appended to a file the host opens append-only, mode 0600, with `O_NOFOLLOW` and `fchmod` on that descriptor. The agent socket has no command that writes or deletes it. A record lists the checks that ran on that call, and it carries a request id. An allow is written with the tool's outcome, after the tool returns. A line written before entry only records that the checks were stored; it is not the allow. It has no boolean field, and it does not contain `policy_file_unchanged` or any other claim that is true by construction. If the log cannot be appended, the tool is not entered. A flood of denials is coalesced: 30 denial lines per second, then one counted line for the rest of that second, so the flood cannot fill the disk and latch a halt. The caller still receives DENY. The directories that hold the log and the halt file must be owned by the host user and mode 0700.
 
 Unknown keys inside a lab envelope's `invoke` object and its `schema_fields` are now `envelope_invalid` in the library parser as well. They are not dropped.
 
@@ -34,9 +34,13 @@ The frozen receipt schema (v1) is unchanged. The in-process receipt can still ca
 
 ## How to run it
 
-The operator starts the process as a user the agent does not share. The process does not switch user itself. The README section "Reference host under its own user" is the short procedure.
+The operator starts the process as a user the agent does not share. The process does not switch user itself. The README section "Reference host under its own user" is the short procedure. The socket directory is setgid to the agent group (mode 2750) so the socket, mode 0660, is in that group. The host checks the directory owner and mode before it binds, and it does not delete a live socket.
 
-Grants are minted by the operator, on the host, for one connection. The agent does not send an approval id or a capability token. The stub token for `lab.demo.agent` is not handed to whoever connects.
+The client checks the socket's owner and the accepting process's user id (`SO_PEERCRED`) against the expected host user. A mismatch, a dead host, or a timeout is a DENY from the client.
+
+Grants are minted by the operator on an admin socket in the private directory (mode 0600). The agent socket cannot mint one. `serve` without `--admin` denies every call. The agent holds the connection; `sessions` and `grant` name that connection. A new connection is a new session.
+
+A request larger than 64KiB, or nested deeper than 32, is DENY and is logged. At most 8 agent connections are open, and a connection idle for 5 seconds is closed. Optional `--allow-uid` and `--allow-gid` restrict the peer credentials. A file descriptor passed to another process keeps the connecting process's credentials.
 
 ## What this does not claim
 
@@ -48,11 +52,12 @@ In particular, this host does not:
 - Stop a process that runs as the host user, or that can write the host's directory. File modes only help when the agent is a different user.
 - Prove a kill across a restart if the process can neither write nor delete the halt file, and the old file still says active. The process that failed the write stays halted. A later process that can still read the old active file will not see that kill.
 - Keep approvals on disk. A restart forgets grants that were only in memory.
-- Add rate limits, argument budgets, or a check that tool results are safe to read. A result is labelled `result_origin: host-registry` so the caller can see where it came from. That label is not a check.
+- Add argument budgets, or a check that tool results are safe to read. Denial logging is coalesced and connections are capped, as above. A result is labelled `result_origin: host-registry` so the caller can see where it came from. That label is not a check.
+- Notice that a connected socket was passed to another process. The peer credentials stay those of the process that connected.
 - Seal the decision log with a key held on another machine. The log is append-only from this process. It is not a tamper-evident chain against someone who can write the file.
 - Change the in-process library into a boundary. Callers of `evaluate` and `gated_invoke` still supply the callable, the clock, and the principal.
 
 ## Consequences
 
-- Tests in `tests/test_reference_host.py` cover a caller-supplied callable, a caller-supplied time, unknown keys, a deleted halt file, a failed kill write, session B acting as session A, and a denial that appears in the host's own log.
+- Tests in `tests/test_reference_host.py` cover a caller-supplied callable, a caller-supplied time, unknown keys, a deleted halt file, a failed kill write, a kill that lands after the first halt check, session B acting as session A, a denial that appears in the host's own log, the socket directory and the client peer check, nested JSON, the connection cap, the idle timeout, coalesced denials, the admin grant, and a suspend that is not latched.
 - `python -m pep.host` is the way to run the process. `pep-host` is the same entry point.

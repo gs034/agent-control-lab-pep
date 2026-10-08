@@ -9,7 +9,7 @@
 
 This repository is a public-goods **host/runtime Policy Enforcement Point (PEP)**. Callers submit a structured invoke envelope. The PEP is the only allow authority for tool entry. The official `eval/` row is an existence-proof **DENY** for the monitor-bypass / policy-rewrite-coax *class* (inspiration: arXiv:2609.19587). It is not a measured attack-success-rate result.
 
-v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same trust boundary. v0.3.1 keeps that plane and binds single-use TTL approvals to the approved invoke. v0.3.2 keeps that plane and fences late effects after `kill()`.
+v0.2 froze the architecture so evaluator-corpus work (EOI milestone **M1**) and a durable kill/suspend path do not relabel this plane as a model or monitor. v0.3 lands those two items on the same plane. v0.3.1 keeps that plane and binds single-use TTL approvals to the approved invoke. v0.3.2 keeps that plane and fences late effects after `kill()`.
 
 ## Decision
 
@@ -17,7 +17,7 @@ The `pep` package is a **trust domain independent of the model, an optional moni
 
 | Plane | Role relative to this PEP |
 | --- | --- |
-| **PEP** | `pep.evaluate` / `pep.gated_invoke`. In-process import is allowed; the function boundary is the trust boundary. |
+| **PEP** | `pep.host` is the reference gate: a separate process (ADR-0007). `pep.evaluate` / `pep.gated_invoke` remain for tests and corpus rows. In-process, the caller supplies the callable, the clock and the principal. |
 | **Model** | Not on the evaluate path. Output is caller material, not policy. |
 | **Monitor** | Optional caller or observer. A monitor “SAFE” / allow coax is not an allow authority. |
 | **MCP / tool host** | Downstream of ALLOW only. Hosting a tool does not mint policy, capability, or approval. |

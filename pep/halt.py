@@ -16,6 +16,8 @@ admissions.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -84,7 +86,7 @@ class HaltStore:
         try:
             raw = path.read_text(encoding="utf-8")
             data = json.loads(raw)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             return HaltState(mode=HaltMode.KILLED, available=False)
         return _parse_halt_document(data)
 
@@ -97,18 +99,38 @@ class HaltStore:
             "updated_at": stamp,
         }
         path = self.path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        # A fixed ``name.tmp`` can be planted. The temp name is unique to this write.
+        fd = -1
+        tmp_name = ""
         try:
-            tmp.write_text(text + "\n", encoding="utf-8")
-            tmp.replace(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+            os.write(fd, (text + "\n").encode("utf-8"))
+            os.fchmod(fd, 0o600)
+            os.close(fd)
+            fd = -1
+            os.replace(tmp_name, path)
+            tmp_name = ""
         except OSError as exc:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
             raise HaltStoreError(f"halt store persist failed: {exc}") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+
+def parse_halt_text(raw: str) -> HaltState:
+    """Parse halt bytes the caller already read. Does not touch the filesystem."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return HaltState(mode=HaltMode.KILLED, available=False)
+    return _parse_halt_document(data)
 
 
 def _parse_halt_document(data: Any) -> HaltState:

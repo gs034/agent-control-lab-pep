@@ -102,3 +102,23 @@ def test_store_write_cannot_clear_kill(tmp_path: Path):
     store.write(HaltState(mode=HaltMode.KILLED))
     written = store.write(HaltState(mode=HaltMode.ACTIVE))
     assert written.mode is HaltMode.KILLED
+
+
+def test_halt_write_uses_a_unique_temp_name(tmp_path: Path, monkeypatch):
+    import tempfile
+
+    created: list[str] = []
+    real = tempfile.mkstemp
+
+    def spy(*args, **kwargs):
+        fd, name = real(*args, **kwargs)
+        created.append(name)
+        return fd, name
+
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    store = HaltStore(tmp_path / "halt.json")
+    store.write(HaltState(mode=HaltMode.ACTIVE))
+    store.write(HaltState(mode=HaltMode.SUSPENDED))
+    assert len(created) == 2
+    assert len(set(created)) == 2
+    assert all(not name.endswith("halt.json.tmp") for name in created)

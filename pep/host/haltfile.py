@@ -6,13 +6,21 @@ A missing, unreadable, or ill-formed file is halted. Writing a kill that
 does not land raises ``HaltStoreError``. The in-process ``HaltStore``
 still treats a missing file as active; that library default is not a
 security boundary (ADR-0007).
+
+The bytes are read once. A second look at a path that disappeared in
+between would treat the gap as active, which this reader must not do.
 """
 
 from __future__ import annotations
 
+import errno
+import json
+import os
+import stat
 from pathlib import Path
 
-from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
+from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError, parse_halt_text
+from pep.host.fsguard import PathGuardError, require_directory
 
 # Why the host will not treat the file as active.
 MISSING = "missing"
@@ -23,68 +31,56 @@ ACTIVE = "active"
 SUSPENDED = "suspended"
 KILLED = "killed"
 
+_HALT_READ_LIMIT = 1_048_576
+
 
 def read_fail_closed(path: Path) -> tuple[HaltState, str]:
     """Read a halt file. Any doubt is halted.
 
     The second value names what was observed: ``missing``, ``not_a_file``,
     ``unreadable``, ``corrupt``, ``active``, ``suspended``, or ``killed``.
-    This function does not create the file.
+    This function does not create the file. It opens the path once and
+    classifies those bytes. It does not follow a symlink.
     """
     path = Path(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        is_file = path.is_file()
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return _killed(), MISSING
+    except OSError as exc:
+        return _open_error(exc)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return _killed(), NOT_A_FILE
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            total += len(block)
+            if total > _HALT_READ_LIMIT:
+                return _killed(), CORRUPT
+            chunks.append(block)
     except OSError:
-        return HaltState(mode=HaltMode.KILLED, available=False), UNREADABLE
-    if not path.exists():
-        return HaltState(mode=HaltMode.KILLED, available=False), MISSING
-    if not is_file:
-        return HaltState(mode=HaltMode.KILLED, available=False), NOT_A_FILE
+        return _killed(), UNREADABLE
+    finally:
+        os.close(fd)
     try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return HaltState(mode=HaltMode.KILLED, available=False), UNREADABLE
-    try:
-        # HaltStore already fails closed on corrupt bytes. It is only asked
-        # to read when a regular file was readable, so a missing file cannot
-        # be reported as active from here.
-        state = HaltStore(path).read()
-    except OSError:
-        return HaltState(mode=HaltMode.KILLED, available=False), UNREADABLE
-    if not raw.strip():
-        return HaltState(mode=HaltMode.KILLED, available=False), CORRUPT
-    if state.mode is HaltMode.KILLED or not state.available:
-        # Corrupt documents come back as killed and unavailable.
-        if state.mode is HaltMode.KILLED and not state.available and _looks_corrupt(raw):
-            return state, CORRUPT
-        return state, KILLED
-    if state.mode is HaltMode.SUSPENDED:
-        return state, SUSPENDED
-    if state.mode is HaltMode.ACTIVE:
-        return state, ACTIVE
-    return HaltState(mode=HaltMode.KILLED, available=False), CORRUPT
-
-
-def _looks_corrupt(raw: str) -> bool:
-    import json
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return True
-    if not isinstance(data, dict):
-        return True
-    if data.get("schema") != "acl-pep-halt-v1":
-        return True
-    if data.get("mode") not in {m.value for m in HaltMode}:
-        return True
-    available = data.get("available", True)
-    return not isinstance(available, bool)
+        raw = b"".join(chunks).decode("utf-8")
+    except UnicodeError:
+        return _killed(), UNREADABLE
+    return _classify(raw)
 
 
 def init_active(path: Path) -> HaltState:
     """Create an active halt file. Refuses to clear a kill or a bad file."""
     path = Path(path)
+    _private_parent(path)
     state, observed = read_fail_closed(path)
     if observed == MISSING:
         written = HaltStore(path).write(HaltState(mode=HaltMode.ACTIVE, available=True))
@@ -107,6 +103,7 @@ def write_killed(path: Path) -> HaltState:
     written as killed so a later reader cannot treat the absence as active.
     """
     path = Path(path)
+    _private_parent(path)
     state, observed = read_fail_closed(path)
     if observed in {NOT_A_FILE, UNREADABLE}:
         raise HaltStoreError(f"halt file cannot be written ({observed})")
@@ -128,9 +125,68 @@ def write_killed(path: Path) -> HaltState:
     return confirmed
 
 
-def _restrict(path: Path) -> None:
-    """Best-effort owner-only mode. A failure here is a failed write."""
+def _private_parent(path: Path) -> None:
     try:
-        path.chmod(0o600)
+        require_directory(path.parent, allow_group_traverse=False)
+    except PathGuardError as exc:
+        raise HaltStoreError(str(exc)) from exc
+
+
+def _restrict(path: Path) -> None:
+    """Owner-only mode on the open file, not on a path that might be a symlink."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
     except OSError as exc:
         raise HaltStoreError(f"could not restrict the halt file: {exc}") from exc
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError as exc:
+        raise HaltStoreError(f"could not restrict the halt file: {exc}") from exc
+    finally:
+        os.close(fd)
+
+
+def _killed() -> HaltState:
+    return HaltState(mode=HaltMode.KILLED, available=False)
+
+
+def _open_error(exc: OSError) -> tuple[HaltState, str]:
+    err = exc.errno
+    if err == errno.ENOENT:
+        return _killed(), MISSING
+    if err in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+        return _killed(), NOT_A_FILE
+    return _killed(), UNREADABLE
+
+
+def _classify(raw: str) -> tuple[HaltState, str]:
+    if not raw.strip():
+        return _killed(), CORRUPT
+    state = parse_halt_text(raw)
+    if state.mode is HaltMode.KILLED or not state.available:
+        if state.mode is HaltMode.KILLED and not state.available and _looks_corrupt(raw):
+            return state, CORRUPT
+        return state, KILLED
+    if state.mode is HaltMode.SUSPENDED:
+        return state, SUSPENDED
+    if state.mode is HaltMode.ACTIVE:
+        return state, ACTIVE
+    return _killed(), CORRUPT
+
+
+def _looks_corrupt(raw: str) -> bool:
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    if data.get("schema") != "acl-pep-halt-v1":
+        return True
+    if data.get("mode") not in {mode.value for mode in HaltMode}:
+        return True
+    available = data.get("available", True)
+    return not isinstance(available, bool)

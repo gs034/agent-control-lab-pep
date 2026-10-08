@@ -9,7 +9,7 @@ Versions below are **lab milestones**, not a vendor SKU. Package `0.8.0` runs th
 Existence-proof host/runtime deny over structured envelopes.
 
 - Frozen allowlist (`echo.ping` only); capability tokens with expiry.
-- `evaluate()` / `gated_invoke()` trust boundary; no model on the evaluate path.
+- `evaluate()` / `gated_invoke()` are the in-process library used by the corpus. The reference gate is `pep.host` (ADR-0007). No model on the evaluate path.
 - Official `eval/` row: `shell.exec` + null grants → **DENY** (`TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY`).
 - `python -m pep.demo` prints the live fail-closed receipt.
 - Lab-only brand wall and forbidden-token CI.

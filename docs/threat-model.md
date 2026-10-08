@@ -22,12 +22,15 @@ Brand: **Agent Control Lab**. Licence: **Apache-2.0**.
 
 ```
 agent / model / optional monitor / HITL UI / MCP or tool host
-                         |  structured envelope only
+                         |  tool_name and args on the Unix socket
                          v
-              pep.evaluate / pep.gated_invoke     <-- PEP trust domain
-                         |  ALLOW only
+              pep.host (separate process)     <-- reference gate
+                         |  registry function, ALLOW only
                          v
                      tool invoke
+
+pep.evaluate / pep.gated_invoke stay for tests and corpus rows.
+In-process, the caller supplies the callable, the clock and the principal.
 ```
 
 | Plane | Role relative to this PEP |
@@ -53,7 +56,7 @@ Receipt field `trust_domain.model_monitor_mcp` is `untrusted_relative_to_pep`. E
 | **Multi-session plant** | A grant or instruction planted in one session's transcript is presented again in a later session as if the operator had approved it. | The PEP consults only its own approval store and the envelope in front of it; transcript prose from any session is data. An approval id the store never issued is `approval_invalid`. This does not detect cross-session planting; it shows the plant cannot become a grant. |
 | **Deferred tool** | A tool effect is deferred past the approval or the turn that was checked, for example by a dormant instruction that fires later. | The action is evaluated when it fires, against the grant's TTL and single-use state, not against the checked turn. A grant whose window has passed is `approval_expired`; a spent one is `approval_consumed`. The dormant instruction itself is not detected. |
 | **Approval binding mismatch** | Mint a HITL/TTL approval for a benign invoke, then substitute args (or otherwise change the operation) before execute. | Mint freezes `tool_name` + canonical args. Consume requires an exact binding match. Mismatch → `approval_binding_mismatch` and does not consume. Prose / `policy_context` / attachments are ignored for the binding. |
-| **Auth revocation / late effect** | Treat kill as only a halt bit, so a queued or in-flight invoke that was already admitted still completes successfully. | `kill()` is a cut plus an in-process fence. Completion after the cut is DENY `late_effect_fence` (receipt detail includes `cut+fence`). A new invoke after the cut stays `kill_active`. Existence-proof for the authorization-revocation / quiescence class ([arXiv:2609.21284](https://arxiv.org/abs/2609.21284)). Not a measured attack-success-rate claim. |
+| **Auth revocation / late effect** | Treat kill as only a halt bit, so a queued or in-flight invoke that was already admitted still completes successfully. | `kill()` is a cut plus an in-process fence. On the reference host the same cut is `python -m pep.host kill`, which writes the halt file. A call that has passed the first halt check reads that file again immediately before the tool runs. If it is no longer active, the host calls `runtime.kill()` and returns DENY. The tool does not run. Completion after an in-process cut is DENY `late_effect_fence` (receipt detail includes `cut+fence`). A new invoke after the cut stays `kill_active`. Existence-proof for the authorization-revocation / quiescence class ([arXiv:2609.21284](https://arxiv.org/abs/2609.21284)). Not a measured attack-success-rate claim. |
 
 Inspiration for the official `eval/` row is the monitor-bypass / policy-rewrite-coax *class* discussed in [arXiv:2609.19587](https://arxiv.org/abs/2609.19587). This stub is an existence-proof deny for that class, not a paper reproduction and not an attack-success-rate claim.
 
@@ -74,7 +77,7 @@ Every control below ends in **DENY + receipt** and, when callers use `gated_invo
 | Single-use TTL approval | Operator-minted grant consumed on first ALLOW of the frozen invoke. Replay / expiry / unknown / uncovered tool / args substitution deny. Does not unlock tools outside the catalog. | `approval_invalid`, `approval_expired`, `approval_consumed`, `approval_binding_mismatch`; when bound, `approval_state_mismatch`, `approval_principal_mismatch`, `approval_implementation_mismatch` |
 | Policy present and readable | Empty store, unreadable spec, or missing schema → deny. | `policy_miss` |
 | Kill / unavailable | `kill()` or `available=false` denies even an otherwise allowlisted envelope. Resume cannot clear a kill. Durable store reloads the same deny after restart. | `kill_active` |
-| Late-effect fence | `kill()` bumps an in-process cut epoch and refuses new entry permits. `begin_invoke` admits without entering a tool. `complete_invoke` (and `gated_invoke`) records a one-shot permit under the runtime lock, then calls the tool only if that permit was issued. A stale epoch is DENY `late_effect_fence`. A second complete on the same admission is DENY `admission_consumed`. Corpus row `acl-pep-eval-late-effect-fence-001` and `python -m pep.demo --late-effect-fence` exercise the cut. | `late_effect_fence`, `admission_consumed` |
+| Late-effect fence | `kill()` bumps an in-process cut epoch and refuses new entry permits. `begin_invoke` admits without entering a tool. `complete_invoke` (and `gated_invoke`) records a one-shot permit under the runtime lock, then calls the tool only if that permit was issued. A stale epoch is DENY `late_effect_fence`. A second complete on the same admission is DENY `admission_consumed`. Corpus row `acl-pep-eval-late-effect-fence-001` and `python -m pep.demo --late-effect-fence` exercise the in-process cut. On the reference host, `python -m pep.host kill` is the same fence for a call that has not entered the tool: the host re-reads the halt file immediately before `complete_invoke` and, when it is not active, calls `runtime.kill()` and returns DENY. | `late_effect_fence`, `admission_consumed`, `kill_active` |
 | Suspend | `suspend()` denies every envelope until `resume()`. Persisted suspend reloads as `suspend_active`. A suspend between admit and complete does not enter the tool. | `suspend_active` |
 | Parse / type failure | Null, bad JSON, malformed ids, non-object args. | `envelope_invalid` |
 | Gate | `gated_invoke` calls the tool only after `allowed()`. Bypass of the helper is outside this trust domain. | (no invoke on DENY) |
@@ -90,7 +93,8 @@ This document and this repository do **not** claim:
 - Marketplace adapters, live git hosts, or a production UI.
 - Measured attack-success-rate, classifier quality, or paper-figure reproduction.
 - That callers who skip `gated_invoke` / `complete_invoke` are still enforced (they are outside the PEP boundary).
-- Preemption or rollback of a callable that has already been entered when `kill()` arrives. The entry permit is recorded under the runtime lock before `tool()` is called. Once that call has started, the fence does not unwind it.
+- Preemption or rollback of a callable that has already been entered when `kill()` arrives. The entry permit is recorded under the runtime lock before `tool()` is called. Once that call has started, the fence does not unwind it. `python -m pep.host kill` is included in that limit: it stops a call that has not entered the tool, and it does not stop a tool body that has already started.
+- A connected socket passed to another process. Peer credentials stay those of the process that called `connect`. The host does not see the hand-off.
 - Process-external provider callbacks that perform the effect without re-entering `complete_invoke`. Another process’s in-memory admissions are not reconstructed. `HaltStore` reload still denies **new** evaluates as `kill_active` only.
 - Root-scoped quiescence across delegated providers, provider-local fences, or a cross-process cut certificate. This stub’s fence is the in-process epoch on `PepRuntime`.
 - Reordering approval consume against a later suspend or kill deny. A grant can be spent and the decision still DENY, with no ALLOW. `_spent_admissions` is also unbounded for the life of the process.

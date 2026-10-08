@@ -86,6 +86,7 @@ class PepRuntime:
         available: bool = True,
         approvals: ApprovalStore | None = None,
         halt_store: HaltStore | None = None,
+        persist_on_load: bool = True,
     ) -> None:
         self._lock = threading.Lock()
         self._fence_epoch = 0
@@ -104,7 +105,11 @@ class PepRuntime:
             self._mode = RuntimeMode.SUSPENDED
         else:
             self._mode = RuntimeMode.ACTIVE
-        self._persist_halt()
+        # The reference host passes persist_on_load=False. A halt file that
+        # disappears between the host's read and this constructor must not be
+        # replaced with a fresh active file.
+        if persist_on_load:
+            self._persist_halt()
 
     @property
     def policy(self) -> PolicyStore:
