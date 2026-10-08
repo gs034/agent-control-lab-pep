@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -117,11 +118,33 @@ def main(argv: list[str] | None = None) -> int:
             allowed_uids=args.allow_uid,
             allowed_gids=args.allow_gid,
         )
-        host.serve_forever()
+        _serve_until_signal(host)
         return 0
     except (HaltStoreError, HostError, DecisionLogError, OSError) as exc:
         print(f"pep.host: {exc}", file=sys.stderr)
         return 1
+
+
+def _serve_until_signal(host: ReferenceHost) -> None:
+    """Run until the accept loop stops, including on SIGTERM or SIGHUP.
+
+    The signal handler only sets the stop event. The accept loop then
+    returns and flushes any denial count still held for the open window.
+    SIGKILL cannot be caught, so it can still drop that held count.
+    """
+
+    def _stop(_signum: int, _frame: object) -> None:
+        host.request_stop()
+
+    previous = {
+        signal.SIGTERM: signal.signal(signal.SIGTERM, _stop),
+        signal.SIGHUP: signal.signal(signal.SIGHUP, _stop),
+    }
+    try:
+        host.serve_forever()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def _print_admin(path: Path, body: dict) -> int:
