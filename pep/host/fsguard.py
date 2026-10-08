@@ -6,6 +6,8 @@ The host refuses a directory it does not own, a symlink, or a directory
 another user can write. The halt file and the decision log live in a
 directory with no group or other bits. The agent socket directory may
 let the agent group traverse it, and must not let that group write it.
+
+Only the directory itself is checked. A parent of that directory is not.
 """
 
 from __future__ import annotations

@@ -6,9 +6,13 @@ The agent has no command that writes or deletes this file. Records list
 checks that ran. They do not carry a boolean that is true by construction
 (for example "policy unchanged").
 
-The log is opened with ``O_NOFOLLOW`` and the mode is set with ``fchmod``
-on that descriptor. A symlink at the log path is refused, so a planted
-link cannot receive the records.
+The log is opened with ``O_NOFOLLOW``. The descriptor is checked with
+``fstat`` before ``fchmod``. A symlink at the log path is refused, so a
+planted link cannot receive the records.
+
+Only the immediate parent directory is checked, not its parents. At
+startup the existing file is read, up to ``MAX_LOG_STARTUP_BYTES``, so
+sequence numbers continue. A larger file is refused.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from typing import Any, Mapping
 from pep.host.fsguard import PathGuardError, require_directory
 
 DECISION_SCHEMA = "acl-pep-host-decision-v1"
+MAX_LOG_STARTUP_BYTES = 1_048_576
 
 # Names that would claim a check the host did not perform, or a boolean
 # that cannot be false. Rejected at append time.
@@ -74,6 +79,11 @@ class DecisionLog:
         except OSError as exc:
             raise DecisionLogError(f"decision log unreadable: {exc}") from exc
         try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise DecisionLogError("decision log is not a regular file")
+            if info.st_uid != os.getuid():
+                raise DecisionLogError("decision log is not owned by this user")
             os.fchmod(fd, 0o600)
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
@@ -83,11 +93,21 @@ class DecisionLog:
             if stat.S_IMODE(info.st_mode) & 0o777 != 0o600:
                 raise DecisionLogError("decision log mode is not 0600")
             os.lseek(fd, 0, os.SEEK_SET)
-            reader = os.fdopen(os.dup(fd), "r", encoding="utf-8")
+            read_fd = os.dup(fd)
             try:
-                existing = reader.read()
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    block = os.read(read_fd, 65536)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > MAX_LOG_STARTUP_BYTES:
+                        raise DecisionLogError("decision log exceeds the startup read limit")
+                    chunks.append(block)
+                existing = b"".join(chunks).decode("utf-8")
             finally:
-                reader.close()
+                os.close(read_fd)
             self._fp = os.fdopen(fd, "a", encoding="utf-8")
             fd = -1
         except Exception:

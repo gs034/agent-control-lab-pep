@@ -24,7 +24,6 @@ import stat
 import struct
 import threading
 import time
-from collections import deque
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,6 +50,7 @@ RegistryTool = Callable[[Mapping[str, Any]], Any]
 
 MAX_CONNECTIONS = 8
 IDLE_TIMEOUT_SECONDS = 5.0
+CONNECTION_DEADLINE_SECONDS = 30.0
 DENY_LOG_BURST = 30
 DENY_LOG_WINDOW_SECONDS = 1.0
 ADMIN_MAX_CONNECTIONS = 4
@@ -138,13 +138,16 @@ class ReferenceHost:
         allowed_gids: Collection[int] | None = None,
         max_connections: int = MAX_CONNECTIONS,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
+        connection_deadline: float = CONNECTION_DEADLINE_SECONDS,
         deny_log_burst: int = DENY_LOG_BURST,
         deny_log_window: float = DENY_LOG_WINDOW_SECONDS,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self.halt_path = Path(halt_path)
         self.socket_path = None if socket_path is None else Path(socket_path)
         self.admin_path = None if admin_path is None else Path(admin_path)
         self._clock = clock or _system_clock
+        self._monotonic = time.monotonic if monotonic is None else monotonic
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._listener: socket.socket | None = None
@@ -159,16 +162,24 @@ class ReferenceHost:
         self._admin_live = 0
         self._max_connections = max_connections
         self._idle_timeout = idle_timeout
+        self._connection_deadline = connection_deadline
         self._deny_burst = deny_log_burst
         self._deny_window = deny_log_window
-        self._deny_stamps: deque[float] = deque()
+        self._window_start: float | None = None
+        self._window_written = 0
         self._suppressed = 0
-        self._last_coalesce = 0.0
+        self._log_closed = False
         self._allowed_uids = _id_set(allowed_uids, "uid")
         self._allowed_gids = _id_set(allowed_gids, "gid")
         self._policy_path = None if policy_path is None else Path(policy_path)
         self._file_digest: str | None = None
-        if max_connections < 1 or idle_timeout <= 0 or deny_log_burst < 1 or deny_log_window <= 0:
+        if (
+            max_connections < 1
+            or idle_timeout <= 0
+            or connection_deadline <= 0
+            or deny_log_burst < 1
+            or deny_log_window <= 0
+        ):
             raise HostError("connection and log limits must be positive")
         _require_private(self.halt_path.parent)
         if self.admin_path is not None:
@@ -331,6 +342,7 @@ class ReferenceHost:
                 except OSError:
                     pass
                 self._admin_listener = None
+            self._shutdown_log()
 
     def serve_in_background(self) -> threading.Thread:
         """Start ``serve_forever`` on a daemon thread. Used by tests and local runs."""
@@ -366,7 +378,7 @@ class ReferenceHost:
                 admin.close()
             except OSError:
                 pass
-        self._decisions.close()
+        self._shutdown_log()
 
     def _decide(self, raw: bytes | str | Any, session: Session) -> dict[str, Any]:
         request_id = self._request_id(session)
@@ -527,11 +539,13 @@ class ReferenceHost:
             )
 
         # A kill that lands after the first halt check, including during the
-        # log fsync, is read again here. The tool does not run.
+        # log fsync, is read again here. The tool does not run. This denial
+        # is the outcome of an admitted call, so it is appended on its own
+        # and is not part of the denial-log window.
         blocked = self._halt_block()
         if blocked is not None:
             check, reason, detail = blocked
-            return self._logged(
+            return self._record(
                 session,
                 "DENY",
                 reason,
@@ -551,7 +565,7 @@ class ReferenceHost:
         try:
             finished, result = complete_invoke(pending, run_registered)
         except Exception:
-            self._logged(
+            return self._record(
                 session,
                 "DENY",
                 "tool_failed",
@@ -561,9 +575,8 @@ class ReferenceHost:
                 now=now,
                 request_id=request_id,
             )
-            return _response("DENY", "tool_failed", "host tool raised after entry", request_id)
         if not finished.allowed():
-            return self._logged(
+            return self._record(
                 session,
                 "DENY",
                 str(finished.receipt.reason_code),
@@ -624,21 +637,48 @@ class ReferenceHost:
                 )
                 return
             session = self.open_session(peer)
-            conn.settimeout(self._idle_timeout)
+            opened = self._monotonic()
             buf = b""
             while not self._stop.is_set():
+                elapsed = self._monotonic() - opened
+                if elapsed >= self._connection_deadline:
+                    request_id = self._request_id(session)
+                    response = self._logged(
+                        session,
+                        "DENY",
+                        "connection_deadline",
+                        "connection deadline passed and the connection was closed",
+                        [{"name": "connection_deadline", "outcome": "deny"}],
+                        tool_name=None,
+                        now=None,
+                        request_id=request_id,
+                    )
+                    _send_line(conn, response)
+                    break
+                try:
+                    conn.settimeout(min(self._idle_timeout, self._connection_deadline - elapsed))
+                except OSError:
+                    break
                 try:
                     chunk = conn.recv(4096)
                 except TimeoutError:
                     if self._stop.is_set():
                         break
+                    if self._monotonic() - opened >= self._connection_deadline:
+                        reason = "connection_deadline"
+                        detail = "connection deadline passed and the connection was closed"
+                        check = "connection_deadline"
+                    else:
+                        reason = "idle_timeout"
+                        detail = "connection was idle and was closed"
+                        check = "idle_timeout"
                     request_id = self._request_id(session)
                     response = self._logged(
                         session,
                         "DENY",
-                        "idle_timeout",
-                        "connection was idle and was closed",
-                        [{"name": "idle_timeout", "outcome": "deny"}],
+                        reason,
+                        detail,
+                        [{"name": check, "outcome": "deny"}],
                         tool_name=None,
                         now=None,
                         request_id=request_id,
@@ -713,9 +753,17 @@ class ReferenceHost:
             if peer.uid != os.getuid():
                 _send_line(conn, {"ok": False, "error": "admin peer is not the host user"})
                 return
-            conn.settimeout(self._idle_timeout)
+            opened = self._monotonic()
             buf = b""
             while b"\n" not in buf:
+                elapsed = self._monotonic() - opened
+                if elapsed >= self._connection_deadline:
+                    _send_line(conn, {"ok": False, "error": "connection deadline passed"})
+                    return
+                try:
+                    conn.settimeout(min(self._idle_timeout, self._connection_deadline - elapsed))
+                except OSError:
+                    return
                 if len(buf) > MAX_REQUEST_BYTES:
                     _send_line(conn, {"ok": False, "error": "admin request exceeds the host limit"})
                     return
@@ -831,9 +879,10 @@ class ReferenceHost:
     ) -> None:
         """No usable peer credentials means no session and no tool entry."""
         request_id = self._request_id(None)
-        if not self._claim_denial_slot():
-            self._coalesce_denial(None, request_id)
-        else:
+        action, pending = self._account_denial()
+        if action == "rotate" and not self._append_summary(pending):
+            self._sticky_halt = True
+        elif action != "count":
             record: dict[str, Any] = {
                 "decision": "DENY",
                 "reason_code": reason,
@@ -971,6 +1020,10 @@ class ReferenceHost:
             self._sticky_halt = True
             raise HaltStoreError(f"could not restrict the halt file: {exc}") from exc
         try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                self._sticky_halt = True
+                raise HaltStoreError("halt file is not a regular file owned by this user")
             os.fchmod(fd, 0o600)
         except OSError as exc:
             self._sticky_halt = True
@@ -1117,36 +1170,85 @@ class ReferenceHost:
         connection = 0 if session is None else session.connection_id
         return f"host.{connection}.{number}"
 
-    def _claim_denial_slot(self) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            while self._deny_stamps and now - self._deny_stamps[0] >= self._deny_window:
-                self._deny_stamps.popleft()
-            if len(self._deny_stamps) < self._deny_burst:
-                self._deny_stamps.append(now)
-                return True
-            return False
+    def _account_denial(self) -> tuple[str, int]:
+        """Count one denial that may be coalesced.
 
-    def _coalesce_denial(self, session: Session | None, request_id: str) -> bool:
-        now = time.monotonic()
+        The clock is read inside the lock. ``write`` means this denial gets
+        its own line. ``count`` means it is held until the window closes.
+        ``rotate`` means the previous window's held count must be written
+        now, and this denial is the first line of the new window.
+
+        A clock that reads 0 is not treated as "a summary was just written".
+        No summary exists until a window with a held count closes, or the
+        host shuts down.
+        """
         with self._lock:
+            if self._log_closed:
+                return "count", 0
+            now = self._monotonic()
+            if self._window_start is None or now - self._window_start >= self._deny_window:
+                pending = self._suppressed
+                self._suppressed = 0
+                self._window_written = 1
+                self._window_start = now
+                if pending:
+                    return "rotate", pending
+                return "write", 0
+            if self._window_written < self._deny_burst:
+                self._window_written += 1
+                return "write", 0
             self._suppressed += 1
-            count = self._suppressed
-            due = now - self._last_coalesce >= self._deny_window
-            if due:
-                self._last_coalesce = now
-        if not due:
+            return "count", self._suppressed
+
+    def _append_summary(self, count: int) -> bool:
+        """One line for the denials held in a window that just closed."""
+        if count < 1:
             return True
-        return self._append(
-            session,
-            "DENY",
-            "rate_limited",
-            f"{count} denials coalesced so the decision log cannot fill the disk",
-            [{"name": "denial_log", "outcome": "coalesced"}],
-            None,
-            None,
-            request_id,
-        )
+        request_id = self._request_id(None)
+        record: dict[str, Any] = {
+            "decision": "DENY",
+            "reason_code": "rate_limited",
+            "reason_detail": _clip(f"{count} denials in this window were counted in this line"),
+            "request_id": request_id,
+            "checks": [{"name": "denial_log", "outcome": "coalesced"}],
+            "suppressed_count": count,
+        }
+        try:
+            self._decisions.append(record)
+        except (DecisionLogError, OSError, ValueError):
+            self._sticky_halt = True
+            return False
+        return True
+
+    def _shutdown_log(self) -> None:
+        """Write a held window count, then close the log. Safe to call twice."""
+        with self._lock:
+            if self._log_closed:
+                return
+            pending = self._suppressed
+            self._suppressed = 0
+            self._log_closed = True
+        if pending:
+            self._append_summary(pending)
+        self._decisions.close()
+
+    def _record(
+        self,
+        session: Session | None,
+        decision: str,
+        reason: str,
+        detail: str,
+        checks: list[dict[str, str]],
+        *,
+        tool_name: str | None,
+        now: datetime | None,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Append a decision that must not be coalesced."""
+        if not self._append(session, decision, reason, detail, checks, tool_name, now, request_id):
+            self._sticky_halt = True
+            return _response("DENY", "kill_active", "decision log append failed; fail-closed deny", request_id)
+        return _response(decision, reason, detail, request_id)
 
     def _logged(
         self,
@@ -1160,11 +1262,13 @@ class ReferenceHost:
         now: datetime | None,
         request_id: str,
     ) -> dict[str, Any]:
-        if decision == "DENY" and not self._claim_denial_slot():
-            if not self._coalesce_denial(session, request_id):
+        if decision == "DENY":
+            action, pending = self._account_denial()
+            if action == "rotate" and not self._append_summary(pending):
                 self._sticky_halt = True
                 return _response("DENY", "kill_active", "decision log append failed; fail-closed deny", request_id)
-            return _response(decision, reason, detail, request_id)
+            if action == "count":
+                return _response(decision, reason, detail, request_id)
         if not self._append(session, decision, reason, detail, checks, tool_name, now, request_id):
             self._sticky_halt = True
             return _response("DENY", "kill_active", "decision log append failed; fail-closed deny", request_id)

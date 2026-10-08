@@ -15,6 +15,7 @@ import os
 import socket
 import stat
 import tempfile
+import threading
 import time
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -28,7 +29,7 @@ from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.host.__main__ import main
 from pep.host.client import invoke
 from pep.host.haltfile import ACTIVE, init_active, read_fail_closed
-from pep.host.log import FORBIDDEN_KEYS, DecisionLog, DecisionLogError
+from pep.host.log import FORBIDDEN_KEYS, MAX_LOG_STARTUP_BYTES, DecisionLog, DecisionLogError
 from pep.host.protocol import ProtocolError, parse_host_request
 from pep.host.server import SOCKET_MODE, HostError, PeerCred, ReferenceHost
 
@@ -80,6 +81,18 @@ def _host(
 
 def _peer(pid: int = 10, uid: int = 1000) -> PeerCred:
     return PeerCred(pid=pid, uid=uid, gid=1000)
+
+
+class _Mono:
+    """Fake monotonic clock. Tests set ``now``; the host reads it under its lock."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return self.now
 
 
 def test_in_process_api_is_not_described_as_the_boundary():
@@ -608,17 +621,132 @@ def test_idle_connection_is_closed_and_the_session_is_dropped(tmp_path: Path):
 
 
 def test_denial_log_is_coalesced(tmp_path: Path):
-    host = _host(tmp_path, deny_log_burst=2, deny_log_window=60)
+    clock = _Mono()
+    window = 10.0
+    host = _host(tmp_path, deny_log_burst=2, deny_log_window=window, monotonic=clock)
     session = host.open_session(_peer())
-    for _ in range(10):
+
+    def deny() -> dict:
         decision = host.handle_request(b"[]", session)
         assert decision["decision"] == "DENY"
+        assert decision["reason_code"] == "envelope_invalid"
+        return decision
+
+    clock.now = 0.0
+    for _ in range(2):
+        deny()
+    for _ in range(3):
+        deny()
     records = host.decision_records()
-    assert len(records) < 10
-    assert any(record["reason_code"] == "rate_limited" for record in records)
+    assert len(records) == 2
+    assert all(record["reason_code"] != "rate_limited" for record in records)
+
+    clock.now = window / 2
+    for _ in range(2):
+        deny()
+    records = host.decision_records()
+    assert len(records) == 2
+    assert all(record["reason_code"] != "rate_limited" for record in records)
+
+    clock.now = window
+    deny()
+    records = host.decision_records()
+    summaries = [record for record in records if record["reason_code"] == "rate_limited"]
+    assert len(summaries) == 1
+    assert summaries[0]["suppressed_count"] == 5
+    assert len(records) == 4
+
+    deny()
+    for _ in range(4):
+        deny()
+    summaries = [record for record in host.decision_records() if record["reason_code"] == "rate_limited"]
+    assert len(summaries) == 1
+
+    host.close()
+    records = host.decision_records()
+    summaries = [record for record in records if record["reason_code"] == "rate_limited"]
+    assert [record["suppressed_count"] for record in summaries] == [5, 4]
     assert host.halted() is False
     for record in records:
         _assert_record_claims_only_what_ran(record)
+
+
+def test_admitted_denials_are_logged_during_a_flood(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    clock = _Mono()
+
+    def boom(_args: dict) -> dict:
+        raise RuntimeError("boom")
+
+    host = _host(
+        tmp_path,
+        registry={"echo.ping": boom},
+        monotonic=clock,
+        deny_log_burst=1,
+        deny_log_window=10,
+    )
+    session = host.open_session(_peer())
+    clock.now = 0.0
+    for _ in range(5):
+        denied = host.handle_request(b"[]", session)
+        assert denied["reason_code"] == "envelope_invalid"
+    host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    failed = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert failed["reason_code"] == "tool_failed"
+    assert any(record["reason_code"] == "tool_failed" for record in host.decision_records())
+
+    real = read_fail_closed
+    seen = {"n": 0}
+
+    def wrapped(path: Path):
+        seen["n"] += 1
+        if seen["n"] >= 2:
+            HaltStore(path).write(HaltState(mode=HaltMode.KILLED, available=True))
+        return real(path)
+
+    monkeypatch.setattr("pep.host.server.read_fail_closed", wrapped)
+    host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    halted = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert halted["reason_code"] == "kill_active"
+    assert any(
+        record["reason_code"] == "kill_active" and record["checks"][0].get("observed") == "killed"
+        for record in host.decision_records()
+    )
+    host.close()
+    summaries = [record for record in host.decision_records() if record["reason_code"] == "rate_limited"]
+    assert summaries
+    assert summaries[0]["suppressed_count"] == 4
+    for record in host.decision_records():
+        _assert_record_claims_only_what_ran(record)
+
+
+def test_decision_log_checks_the_file_before_fchmod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "decisions.log"
+    path.write_text("")
+    order: list[str] = []
+    real_fstat = os.fstat
+    real_fchmod = os.fchmod
+
+    def fstat(fd: int):
+        order.append("fstat")
+        return real_fstat(fd)
+
+    def fchmod(fd: int, mode: int) -> None:
+        order.append("fchmod")
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    monkeypatch.setattr(os, "fchmod", fchmod)
+    DecisionLog(path)
+    assert order.index("fstat") < order.index("fchmod")
+
+
+def test_decision_log_refuses_a_file_over_the_startup_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "decisions.log"
+    path.write_text("x" * 64)
+    monkeypatch.setattr("pep.host.log.MAX_LOG_STARTUP_BYTES", 32)
+    with pytest.raises(DecisionLogError, match="startup read limit"):
+        DecisionLog(path)
+    assert MAX_LOG_STARTUP_BYTES == 1_048_576
 
 
 def test_decision_log_refuses_a_symlink_and_does_not_chmod_the_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -744,6 +872,65 @@ def test_stale_socket_is_replaced_and_a_non_socket_is_not(tmp_path: Path):
     with pytest.raises(HostError, match="symlink"):
         linked.serve_in_background()
     assert link.is_symlink()
+
+
+def test_client_denies_a_reply_without_a_decision(tmp_path: Path):
+    path = tmp_path / "reply.sock"
+
+    def serve(payload: bytes, ready: threading.Event) -> None:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.settimeout(2)
+        listener.bind(str(path))
+        listener.listen(1)
+        ready.set()
+        conn, _addr = listener.accept()
+        try:
+            buf = b""
+            while b"\n" not in buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.sendall(payload)
+        finally:
+            conn.close()
+            listener.close()
+
+    for payload in (b'{"ok":true}\n', b'{"decision":"MAYBE"}\n'):
+        if path.exists():
+            path.unlink()
+        ready = threading.Event()
+        thread = threading.Thread(target=serve, args=(payload, ready), daemon=True)
+        thread.start()
+        assert ready.wait(timeout=2)
+        try:
+            reply = invoke(path, "echo.ping", ARGS, host_uid=os.getuid(), timeout=2)
+        finally:
+            thread.join(timeout=2)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "envelope_invalid"
+        assert "decision" in reply["reason_detail"]
+
+
+def test_connection_deadline_closes_a_slow_drip(tmp_path: Path):
+    clock = _Mono()
+    host = _listen(tmp_path, monotonic=clock, connection_deadline=10, idle_timeout=30)
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        deadline = time.time() + 2
+        while time.time() < deadline and clock.calls < 2:
+            time.sleep(0.01)
+        assert clock.calls >= 2
+        clock.now = 10
+        client.sendall(b"x")
+        reply = _recv(client)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "connection_deadline"
+        assert any(record["reason_code"] == "connection_deadline" for record in host.decision_records())
+    finally:
+        client.close()
+        host.close()
 
 
 def test_client_denies_when_the_host_is_down_or_the_peer_is_wrong(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

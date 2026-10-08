@@ -84,6 +84,16 @@ Every control below ends in **DENY + receipt** and, when callers use `gated_invo
 
 Receipts also attest `fail_closed: true`, `judge.path: host_runtime_deterministic`, `llm_cot_transcript_judge: false`, `agent_prose_used_as_policy: false`, and `negative_controls_observed` (policy bytes unchanged, tool not executed, monitor coax not accepted).
 
+## Resource limits on the reference host
+
+| Limit | What it bounds | What remains |
+| --- | --- | --- |
+| Connection cap | At most 8 agent connections, one thread each. A further connection is DENY `connection_limit` and is not given a session. The admin socket has its own cap of 4. | Threads for the accept loop and the admin listener still exist. The cap is not a measured bound on attack success. |
+| Idle timeout and connection deadline | The idle timeout is per read: 5 seconds with no bytes closes the connection (`idle_timeout`) and drops the session. A client that sends a byte before each idle timeout holds one of the 8 slots until the connection deadline, 30 seconds after accept (`connection_deadline`). | Until that deadline the slot stays taken. The gate still fails closed. `python -m pep.host kill` still denies a call that has not entered the tool. The deadline does not unwind a tool body that has already started. |
+| Denial-log window | At most 30 denial lines per one-second window for calls that have not been admitted. The clock is read inside the lock. A clock reading of 0 is not a summary already written. The rest of the window is counted, not written. When the window closes, one `rate_limited` line carries that window's count and the count is reset. Shutdown writes that line if a count is still held. | An allow, the pre-entry line, the second halt check, a tool that raises after entry, and a fence denial after the pre-entry line are each appended on their own. A stream of allows can still grow the log. A full disk on append fails closed and latches a halt. |
+| Log startup read | The host reads the decision log at startup, up to 1MiB, to continue sequence numbers, and refuses a larger file. | The operator read of the log is not capped by that startup limit. |
+| Directory check | The halt directory and the log directory must be owned by the host user and mode 0700. The socket directory must be owned by the host user and not writable by group or other. | Only that immediate directory is checked. A parent directory is not. |
+
 ## Explicit non-goals
 
 This document and this repository do **not** claim:

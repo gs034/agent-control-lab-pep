@@ -59,7 +59,7 @@ def invoke(
     try:
         with _connect_attested(socket_path, host_uid, timeout) as sock:
             sock.sendall(payload + b"\n")
-            return _read_response(sock)
+            return _read_response(sock, require_decision=True)
     except _ClientDeny as exc:
         return _deny(exc.reason, exc.detail)
     except (TimeoutError, OSError):
@@ -83,7 +83,7 @@ def admin_call(
     try:
         with _connect_attested(admin_path, host_uid, timeout) as sock:
             sock.sendall(payload + b"\n")
-            return _read_response(sock)
+            return _read_response(sock, require_decision=False)
     except _ClientDeny as exc:
         return _deny(exc.reason, exc.detail)
     except (TimeoutError, OSError):
@@ -122,7 +122,7 @@ def _connect_attested(path: Path | str, host_uid: int, timeout: float) -> socket
     return sock
 
 
-def _read_response(sock: socket.socket) -> dict[str, Any]:
+def _read_response(sock: socket.socket, *, require_decision: bool) -> dict[str, Any]:
     buf = b""
     while b"\n" not in buf:
         if len(buf) > MAX_REQUEST_BYTES:
@@ -144,6 +144,8 @@ def _read_response(sock: socket.socket) -> dict[str, Any]:
         return _deny("envelope_invalid", "host response is not a JSON object")
     if not isinstance(parsed, dict):
         return _deny("envelope_invalid", "host response is not a JSON object")
+    if require_decision and parsed.get("decision") not in {"ALLOW", "DENY"}:
+        return _deny("envelope_invalid", "host response has no decision")
     return parsed
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -107,11 +108,16 @@ class HaltStore:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
             os.write(fd, (text + "\n").encode("utf-8"))
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise HaltStoreError("halt temp file is not a regular file owned by this user")
             os.fchmod(fd, 0o600)
+            os.fsync(fd)
             os.close(fd)
             fd = -1
             os.replace(tmp_name, path)
             tmp_name = ""
+            _fsync_directory(path.parent)
         except OSError as exc:
             raise HaltStoreError(f"halt store persist failed: {exc}") from exc
         finally:
@@ -122,6 +128,20 @@ class HaltStore:
                     os.unlink(tmp_name)
                 except OSError:
                     pass
+
+
+def _fsync_directory(parent: Path) -> None:
+    """Persist the rename. The temporary file itself is fsynced before it."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    dirfd = os.open(parent, flags)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
 
 
 def parse_halt_text(raw: str) -> HaltState:

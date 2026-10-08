@@ -142,6 +142,9 @@ def _restrict(path: Path) -> None:
     except OSError as exc:
         raise HaltStoreError(f"could not restrict the halt file: {exc}") from exc
     try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise HaltStoreError("halt file is not a regular file owned by this user")
         os.fchmod(fd, 0o600)
     except OSError as exc:
         raise HaltStoreError(f"could not restrict the halt file: {exc}") from exc
