@@ -146,7 +146,7 @@ The built-in registry runs `echo.ping`. The agent does not supply the function.
 
 The client checks two things before it trusts a reply. The socket file must be owned by the expected host user, and `SO_PEERCRED` on the connection must show that same user id. If the host is down, the peer does not match, or the reply does not arrive before the timeout (5 seconds), the client returns a DENY. It does not raise.
 
-`invoke` opens a new connection for each call, so it can never receive an ALLOW: the grant applies to a connection that is open when it is minted. An agent makes its calls on one held connection with `AgentConnection`:
+`invoke` opens a new connection for each call and sends one request on it. A grant applies only to a connection that is open when the operator mints it, so `invoke` cannot be granted in advance. An agent makes its calls on one held connection with `AgentConnection`:
 
 ```python
 from pep.host.client import AgentConnection
@@ -159,7 +159,7 @@ The host closes a connection after 5 seconds with no bytes, and 30 seconds after
 
 ### Check this deployment
 
-`scripts/reference_host_check/live_check.py` runs this procedure as two operating-system users and tries each claim in this section from the agent side. It is Linux-only and needs root. See [its README](scripts/reference_host_check/README.md) for what it does not prove. The same check runs on every push in `.github/workflows/reference-host-live.yml`.
+`scripts/reference_host_check/live_check.py` runs this procedure as two operating-system users and tries the claims listed in [ADR-0008](docs/adr/ADR-0008-reference-host-deployment-acceptance.md) from the agent side. It is Linux-only and needs root. See [its README](scripts/reference_host_check/README.md) for what it does not prove. The same check runs on every push in `.github/workflows/reference-host-live.yml`.
 
 Limits on this reference host: a request over 64KiB, or JSON nested deeper than 32, is DENY and the denial is appended to the log. At most 8 agent connections are handled at once, one thread each; a further connection is DENY `connection_limit`. The idle timeout is per read. A connection with no bytes for 5 seconds is closed with DENY `idle_timeout`, and that session is dropped. A client that keeps sending a byte before that timeout is closed 30 seconds after accept, with DENY `connection_deadline`. Until then it holds one of the 8 slots. The gate still fails closed, and a kill still denies a call that has not entered the tool.
 

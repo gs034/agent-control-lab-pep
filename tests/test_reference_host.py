@@ -1423,3 +1423,14 @@ def test_held_connection_refuses_a_host_owned_by_another_user(tmp_path: Path):
         assert reply["reason_code"] == "host_unattested"
     finally:
         host.close()
+
+
+def test_held_connection_returns_deny_when_no_socket_can_be_opened(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def no_descriptors(*_args: object, **_kwargs: object) -> None:
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("pep.host.client._connect_attested", no_descriptors)
+    with AgentConnection(tmp_path / "pep.sock", host_uid=os.getuid()) as held:
+        reply = held.call("echo.ping", ARGS)
+    assert reply["decision"] == "DENY"
+    assert reply["reason_code"] == "host_unreachable"

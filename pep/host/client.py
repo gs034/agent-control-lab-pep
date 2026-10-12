@@ -173,16 +173,27 @@ class AgentConnection:
         self._buf = b""
 
     def __enter__(self) -> AgentConnection:
+        self.close()
+        self._refused = None
+        self._buf = b""
         try:
             self._sock = _connect_attested(self._socket_path, self._host_uid, self._timeout)
         except _ClientDeny as exc:
             self._refused = _deny(exc.reason, exc.detail)
+        except OSError:
+            self._refused = _deny("host_unreachable", "could not open a connection to the host")
         return self
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
     def call(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Send one request on the held connection.
+
+        A DENY with ``host_unreachable`` after the request was sent does not
+        mean the tool did not run: the host may have admitted the call and
+        still be running it. Check the decision log before retrying an effect.
+        """
         if self._sock is None:
             return self._refused or _deny("host_unreachable", "connection is not open")
         try:

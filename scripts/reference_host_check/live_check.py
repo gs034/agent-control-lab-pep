@@ -294,22 +294,24 @@ def read_log(lay: Layout) -> list[dict[str, Any]]:
     return records
 
 
+def _grant_newest(lay: Layout, python: str, args: dict[str, Any], ttl: int) -> bool:
+    """Grant the newest session. False when there is no session or the grant was refused."""
+    conn = newest_session_id(lay, python)
+    if conn is None:
+        return False
+    return grant(lay, python, conn, args, ttl=ttl).returncode == 0
+
+
 def mode_of(path: Path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
 
 def reset_state(lay: Layout, python: str) -> None:
-    host_uid = pwd.getpwnam(HOST_USER).pw_uid
-    host_gid = pwd.getpwnam(HOST_USER).pw_gid
-    agent_gid = pwd.getpwnam(AGENT_USER).pw_gid
+    """Create the directories with the README's own commands (steps 2 and 3)."""
     for path in (lay.state, lay.run):
         shutil.rmtree(path, ignore_errors=True)
-    lay.state.mkdir(mode=0o700)
-    os.chown(lay.state, host_uid, host_gid)
-    os.chmod(lay.state, 0o700)
-    lay.run.mkdir()
-    os.chown(lay.run, host_uid, agent_gid)
-    os.chmod(lay.run, 0o2750)
+    run(["install", "-d", "-o", HOST_USER, "-g", HOST_USER, "-m", "0700", str(lay.state)])
+    run(["install", "-d", "-o", HOST_USER, "-g", AGENT_GROUP, "-m", "2750", str(lay.run)])
     result = host_python(lay, python, "init-halt", "--halt", str(lay.halt))
     if result.returncode != 0:
         raise SystemExit(f"init-halt failed: {result.stderr}")
@@ -410,10 +412,11 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
             str(lay.admin),
         ],
     )
+    admin_control = host_python(lay, python, "sessions", "--admin", str(lay.admin))
     report.check(
         "agent cannot connect to the admin socket",
-        admin_probe.returncode != 0 and "Permission denied" in admin_probe.stderr,
-        admin_probe.stderr.strip()[-120:],
+        admin_probe.returncode != 0 and "Permission denied" in admin_probe.stderr and admin_control.returncode == 0,
+        f"agent: {admin_probe.stderr.strip()[-100:]} | host control rc={admin_control.returncode}",
     )
 
     agent_a = Held(lay, python)
@@ -461,7 +464,11 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
             report.check("the agent cannot mint a grant over its own socket", is_deny(self_grant), self_grant[:120])
 
             unknown = grant(lay, python, 99999, {"message": "hi"}, ttl=60)
-            report.check("a grant to a connection that does not exist is refused", unknown.returncode != 0 or '"ok": false' in unknown.stdout.lower() or "no such connection" in unknown.stdout, unknown.stdout.strip()[:120])
+            report.check(
+                "a grant to a connection that does not exist is refused by the host",
+                unknown.returncode != 0 and "no such connection" in unknown.stderr,
+                unknown.stderr.strip()[-120:],
+            )
 
             expiry_grant = grant(lay, python, conn_a, {"message": "ttl"}, ttl=2)
             before_expiry = agent_a.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "ttl"}}))
@@ -481,8 +488,15 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
         nested = [nested]
     deep_conn = Held(lay, python)
     try:
-        deep = deep_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi", "deep": nested}}))
-        report.check("JSON nested deeper than 32 is denied", is_deny(deep), deep[:120])
+        deep_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "probe"}}))
+        granted = _grant_newest(lay, python, {"message": "hi"}, 120)
+        control = deep_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
+        deep = decode(deep_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi", "deep": nested}})))
+        report.check(
+            "JSON nested deeper than 32 is denied on a granted connection",
+            granted and is_allow(control) and deep.get("reason_code") == "envelope_invalid" and "nesting" in deep.get("reason_detail", ""),
+            str(deep.get("reason_detail")),
+        )
     finally:
         deep_conn.close()
 
@@ -504,8 +518,15 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
 
     oversize_conn = Held(lay, python)
     try:
-        oversized = oversize_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "a" * 70000}}))
-        report.check("a request over 64KiB is denied", is_deny(oversized), oversized[:120])
+        oversize_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "probe"}}))
+        granted = _grant_newest(lay, python, {"message": "hi"}, 120)
+        control = oversize_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
+        oversized = decode(oversize_conn.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "a" * 70000}})))
+        report.check(
+            "a request over 64KiB is denied on a granted connection",
+            granted and is_allow(control) and oversized.get("reason_code") == "envelope_invalid" and "exceeds" in oversized.get("reason_detail", ""),
+            str(oversized.get("reason_detail")),
+        )
     finally:
         oversize_conn.close()
 
@@ -528,10 +549,20 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
             held.close()
 
     idle = as_user(AGENT_USER, lay, [python, "-c", _idle_script(str(lay.sock))], timeout=40)
-    report.check("a connection with no bytes is closed after the idle timeout", "idle_timeout" in idle.stdout or idle.stdout.strip() == "EOF", idle.stdout.strip()[:120])
+    idle_elapsed, idle_reply = _timed(idle.stdout)
+    report.check(
+        "a connection with no bytes is closed after 5 seconds",
+        idle_reply is not None and "idle_timeout" in idle_reply and 4.0 <= idle_elapsed <= 8.0,
+        f"closed after {idle_elapsed}s with {idle_reply!r}",
+    )
 
     deadline = as_user(AGENT_USER, lay, [python, "-c", _trickle_script(str(lay.sock))], timeout=60)
-    report.check("a connection that keeps trickling is closed at the connection deadline", "connection_deadline" in deadline.stdout, deadline.stdout.strip()[-120:])
+    deadline_elapsed, deadline_reply = _timed(deadline.stdout)
+    report.check(
+        "a connection that keeps trickling is closed at 30 seconds",
+        deadline_reply is not None and "connection_deadline" in deadline_reply and 28.0 <= deadline_elapsed <= 36.0,
+        f"closed after {deadline_elapsed}s with {deadline_reply!r}",
+    )
 
     agent_c = Held(lay, python)
     try:
@@ -545,17 +576,26 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
     report.check("SIGTERM stops the host cleanly", code == 0 and "Traceback" not in err, f"exit={code}")
 
 
+def _timed(stdout: str) -> tuple[float, str | None]:
+    """Parse a probe line of the form ``<seconds> <reply>``."""
+    head, _, rest = stdout.strip().partition(" ")
+    try:
+        return float(head), rest or None
+    except ValueError:
+        return -1.0, None
+
+
 def _idle_script(sock: str) -> str:
     return (
         "import socket,time\n"
         f"s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect({sock!r})\n"
         "s.settimeout(20)\n"
-        "data=b''\n"
+        "start=time.monotonic(); data=b''\n"
         "try:\n"
         "    data=s.recv(4096)\n"
         "except OSError:\n"
         "    pass\n"
-        "print(data.decode('utf-8','replace').strip() or 'EOF')\n"
+        "print(round(time.monotonic()-start,2), data.decode('utf-8','replace').strip() or 'EOF')\n"
     )
 
 
@@ -564,7 +604,7 @@ def _trickle_script(sock: str) -> str:
         "import socket,time\n"
         f"s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect({sock!r})\n"
         "s.settimeout(2)\n"
-        "end=time.monotonic()+40\n"
+        "start=time.monotonic(); end=start+40\n"
         "data=b''\n"
         "while time.monotonic()<end:\n"
         "    try:\n"
@@ -580,7 +620,7 @@ def _trickle_script(sock: str) -> str:
         "    if data:\n"
         "        break\n"
         "    time.sleep(2)\n"
-        "print(data.decode('utf-8','replace').strip() or 'EOF')\n"
+        "print(round(time.monotonic()-start,2), data.decode('utf-8','replace').strip() or 'EOF')\n"
     )
 
 
@@ -620,8 +660,7 @@ def client_checks(lay: Layout, python: str, report: Report) -> None:
     held = Held(lay, python, via_client=True)
     try:
         before = held.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "client"}}))
-        conn = newest_session_id(lay, python)
-        grant(lay, python, conn or 0, {"message": "client"}, ttl=60)
+        _grant_newest(lay, python, {"message": "client"}, 60)
         after = held.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "client"}}))
         report.check(
             "a held client connection is allowed once the operator grants it",
@@ -682,8 +721,7 @@ def scenario_runtime_halt(lay: Layout, python: str, report: Report) -> None:
     agent = Held(lay, python)
     try:
         agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
-        conn = newest_session_id(lay, python)
-        grant(lay, python, conn or 0, {"message": "hi"}, ttl=120)
+        _grant_newest(lay, python, {"message": "hi"}, 120)
         baseline = agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
         report.check("baseline before the halt file is removed: allowed", is_allow(baseline), baseline[:80])
         removed = as_user(HOST_USER, lay, ["rm", "-f", str(lay.halt)])
@@ -708,8 +746,7 @@ def scenario_halt(lay: Layout, python: str, report: Report) -> None:
     agent = Held(lay, python)
     try:
         agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
-        conn = newest_session_id(lay, python)
-        grant(lay, python, conn or 0, {"message": "hi"}, ttl=120)
+        _grant_newest(lay, python, {"message": "hi"}, 120)
         before = agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
         report.check("baseline: granted call is allowed before the kill", is_allow(before), before[:120])
 
@@ -731,10 +768,9 @@ def scenario_halt(lay: Layout, python: str, report: Report) -> None:
         agent = Held(lay, python)
         try:
             agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
-            conn = newest_session_id(lay, python)
-            grant(lay, python, conn or 0, {"message": "hi"}, ttl=120)
+            granted = _grant_newest(lay, python, {"message": "hi"}, 120)
             restarted = agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
-            report.check("a kill survives a restart", is_deny(restarted), restarted[:120])
+            report.check("a kill survives a restart", granted and is_deny(restarted), f"granted={granted} {restarted[:100]}")
         finally:
             agent.close()
     else:
@@ -762,41 +798,42 @@ def _denied_on_start(lay: Layout, python: str, host: Host) -> bool:
     agent = Held(lay, python)
     try:
         agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}}))
-        conn = newest_session_id(lay, python)
-        grant(lay, python, conn or 0, {"message": "hi"}, ttl=120)
-        return is_deny(agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}})))
+        granted = _grant_newest(lay, python, {"message": "hi"}, 120)
+        return granted and is_deny(agent.send(json.dumps({"tool_name": "echo.ping", "args": {"message": "hi"}})))
     finally:
         agent.close()
+
+
+def _start_refused(lay: Layout, python: str) -> tuple[int | None, str]:
+    """Start the host and return its exit status and stderr. None when it did not exit."""
+    host = Host(lay, python)
+    try:
+        _, err = host.proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        host.stop()
+        return None, "host did not exit"
+    LIVE_HOSTS.remove(host)
+    return host.proc.returncode, err
 
 
 def scenario_startup(lay: Layout, python: str, report: Report) -> None:
     reset_state(lay, python)
     os.chmod(lay.run, 0o2770)
-    refused = Host(lay, python)
-    try:
-        code = refused.proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        code = None
-        refused.stop()
+    code, err = _start_refused(lay, python)
     report.check(
-        "a socket directory that group members can write is refused",
-        code not in (None, 0) and not lay.sock.exists(),
-        f"exit={code}",
+        "a socket directory that group members can write is refused at start",
+        code == 1 and "writable by group or other" in err and not lay.sock.exists(),
+        f"exit={code} {err.strip()[-100:]}",
     )
     os.chmod(lay.run, 0o2750)
 
     reset_state(lay, python)
     os.chmod(lay.state, 0o755)
-    refused = Host(lay, python)
-    try:
-        code = refused.proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        code = None
-        refused.stop()
+    code, err = _start_refused(lay, python)
     report.check(
-        "a state directory that others can read is refused",
-        code not in (None, 0),
-        f"exit={code}",
+        "a state directory that others can read is refused at start",
+        code == 1 and "accessible to group or other" in err,
+        f"exit={code} {err.strip()[-100:]}",
     )
     os.chmod(lay.state, 0o700)
 
