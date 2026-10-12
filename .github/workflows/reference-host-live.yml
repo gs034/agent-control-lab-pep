@@ -5,10 +5,16 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   live:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Live deployment check as two operating-system users
-        run: sudo "$(command -v python3)" scripts/reference_host_check/live_check.py --source .
+        run: |
+          sudo groupadd -f -r acl-agent
+          id -u acl-agent >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin -g acl-agent acl-agent
+          sudo "$(command -v python3)" scripts/reference_host_check/live_check.py --source . --yes --cleanup --allow-uid "$(id -u acl-agent)" --allow-gid "$(id -g acl-agent)"

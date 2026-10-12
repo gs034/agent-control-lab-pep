@@ -145,7 +145,7 @@ sudo -u acl-pep python -m pep.host grant \
   --ttl 60
 ```
 
-The built-in registry runs `echo.ping`. The agent does not supply the function. The host forks an executor before it reads the policy, the halt file, or the log, and the tool runs there. The executor drops every inherited descriptor except its socket, then installs a landlock ruleset that denies filesystem access and a seccomp filter that rejects connecting a socket, changing a file mode or owner, signalling another process, and reading or writing another process. This is Linux x86_64 only. If that sandbox cannot be installed, the host does not start and does not run the tool in-process. The gate still re-reads the halt file in its own process immediately before it asks the executor to run, and a kill at that point does not enter the tool. A tool body that has already started is not unwound.
+The built-in registry runs `echo.ping`. The agent does not supply the function. The host forks an executor nursery before it reads the policy, the halt file, or the log, and each session's tool runs in its own worker from that nursery. A worker drops every inherited descriptor except its socket, then installs a landlock ruleset that denies filesystem access and a seccomp allow list. The list checks the architecture is x86_64 first and kills any other architecture, including a 32-bit `int 0x80` entry. It rejects an x32-style syscall number, and it does not include `memfd_create`, `io_uring`, `clone3`, `bpf`, `userfaultfd`, `perf_event_open`, `open_by_handle_at`, `keyctl`, `ptrace`, or `sendto`. The worker clears its environment and caps core dumps, file size, and new processes. At most as many workers as the connection cap are live. A call that runs longer than five seconds is denied and that session's worker is stopped. This is Linux x86_64 only. If that sandbox cannot be installed, the host does not start and does not run the tool in-process. The gate still re-reads the halt file in its own process immediately before it asks the worker to run, and a kill at that point does not enter the tool. A tool body that has already started is not unwound.
 
 The client checks two things before it trusts a reply. The socket file must be owned by the expected host user, and `SO_PEERCRED` on the connection must show that same user id. If the host is down, the peer does not match, or the reply does not arrive before the timeout (5 seconds), the client returns a DENY. It does not raise.
 
@@ -158,7 +158,7 @@ with AgentConnection("/run/acl-pep/pep.sock", host_uid=<uid of acl-pep>) as held
     reply = held.call("echo.ping", {"message": "hi"})
 ```
 
-The host closes a connection after 5 seconds with no bytes, and 30 seconds after it was accepted. A closed connection gives DENY. The agent reconnects, and the operator mints a new grant for the new connection.
+Threads may share one `AgentConnection`: a lock keeps each request and its reply together, and a reply whose host request id does not belong to this connection, or does not rise, is DENY `reply_mismatch` and closes the connection. A reply that is not JSON also closes it. Every thread on one connection shares that connection's grants. The host closes a connection after 5 seconds with no bytes, and 30 seconds after it was accepted. A closed connection gives DENY. The agent reconnects, and the operator mints a new grant for the new connection.
 
 ### Check this deployment
 

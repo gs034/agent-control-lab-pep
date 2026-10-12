@@ -18,9 +18,28 @@ Linux, as root, with Python 3.11 or later. It needs `runuser`, `setpriv` and
 `acl-pep` (the host) and `acl-agent` (the agent, in group `acl-agent`), and it
 uses test paths `/var/lib/acl-pep-check` and `/run/acl-pep-check`.
 
+> **Do not run this on a shared or production host.** It creates the system
+> users `acl-pep` and `acl-agent` and deletes its test directories as root.
+> Without `--yes` it prints what it would do and exits with status 2.
+
 ```bash
-sudo python3 scripts/reference_host_check/live_check.py --source .
+sudo python3 scripts/reference_host_check/live_check.py --source . --yes --cleanup \
+  --allow-uid "$(id -u acl-agent)" --allow-gid "$(id -g acl-agent)"
 ```
+
+`--allow-uid` and `--allow-gid` are the agent user's ids. The check passes
+both to every host it starts. The claim that a peer outside the list is
+refused uses a different user id and this same group id. Omitting the flags
+still uses the `acl-agent` user the check creates. A value that is not that
+user is refused.
+
+`--cleanup` removes the users, the group and the test directories at the end,
+but only the users and group that this run created. The check only deletes a
+directory under `/opt/acl-pep-check`, `/var/lib/acl-pep-check`,
+`/run/acl-pep-check`, or a `--scratch-root` you name (at least two levels
+deep). A symlink at one of those paths is refused. The damaged halt file is
+written as the host user with `O_NOFOLLOW`, so root never writes, chowns or
+chmods by path inside a directory the host user owns.
 
 It takes about a minute. The host is started and stopped by the script, and
 nothing is left running afterwards.

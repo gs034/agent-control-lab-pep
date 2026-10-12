@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from pep.host.protocol import MAX_REQUEST_BYTES
 from pep.host.server import HostError, peer_credentials
 
 DEFAULT_TIMEOUT_SECONDS = 5.0
+_REQUEST_ID_RE = re.compile(r"\Ahost\.(\d{1,18})\.(\d{1,18})\Z")
 
 
 class _ClientDeny(Exception):
@@ -162,26 +165,41 @@ class AgentConnection:
     after 5 seconds with no bytes, and 30 seconds after it was accepted. A
     closed connection gives DENY; the next connection is a new session with
     no grant.
+
+    Threads may share one object. A lock holds each request and its reply
+    line together, so one caller cannot read another caller's reply. One
+    connection is still one session: every thread on it shares its grants.
+
+    Each reply must carry a host request id of the form ``host.<conn>.<n>``.
+    The connection part must stay the same on this connection and ``n`` must
+    rise. A reply that breaks this, or that is not JSON, is DENY and the
+    connection is closed, because the client can no longer tell which
+    request a later line answers.
     """
 
     def __init__(self, socket_path: Path | str, *, host_uid: int, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:
         self._socket_path = socket_path
         self._host_uid = host_uid
         self._timeout = timeout
+        self._lock = threading.Lock()
         self._sock: socket.socket | None = None
         self._refused: dict[str, str] | None = None
         self._buf = b""
+        self._conn_part: int | None = None
+        self._last_number = -1
 
     def __enter__(self) -> AgentConnection:
-        self.close()
-        self._refused = None
-        self._buf = b""
-        try:
-            self._sock = _connect_attested(self._socket_path, self._host_uid, self._timeout)
-        except _ClientDeny as exc:
-            self._refused = _deny(exc.reason, exc.detail)
-        except OSError:
-            self._refused = _deny("host_unreachable", "could not open a connection to the host")
+        with self._lock:
+            self._close_locked(None)
+            self._refused = None
+            self._conn_part = None
+            self._last_number = -1
+            try:
+                self._sock = _connect_attested(self._socket_path, self._host_uid, self._timeout)
+            except _ClientDeny as exc:
+                self._refused = _deny(exc.reason, exc.detail)
+            except OSError:
+                self._refused = _deny("host_unreachable", "could not open a connection to the host")
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -194,29 +212,61 @@ class AgentConnection:
         mean the tool did not run: the host may have admitted the call and
         still be running it. Check the decision log before retrying an effect.
         """
-        if self._sock is None:
-            return self._refused or _deny("host_unreachable", "connection is not open")
         try:
             payload = json.dumps({"args": args, "tool_name": tool_name}, separators=(",", ":")).encode("utf-8")
         except (TypeError, ValueError, RecursionError):
             return _deny("envelope_invalid", "request is not JSON")
         if len(payload) > MAX_REQUEST_BYTES:
             return _deny("envelope_invalid", "request exceeds the host limit")
-        try:
-            self._sock.sendall(payload + b"\n")
-            line = self._read_line()
-        except (TimeoutError, OSError):
-            self.close()
-            return _deny("host_unreachable", "host did not reply")
-        if line is None:
-            self.close()
-            return _deny("host_unreachable", "host closed the connection")
-        return _parse_reply(line, require_decision=True)
+        with self._lock:
+            if self._sock is None:
+                return self._refused or _deny("host_unreachable", "connection is not open")
+            try:
+                self._sock.sendall(payload + b"\n")
+                line = self._read_line()
+            except (TimeoutError, OSError):
+                return self._close_locked(_deny("host_unreachable", "host did not reply"))
+            if line is None:
+                return self._close_locked(_deny("host_unreachable", "host closed the connection"))
+            reply = _parse_reply(line, require_decision=True)
+            if reply.get("reason_code") == "envelope_invalid" and "request_id" not in reply:
+                return self._close_locked(reply)
+            mismatch = self._check_request_id(reply.get("request_id"))
+            if mismatch is not None:
+                return self._close_locked(_deny("reply_mismatch", mismatch))
+            return reply
 
     def close(self) -> None:
+        with self._lock:
+            self._close_locked(None)
+
+    def _close_locked(self, reason: dict[str, str] | None) -> dict[str, str] | None:
         if self._sock is not None:
-            self._sock.close()
+            try:
+                self._sock.close()
+            except OSError:
+                pass
             self._sock = None
+        self._buf = b""
+        if reason is not None:
+            self._refused = reason
+        return reason
+
+    def _check_request_id(self, request_id: Any) -> str | None:
+        if not isinstance(request_id, str):
+            return "reply has no host request id"
+        match = _REQUEST_ID_RE.match(request_id)
+        if match is None:
+            return "reply request id is not a host request id"
+        conn_part, number = int(match.group(1)), int(match.group(2))
+        if self._conn_part is None:
+            self._conn_part = conn_part
+        elif conn_part != self._conn_part:
+            return "reply request id names another connection"
+        if number <= self._last_number:
+            return "reply request id did not rise"
+        self._last_number = number
+        return None
 
     def _read_line(self) -> bytes | None:
         while b"\n" not in self._buf:
