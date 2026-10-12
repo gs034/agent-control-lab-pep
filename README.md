@@ -146,6 +146,21 @@ The built-in registry runs `echo.ping`. The agent does not supply the function.
 
 The client checks two things before it trusts a reply. The socket file must be owned by the expected host user, and `SO_PEERCRED` on the connection must show that same user id. If the host is down, the peer does not match, or the reply does not arrive before the timeout (5 seconds), the client returns a DENY. It does not raise.
 
+`invoke` opens a new connection for each call and sends one request on it. A grant applies only to a connection that is open when the operator mints it, so `invoke` cannot be granted in advance. An agent makes its calls on one held connection with `AgentConnection`:
+
+```python
+from pep.host.client import AgentConnection
+
+with AgentConnection("/run/acl-pep/pep.sock", host_uid=<uid of acl-pep>) as held:
+    reply = held.call("echo.ping", {"message": "hi"})
+```
+
+The host closes a connection after 5 seconds with no bytes, and 30 seconds after it was accepted. A closed connection gives DENY. The agent reconnects, and the operator mints a new grant for the new connection.
+
+### Check this deployment
+
+`scripts/reference_host_check/live_check.py` runs this procedure as two operating-system users and tries the claims listed in [ADR-0008](docs/adr/ADR-0008-reference-host-deployment-acceptance.md) from the agent side. It is Linux-only and needs root. See [its README](scripts/reference_host_check/README.md) for what it does not prove. The same check runs on every push in `.github/workflows/reference-host-live.yml`.
+
 Limits on this reference host: a request over 64KiB, or JSON nested deeper than 32, is DENY and the denial is appended to the log. At most 8 agent connections are handled at once, one thread each; a further connection is DENY `connection_limit`. The idle timeout is per read. A connection with no bytes for 5 seconds is closed with DENY `idle_timeout`, and that session is dropped. A client that keeps sending a byte before that timeout is closed 30 seconds after accept, with DENY `connection_deadline`. Until then it holds one of the 8 slots. The gate still fails closed, and a kill still denies a call that has not entered the tool.
 
 Denial lines for a call that has not been admitted are capped at 30 per window of one second. The clock is read inside the lock that counts them. A clock that reads 0 is not treated as a summary already written. Further denials in that window are not written one by one. When the window closes, one `rate_limited` line is written with that window's count, and the count is reset. The accept loop wakes about every 0.2 seconds and writes that line even when no further denial arrives. The same line is written on shutdown if a count is still held. Shutdown waits for a denial that has already entered the host and folds it into that count before it closes the file. The caller of a counted denial still receives DENY with the original reason. The second halt check, a tool that raises after entry, and a fence denial after the pre-entry line are each their own log line and are not part of the count. There is no argument-size budget beyond the request cap, and a tool result is still only labelled, not checked.
@@ -198,6 +213,8 @@ Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v
 | `eval/corpus/` | M1 structured envelopes + expected receipts (deny classes + catalog-bound ALLOW + approval binding) |
 | `docs/adr/ADR-0001-lab-pep-architecture.md` | Architecture decision: trust domain, grants, fail-closed, halt, receipts |
 | `docs/adr/ADR-0007-reference-host-process.md` | The gate runs as its own process under its own user. The in-process library is not a security boundary |
+| `docs/adr/ADR-0008-reference-host-deployment-acceptance.md` | The reference host's deployment claims are checked live as two operating-system users, in CI on every push |
+| `scripts/reference_host_check/` | Live check of the reference host deployment against its written claims |
 | `docs/ROADMAP.md` | stub → v0.2 → v0.3 / EOI M1 → v0.3.1 approval binding → v0.3.2 late-effect fence → v0.3.3 state digest → v0.4.0 principal binding → v0.5.0 capability holders → v0.6.0 implementation binding → v0.7.0 execute what was digested |
 | `docs/threat-model.md` | Public host/runtime PEP threat model and control taxonomy |
 | `docs/DILIGENCE-HISTORY.md` | Residual historical PR refs by SHA/ref (tip stays Lab-clean) |
