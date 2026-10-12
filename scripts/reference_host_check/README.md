@@ -19,8 +19,15 @@ Linux, as root, with Python 3.11 or later. It needs `runuser`, `setpriv` and
 uses test paths `/var/lib/acl-pep-check` and `/run/acl-pep-check`.
 
 ```bash
-sudo python3 scripts/reference_host_check/live_check.py --source .
+sudo python3 scripts/reference_host_check/live_check.py --source . \
+  --allow-uid "$(id -u acl-agent)" --allow-gid "$(id -g acl-agent)"
 ```
+
+`--allow-uid` and `--allow-gid` are the agent user's ids. The check passes
+both to every host it starts. The claim that a peer outside the list is
+refused uses a different user id and this same group id. Omitting the flags
+still uses the `acl-agent` user the check creates. A value that is not that
+user is refused.
 
 It takes about a minute. The host is started and stopped by the script, and
 nothing is left running afterwards.

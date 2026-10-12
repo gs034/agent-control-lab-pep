@@ -37,6 +37,9 @@ AGENT_USER = "acl-agent"
 AGENT_GROUP = "acl-agent"
 HERE = Path(__file__).resolve().parent
 LIVE_HOSTS: list[Host] = []
+# Set in main to the agent user's ids. Hosts that should accept the agent pass both.
+AGENT_UID = ""
+AGENT_GID = ""
 
 
 @dataclass(frozen=True)
@@ -110,10 +113,20 @@ def ensure_users() -> None:
         run(["useradd", "-r", "-M", "-s", "/usr/sbin/nologin", "-g", AGENT_GROUP, AGENT_USER])
 
 
+def agent_allow_args() -> tuple[str, str, str, str]:
+    """``--allow-uid`` and ``--allow-gid`` for the agent user this check created."""
+    user = pwd.getpwnam(AGENT_USER)
+    uid = AGENT_UID or str(user.pw_uid)
+    gid = AGENT_GID or str(user.pw_gid)
+    return ("--allow-uid", uid, "--allow-gid", gid)
+
+
 class Host:
     """The reference host, started as the host user and stopped on exit."""
 
-    def __init__(self, lay: Layout, python: str, extra: tuple[str, ...] = ()) -> None:
+    def __init__(self, lay: Layout, python: str, extra: tuple[str, ...] | None = None) -> None:
+        if extra is None:
+            extra = agent_allow_args()
         self.lay = lay
         pw = pwd.getpwnam(HOST_USER)
         self.proc = subprocess.Popen(
@@ -339,7 +352,7 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
         where.stdout.strip() == expected,
         where.stdout.strip() or where.stderr.strip()[-120:],
     )
-    host = Host(lay, python, extra=())
+    host = Host(lay, python)
     if not host.wait_ready():
         _, err = host.stop()
         report.check("host starts with its socket", False, err.strip()[-300:])
@@ -678,7 +691,13 @@ def client_checks(lay: Layout, python: str, report: Report) -> None:
 
 def scenario_peer(lay: Layout, python: str, report: Report) -> None:
     reset_state(lay, python)
-    host = Host(lay, python, extra=("--allow-uid", "4242"))
+    host_uid = pwd.getpwnam(HOST_USER).pw_uid
+    agent_uid = int(AGENT_UID or pwd.getpwnam(AGENT_USER).pw_uid)
+    foreign = "4242"
+    if int(foreign) in {0, host_uid, agent_uid}:
+        foreign = str(max(host_uid, agent_uid) + 1)
+    _uid_flag, _uid, gid_flag, gid = agent_allow_args()
+    host = Host(lay, python, extra=("--allow-uid", foreign, gid_flag, gid))
     if not host.wait_ready():
         report.check("peer scenario: host starts", False)
         host.stop()
@@ -850,13 +869,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", type=Path, default=Path("/var/lib/acl-pep-check"))
     parser.add_argument("--run-dir", type=Path, default=Path("/run/acl-pep-check"))
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--allow-uid",
+        type=int,
+        default=None,
+        help="User id of the agent. Must be the acl-agent user. The host is started with this id.",
+    )
+    parser.add_argument(
+        "--allow-gid",
+        type=int,
+        default=None,
+        help="Group id of the agent. Must be the acl-agent group. The host is started with this id.",
+    )
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         parser.error("run as root: the check creates users and switches to them")
     lay = Layout(code=args.code_dir, state=args.state_dir, run=args.run_dir)
     report = Report()
+    global AGENT_UID, AGENT_GID
     try:
         provision(lay, args.source)
+        agent = pwd.getpwnam(AGENT_USER)
+        if args.allow_uid is not None and args.allow_uid != agent.pw_uid:
+            print(
+                f"pep live check: --allow-uid {args.allow_uid} is not the {AGENT_USER} user ({agent.pw_uid})",
+                file=sys.stderr,
+            )
+            return 2
+        if args.allow_gid is not None and args.allow_gid != agent.pw_gid:
+            print(
+                f"pep live check: --allow-gid {args.allow_gid} is not the {AGENT_USER} group ({agent.pw_gid})",
+                file=sys.stderr,
+            )
+            return 2
+        AGENT_UID = str(agent.pw_uid)
+        AGENT_GID = str(agent.pw_gid)
         scenario_main(lay, args.python, report)
         scenario_halt(lay, args.python, report)
         scenario_startup(lay, args.python, report)

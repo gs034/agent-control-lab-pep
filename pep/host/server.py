@@ -8,8 +8,9 @@ envelope over a Unix socket. Identity comes from the operating system's
 peer credentials on that connection, plus a session this process assigns.
 The agent cannot supply the function that runs, the time, or another
 session's identity. A registry function runs in a separate executor
-process, not in this one. This process refuses to run as root, and the
-agent socket refuses a peer whose user id is root or this process's.
+process, one per session, not in this one. This process refuses to run
+as root, and the agent socket refuses a peer whose user id is root or
+this process's.
 
 This is a reference prototype. It is not a measured attack-success
 reduction and not a product. See ADR-0007.
@@ -36,7 +37,13 @@ from pep.approval import ApprovalRecord, is_principal
 from pep.evaluate import PepRuntime
 from pep.gate import begin_invoke, complete_invoke
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
-from pep.host.executor import ExecutorStartError, ToolExecutionError, ToolExecutor, UnencodableResult
+from pep.host.executor import (
+    DEFAULT_CALL_TIMEOUT_SECONDS,
+    ExecutorNursery,
+    ExecutorStartError,
+    ToolExecutionError,
+    UnencodableResult,
+)
 from pep.host.fsguard import PathGuardError, read_private_file, require_directory
 from pep.host.haltfile import (
     ACTIVE,
@@ -54,6 +61,7 @@ RegistryTool = Callable[[Mapping[str, Any]], Any]
 MAX_CONNECTIONS = 8
 IDLE_TIMEOUT_SECONDS = 5.0
 CONNECTION_DEADLINE_SECONDS = 30.0
+TOOL_CALL_TIMEOUT_SECONDS = DEFAULT_CALL_TIMEOUT_SECONDS
 DENY_LOG_BURST = 30
 DENY_LOG_WINDOW_SECONDS = 1.0
 ADMIN_MAX_CONNECTIONS = 4
@@ -154,6 +162,7 @@ class ReferenceHost:
         max_connections: int = MAX_CONNECTIONS,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
         connection_deadline: float = CONNECTION_DEADLINE_SECONDS,
+        tool_timeout: float = TOOL_CALL_TIMEOUT_SECONDS,
         deny_log_burst: int = DENY_LOG_BURST,
         deny_log_window: float = DENY_LOG_WINDOW_SECONDS,
         monotonic: Callable[[], float] | None = None,
@@ -183,6 +192,7 @@ class ReferenceHost:
         self._max_connections = max_connections
         self._idle_timeout = idle_timeout
         self._connection_deadline = connection_deadline
+        self._tool_timeout = tool_timeout
         self._deny_burst = deny_log_burst
         self._deny_window = deny_log_window
         self._window_start: float | None = None
@@ -199,16 +209,21 @@ class ReferenceHost:
             max_connections < 1
             or idle_timeout <= 0
             or connection_deadline <= 0
+            or tool_timeout <= 0
             or deny_log_burst < 1
             or deny_log_window <= 0
         ):
             raise HostError("connection and log limits must be positive")
-        # Fork the executor before this process reads the policy, the halt
-        # file, or the log. The child keeps the registry functions and does
-        # not see grants minted later.
+        # Fork the nursery before this process reads the policy, the halt
+        # file, or the log. Workers come from that nursery, so they do not
+        # see grants minted later. Each session gets its own worker.
         self._registry = self._copy_registry(registry)
         try:
-            self._executor = ToolExecutor.start(self._registry)
+            self._executors = ExecutorNursery.start(
+                self._registry,
+                call_timeout=tool_timeout,
+                max_workers=max_connections,
+            )
         except ExecutorStartError as exc:
             raise HostError(str(exc)) from exc
         try:
@@ -221,7 +236,7 @@ class ReferenceHost:
             self._runtime = self._open_runtime()
             self._decisions = DecisionLog(Path(log_path))
         except Exception:
-            self._executor.close()
+            self._executors.close()
             raise
 
     @property
@@ -460,9 +475,9 @@ class ReferenceHost:
 
     def close(self) -> None:
         self.request_stop()
-        executor = getattr(self, "_executor", None)
-        if executor is not None:
-            executor.close()
+        executors = getattr(self, "_executors", None)
+        if executors is not None:
+            executors.close()
         listener = self._listener
         if listener is not None:
             try:
@@ -478,9 +493,9 @@ class ReferenceHost:
         self._shutdown_log()
 
     def __del__(self) -> None:
-        executor = getattr(self, "_executor", None)
-        if executor is not None:
-            executor.close()
+        executors = getattr(self, "_executors", None)
+        if executors is not None:
+            executors.close()
 
     def _decide(self, raw: bytes | str | Any, session: Session) -> dict[str, Any]:
         request_id = self._request_id(session)
@@ -661,18 +676,21 @@ class ReferenceHost:
         snapshot = dict(args)
 
         def run_registered() -> Any:
-            # The name selects the registry function copied into the executor
-            # at startup. The request cannot replace that function.
-            return self._executor.call(tool_name, snapshot)
+            # The name selects the registry function copied into this session's
+            # worker at startup. The request cannot replace that function.
+            return self._executors.call(session.connection_id, tool_name, snapshot)
 
         try:
             finished, result = complete_invoke(pending, run_registered)
         except ToolExecutionError as exc:
-            detail = (
-                "host tool was denied access outside the executor"
-                if exc.kind == "permission"
-                else "host tool raised after entry"
-            )
+            if exc.kind == "permission":
+                detail = "host tool was denied access outside the executor"
+            elif exc.kind == "timeout":
+                detail = "host tool timed out"
+            elif exc.kind == "limit":
+                detail = "host tool executor limit reached"
+            else:
+                detail = "host tool raised after entry"
             return self._record(
                 session,
                 "DENY",
@@ -1096,6 +1114,9 @@ class ReferenceHost:
             self._sessions = [item for item in self._sessions if item.connection_id != session.connection_id]
             self._known.discard(session.principal)
             self._grants.pop(session.principal, None)
+        executors = getattr(self, "_executors", None)
+        if executors is not None:
+            executors.release(session.connection_id)
 
     def _load_policy(self, policy: PolicyStore | None) -> PolicyStore:
         if self._policy_path is None:

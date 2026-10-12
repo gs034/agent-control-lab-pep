@@ -11,4 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Live deployment check as two operating-system users
-        run: sudo "$(command -v python3)" scripts/reference_host_check/live_check.py --source .
+        run: |
+          sudo groupadd -f -r acl-agent
+          id -u acl-agent >/dev/null 2>&1 || sudo useradd -r -M -s /usr/sbin/nologin -g acl-agent acl-agent
+          sudo "$(command -v python3)" scripts/reference_host_check/live_check.py --source . --allow-uid "$(id -u acl-agent)" --allow-gid "$(id -g acl-agent)"
