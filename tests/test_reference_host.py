@@ -32,7 +32,7 @@ from pep.evaluate import PepRuntime, evaluate
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import STUB_POLICY_DOCUMENT
 from pep.host.__main__ import main
-from pep.host.client import invoke
+from pep.host.client import AgentConnection, invoke
 from pep.host.haltfile import ACTIVE, init_active, read_fail_closed
 from pep.host.log import FORBIDDEN_KEYS, MAX_LOG_STARTUP_BYTES, DecisionLog, DecisionLogError
 from pep.host.protocol import ProtocolError, parse_host_request
@@ -1457,366 +1457,50 @@ def _listen_at(tmp_path: Path, socket_path: Path) -> ReferenceHost:
     return host
 
 
-def _private(path: Path) -> Path:
-    path.mkdir(exist_ok=True)
-    os.chmod(path, 0o700)
-    return path
-
-
-def _policy_file(directory: Path) -> Path:
-    _private(directory)
-    path = directory / "policy.json"
-    path.write_text(json.dumps(STUB_POLICY_DOCUMENT), encoding="utf-8")
-    os.chmod(path, 0o600)
-    return path
-
-
-def test_root_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(os, "geteuid", lambda: 0)
-    with pytest.raises(HostError, match="root"):
-        _host(tmp_path)
-    monkeypatch.undo()
-
-    nested = tmp_path / "real-uid"
-    nested.mkdir()
-    os.chmod(nested, 0o700)
-    halt = nested / "halt.json"
-    init_active(halt)
-    monkeypatch.setattr(os, "getuid", lambda: 0)
-    with pytest.raises(HostError, match="root"):
-        ReferenceHost(halt_path=halt, log_path=nested / "decisions.log")
-    assert main(["init-halt", "--halt", str(nested / "ignored.json")]) == 1
-
-
-def test_agent_socket_refuses_the_host_user(tmp_path: Path):
-    host = _listen(tmp_path, allowed_uids=frozenset({_agent_uid()}))
-    client = _connect(host.socket_path)
+def test_held_connection_is_allowed_only_once_the_operator_grants_it(tmp_path: Path):
+    host = _listen(tmp_path)
     try:
-        denied = _recv(client)
-        assert denied["decision"] == "DENY"
-        assert denied["reason_code"] == "peer_rejected"
-        assert "host user" in denied["reason_detail"]
-        assert host.decision_records()[-1]["peer_uid"] == os.getuid()
-        assert host.sessions() == ()
-    finally:
-        client.close()
-        host.close()
-
-
-def test_agent_socket_refuses_a_root_peer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    def root_peer(conn: socket.socket) -> PeerCred:
-        cred = peer_credentials(conn)
-        return PeerCred(pid=cred.pid, uid=0, gid=cred.gid)
-
-    monkeypatch.setattr("pep.host.server.peer_credentials", root_peer)
-    host = _listen(tmp_path, allowed_uids=frozenset({_agent_uid()}))
-    client = _connect(host.socket_path)
-    try:
-        denied = _recv(client)
-        assert denied["decision"] == "DENY"
-        assert denied["reason_code"] == "peer_rejected"
-        assert "root" in denied["reason_detail"]
-        assert host.decision_records()[-1]["peer_uid"] == 0
-        assert host.sessions() == ()
-    finally:
-        client.close()
-        host.close()
-
-
-def test_serve_requires_an_allow_list(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-    host = _host(tmp_path)
-    try:
-        with pytest.raises(HostError, match="allow list"):
-            host.serve_forever()
-    finally:
-        host.close()
-
-    other = _private(tmp_path / "empty")
-    empty = _host(other, allowed_uids=frozenset())
-    try:
-        with pytest.raises(HostError, match="allow list"):
-            empty.serve_forever()
-    finally:
-        empty.close()
-
-    os.chmod(tmp_path, 0o700)
-    sock_dir = _private(tmp_path / "run")
-    os.chmod(sock_dir, 0o2750)
-    halt = tmp_path / "cli-halt.json"
-    init_active(halt)
-    code = main(
-        [
-            "serve",
-            "--socket",
-            str(sock_dir / "pep.sock"),
-            "--halt",
-            str(halt),
-            "--log",
-            str(tmp_path / "cli.log"),
-        ]
-    )
-    assert code == 1
-    assert "allow list" in capsys.readouterr().err
-
-
-def test_allow_list_cannot_name_root_or_the_host_user(tmp_path: Path):
-    with pytest.raises(HostError, match="host user"):
-        _host(tmp_path, allowed_uids={os.getuid()})
-    nested = tmp_path / "root-uid"
-    nested.mkdir()
-    os.chmod(nested, 0o700)
-    with pytest.raises(HostError, match="root"):
-        _host(nested, allowed_uids={0})
-
-
-def test_host_user_is_refused_before_a_group_allow_list(tmp_path: Path):
-    host = _host(tmp_path, allowed_gids=frozenset({os.getgid()}))
-    try:
-        same = PeerCred(pid=1, uid=os.getuid(), gid=os.getgid())
-        assert host.peer_permitted(same) is False
-        assert host._agent_peer_denial(same) == "peer uid is the host user"
-        assert host.peer_permitted(PeerCred(pid=1, uid=_agent_uid(), gid=os.getgid())) is True
-        assert host.peer_permitted(PeerCred(pid=1, uid=_agent_uid(), gid=os.getgid() + 1)) is False
+        with AgentConnection(host.socket_path, host_uid=os.getuid()) as held:
+            assert held.call("echo.ping", ARGS)["decision"] == "DENY"
+            _wait_sessions(host, 1)
+            session = host.sessions()[0]
+            host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+            allowed = held.call("echo.ping", ARGS)
+            assert allowed["decision"] == "ALLOW"
+            assert held.call("echo.ping", {"message": "other"})["decision"] == "DENY"
     finally:
         host.close()
 
 
-def test_admin_socket_refuses_a_pid_the_agent_socket_rejected(tmp_path: Path):
-    admin = tmp_path / "admin.sock"
-    host = _listen(tmp_path, admin_path=admin, allowed_uids=frozenset({_agent_uid()}))
-    client = _connect(host.socket_path)
+def test_held_connection_gives_deny_once_the_host_has_closed_it(tmp_path: Path):
+    host = _listen(tmp_path)
     try:
-        denied = _recv(client)
-        assert denied["reason_code"] == "peer_rejected"
-        assert "host user" in denied["reason_detail"]
-        admin_client = _connect(admin)
-        try:
-            reply = _recv(admin_client)
-        finally:
-            admin_client.close()
-        assert reply["ok"] is False
-        assert "operator" in reply["error"]
-        # A different process id with this user id is still accepted. The kernel
-        # credential does not say which of those processes is the operator.
-        assert host._admin_peer_denial(PeerCred(pid=os.getpid() + 1, uid=os.getuid(), gid=os.getgid())) is None
-    finally:
-        client.close()
-        host.close()
-
-
-def test_admin_socket_refuses_an_allow_listed_uid(tmp_path: Path):
-    admin = tmp_path / "admin.sock"
-    agent = _agent_uid()
-    host = _listen(tmp_path, admin_path=admin, allowed_uids=frozenset({agent}))
-    _inject_agent_peer(host, agent)
-    client = _connect(admin)
-    try:
-        reply = _recv(client)
-        assert reply["ok"] is False
-        assert "host user" in reply["error"]
-    finally:
-        client.close()
-        host.close()
-
-
-def test_symlinked_policy_is_refused(tmp_path: Path):
-    os.chmod(tmp_path, 0o700)
-    target = _policy_file(tmp_path)
-    target_bytes = target.read_bytes()
-    link = tmp_path / "policy-link.json"
-    link.symlink_to(target)
-    halt = tmp_path / "halt.json"
-    init_active(halt)
-    with pytest.raises(HostError, match="symlink"):
-        ReferenceHost(
-            halt_path=halt,
-            log_path=tmp_path / "decisions.log",
-            policy_path=link,
-        )
-    assert link.is_symlink()
-    assert target.read_bytes() == target_bytes
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
-
-
-def test_group_readable_policy_is_refused(tmp_path: Path):
-    os.chmod(tmp_path, 0o700)
-    path = _policy_file(tmp_path)
-    os.chmod(path, 0o640)
-    halt = tmp_path / "halt.json"
-    init_active(halt)
-    with pytest.raises(HostError, match="group or other"):
-        ReferenceHost(
-            halt_path=halt,
-            log_path=tmp_path / "decisions.log",
-            policy_path=path,
-        )
-
-
-def test_policy_in_a_loose_directory_is_refused(tmp_path: Path):
-    os.chmod(tmp_path, 0o700)
-    loose = tmp_path / "loose"
-    loose.mkdir()
-    os.chmod(loose, 0o755)
-    path = loose / "policy.json"
-    path.write_text(json.dumps(STUB_POLICY_DOCUMENT), encoding="utf-8")
-    os.chmod(path, 0o600)
-    halt = tmp_path / "halt.json"
-    init_active(halt)
-    with pytest.raises(HostError, match="directory"):
-        ReferenceHost(
-            halt_path=halt,
-            log_path=tmp_path / "decisions.log",
-            policy_path=path,
-        )
-
-
-def test_policy_owned_by_someone_else_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    os.chmod(tmp_path, 0o700)
-    path = _policy_file(tmp_path)
-    halt = tmp_path / "halt.json"
-    init_active(halt)
-    monkeypatch.setattr("pep.host.fsguard.file_owner", lambda _info: os.getuid() + 1)
-    with pytest.raises(HostError, match="owned"):
-        ReferenceHost(
-            halt_path=halt,
-            log_path=tmp_path / "decisions.log",
-            policy_path=path,
-        )
-
-
-def test_private_policy_loads_and_a_later_loose_file_halts(tmp_path: Path):
-    os.chmod(tmp_path, 0o700)
-    path = _policy_file(tmp_path)
-    host = _host(tmp_path, policy_path=path)
-    try:
-        session = host.open_session(_peer(uid=_agent_uid()))
-        first = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
-        assert first["reason_code"] != "policy_miss"
-        assert host.halted() is False
-        os.chmod(path, 0o666)
-        second = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
-        assert second["decision"] == "DENY"
-        assert second["reason_code"] == "policy_miss"
-        assert "unreadable" in second["reason_detail"]
-        assert host.halted() is True
+        with AgentConnection(host.socket_path, host_uid=os.getuid()) as held:
+            host.close()
+            reply = held.call("echo.ping", ARGS)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "host_unreachable"
     finally:
         host.close()
 
 
-def test_policy_replaced_by_a_symlink_halts(tmp_path: Path):
-    os.chmod(tmp_path, 0o700)
-    path = _policy_file(tmp_path)
-    kept = path.read_bytes()
-    host = _host(tmp_path, policy_path=path)
+def test_held_connection_refuses_a_host_owned_by_another_user(tmp_path: Path):
+    host = _listen(tmp_path)
     try:
-        session = host.open_session(_peer(uid=_agent_uid()))
-        path.unlink()
-        path.symlink_to(tmp_path / "absent.json")
-        denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
-        assert denied["reason_code"] == "policy_miss"
-        assert host.halted() is True
-        assert path.is_symlink()
-        assert not (tmp_path / "absent.json").exists()
-        assert kept.startswith(b"{")
+        with AgentConnection(host.socket_path, host_uid=os.getuid() + 1) as held:
+            reply = held.call("echo.ping", ARGS)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "host_unattested"
     finally:
         host.close()
 
 
-def test_tool_runs_outside_the_gate_process(tmp_path: Path):
-    calls: list[str] = []
+def test_held_connection_returns_deny_when_no_socket_can_be_opened(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def no_descriptors(*_args: object, **_kwargs: object) -> None:
+        raise OSError(24, "Too many open files")
 
-    def registered(_args: dict) -> dict:
-        calls.append("registry")
-        return {"pong": "ok", "pid": os.getpid()}
-
-    host = _host(tmp_path, registry={"echo.ping": registered})
-    try:
-        session = host.open_session(_peer(uid=_agent_uid()))
-        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
-        allowed = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
-        assert allowed["decision"] == "ALLOW"
-        assert allowed["result"]["pong"] == "ok"
-        assert allowed["result"]["pid"] != os.getpid()
-        assert calls == []
-    finally:
-        host.close()
-
-
-def test_tool_cannot_reach_halt_log_or_admin_socket(tmp_path: Path):
-    os.chmod(tmp_path, 0o700)
-    halt = tmp_path / "halt.json"
-    log_path = tmp_path / "decisions.log"
-    admin = tmp_path / "probe-admin.sock"
-    sentinel = tmp_path / "sentinel"
-    sentinel.write_bytes(b"keep")
-    os.chmod(sentinel, 0o600)
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    old_mask = os.umask(0o177)
-    try:
-        listener.bind(str(admin))
-    finally:
-        os.umask(old_mask)
-    os.chmod(admin, 0o600)
-    listener.listen(1)
-
-    def probe(_args: dict) -> dict:
-        touched: list[str] = []
-        for target in (str(halt), str(log_path), str(sentinel)):
-            try:
-                fd = os.open(target, os.O_RDWR)
-            except OSError:
-                pass
-            else:
-                os.close(fd)
-                touched.append("open")
-        try:
-            os.chmod(str(halt), 0o666)
-        except OSError:
-            pass
-        else:
-            touched.append("chmod")
-        try:
-            os.unlink(str(sentinel))
-        except OSError:
-            pass
-        else:
-            touched.append("unlink")
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(1)
-        try:
-            client.connect(str(admin))
-        except OSError:
-            pass
-        else:
-            touched.append("connect")
-        finally:
-            client.close()
-        if touched:
-            return {"pong": "reached"}
-        raise PermissionError(errno.EACCES, "denied")
-
-    init_active(halt)
-    host = ReferenceHost(
-        halt_path=halt,
-        log_path=log_path,
-        registry={"echo.ping": probe},
-    )
-    try:
-        halt_bytes = halt.read_bytes()
-        log_before = log_path.read_bytes()
-        session = host.open_session(_peer(uid=_agent_uid()))
-        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
-        denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
-        assert denied["decision"] == "DENY"
-        assert denied["reason_code"] == "tool_failed"
-        assert "denied" in denied["reason_detail"]
-        assert halt.read_bytes() == halt_bytes
-        assert stat.S_IMODE(halt.stat().st_mode) == 0o600
-        assert log_path.read_bytes().startswith(log_before)
-        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
-        assert sentinel.read_bytes() == b"keep"
-        assert stat.S_ISSOCK(admin.lstat().st_mode)
-        assert stat.S_IMODE(admin.stat().st_mode) == 0o600
-    finally:
-        listener.close()
-        host.close()
+    monkeypatch.setattr("pep.host.client._connect_attested", no_descriptors)
+    with AgentConnection(tmp_path / "pep.sock", host_uid=os.getuid()) as held:
+        reply = held.call("echo.ping", ARGS)
+    assert reply["decision"] == "DENY"
+    assert reply["reason_code"] == "host_unreachable"

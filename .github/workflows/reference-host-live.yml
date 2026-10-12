@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+name: reference-host-live
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Live deployment check as two operating-system users
+        run: sudo "$(command -v python3)" scripts/reference_host_check/live_check.py --source .
