@@ -600,6 +600,8 @@ def _idle_script(sock: str) -> str:
 
 
 def _trickle_script(sock: str) -> str:
+    # A failed send means the host may already have written its reply and
+    # closed; the reply is still readable, so recv runs after it either way.
     return (
         "import socket,time\n"
         f"s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect({sock!r})\n"
@@ -610,14 +612,17 @@ def _trickle_script(sock: str) -> str:
         "    try:\n"
         "        s.sendall(b' ')\n"
         "    except OSError:\n"
-        "        break\n"
-        "    try:\n"
-        "        data+=s.recv(4096)\n"
-        "    except socket.timeout:\n"
         "        pass\n"
+        "    try:\n"
+        "        chunk=s.recv(4096)\n"
+        "    except socket.timeout:\n"
+        "        chunk=None\n"
         "    except OSError:\n"
         "        break\n"
-        "    if data:\n"
+        "    if chunk==b'':\n"
+        "        break\n"
+        "    if chunk:\n"
+        "        data+=chunk\n"
         "        break\n"
         "    time.sleep(2)\n"
         "print(round(time.monotonic()-start,2), data.decode('utf-8','replace').strip() or 'EOF')\n"
