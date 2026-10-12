@@ -7,7 +7,9 @@ policy, the halt state, and the decision log. An agent sends a request
 envelope over a Unix socket. Identity comes from the operating system's
 peer credentials on that connection, plus a session this process assigns.
 The agent cannot supply the function that runs, the time, or another
-session's identity.
+session's identity. A registry function runs in a separate executor
+process, not in this one. This process refuses to run as root, and the
+agent socket refuses a peer whose user id is root or this process's.
 
 This is a reference prototype. It is not a measured attack-success
 reduction and not a product. See ADR-0007.
@@ -34,7 +36,8 @@ from pep.approval import ApprovalRecord, is_principal
 from pep.evaluate import PepRuntime
 from pep.gate import begin_invoke, complete_invoke
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
-from pep.host.fsguard import PathGuardError, require_directory
+from pep.host.executor import ExecutorStartError, ToolExecutionError, ToolExecutor, UnencodableResult
+from pep.host.fsguard import PathGuardError, read_private_file, require_directory
 from pep.host.haltfile import (
     ACTIVE,
     SUSPENDED,
@@ -64,6 +67,15 @@ _ACCEPT_POLL_SECONDS = 0.2
 
 class HostError(RuntimeError):
     """The host could not attest a caller or start. Not an allow."""
+
+
+def running_as_root() -> bool:
+    """True when this process's real or effective user id is root.
+
+    Ownership checks compare against the real user id. An effective id
+    of 0 can change that id, so either one refuses to start.
+    """
+    return os.getuid() == 0 or os.geteuid() == 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +158,8 @@ class ReferenceHost:
         deny_log_window: float = DENY_LOG_WINDOW_SECONDS,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
+        if running_as_root():
+            raise HostError("refusing to run as root")
         self.halt_path = Path(halt_path)
         self.socket_path = None if socket_path is None else Path(socket_path)
         self.admin_path = None if admin_path is None else Path(admin_path)
@@ -177,6 +191,8 @@ class ReferenceHost:
         self._log_closed = False
         self._allowed_uids = _id_set(allowed_uids, "uid")
         self._allowed_gids = _id_set(allowed_gids, "gid")
+        self._rejected_peers: set[int] = set()
+        _refuse_unsafe_allow_list(self._allowed_uids)
         self._policy_path = None if policy_path is None else Path(policy_path)
         self._file_digest: str | None = None
         if (
@@ -187,15 +203,26 @@ class ReferenceHost:
             or deny_log_window <= 0
         ):
             raise HostError("connection and log limits must be positive")
-        _require_private(self.halt_path.parent)
-        if self.admin_path is not None:
-            if self.socket_path is not None and self.admin_path.absolute() == self.socket_path.absolute():
-                raise HostError("admin socket must be a different path from the agent socket")
-            _require_private(self.admin_path.parent)
-        self._policy = self._load_policy(policy)
+        # Fork the executor before this process reads the policy, the halt
+        # file, or the log. The child keeps the registry functions and does
+        # not see grants minted later.
         self._registry = self._copy_registry(registry)
-        self._runtime = self._open_runtime()
-        self._decisions = DecisionLog(Path(log_path))
+        try:
+            self._executor = ToolExecutor.start(self._registry)
+        except ExecutorStartError as exc:
+            raise HostError(str(exc)) from exc
+        try:
+            _require_private(self.halt_path.parent)
+            if self.admin_path is not None:
+                if self.socket_path is not None and self.admin_path.absolute() == self.socket_path.absolute():
+                    raise HostError("admin socket must be a different path from the agent socket")
+                _require_private(self.admin_path.parent)
+            self._policy = self._load_policy(policy)
+            self._runtime = self._open_runtime()
+            self._decisions = DecisionLog(Path(log_path))
+        except Exception:
+            self._executor.close()
+            raise
 
     @property
     def runtime(self) -> PepRuntime:
@@ -220,12 +247,48 @@ class ReferenceHost:
         return observed != ACTIVE
 
     def peer_permitted(self, peer: PeerCred) -> bool:
-        """True when no allow list is set, or the peer is on each list that is set."""
+        """True when this peer may open an agent session.
+
+        Root and this process's own user id are refused even when an
+        allow list names them. With no allow list, every peer is refused.
+        """
+        return self._agent_peer_denial(peer) is None
+
+    def _agent_allow_list_set(self) -> bool:
+        return bool(self._allowed_uids) or bool(self._allowed_gids)
+
+    def _agent_peer_denial(self, peer: PeerCred) -> str | None:
+        if peer.uid == 0:
+            return "peer uid is root"
+        if peer.uid == os.getuid():
+            return "peer uid is the host user"
+        if not self._agent_allow_list_set():
+            return "agent allow list is not set"
         if self._allowed_uids is not None and peer.uid not in self._allowed_uids:
-            return False
+            return "peer is not on the host allow list"
         if self._allowed_gids is not None and peer.gid not in self._allowed_gids:
-            return False
-        return True
+            return "peer is not on the host allow list"
+        return None
+
+    def _note_rejected_agent(self, peer: PeerCred) -> None:
+        """Remember a same-user or root peer so the admin socket can refuse that pid."""
+        if peer.uid == 0 or peer.uid == os.getuid():
+            with self._lock:
+                self._rejected_peers.add(peer.pid)
+
+    def _admin_peer_denial(self, peer: PeerCred) -> str | None:
+        if peer.uid == 0 or peer.uid != os.getuid():
+            return "admin peer is not the host user"
+        if self._allowed_uids is not None and peer.uid in self._allowed_uids:
+            return "admin peer is an agent user id"
+        with self._lock:
+            rejected = peer.pid in self._rejected_peers
+        if rejected:
+            return "admin peer is not an operator connection"
+        return None
+
+    def _peer_of(self, conn: socket.socket) -> PeerCred:
+        return peer_credentials(conn)
 
     def init_halt(self) -> None:
         """Create an active halt file before this process has latched a halt.
@@ -309,6 +372,10 @@ class ReferenceHost:
 
     def serve_forever(self, *, stop: threading.Event | None = None, ready: threading.Event | None = None) -> None:
         """Listen on the Unix socket until ``stop`` is set."""
+        if running_as_root():
+            raise HostError("refusing to run as root")
+        if not self._agent_allow_list_set():
+            raise HostError("agent allow list is required")
         if self.socket_path is None:
             raise HostError("socket path is required")
         if not hasattr(socket, "SO_PEERCRED"):
@@ -393,6 +460,9 @@ class ReferenceHost:
 
     def close(self) -> None:
         self.request_stop()
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.close()
         listener = self._listener
         if listener is not None:
             try:
@@ -406,6 +476,11 @@ class ReferenceHost:
             except OSError:
                 pass
         self._shutdown_log()
+
+    def __del__(self) -> None:
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.close()
 
     def _decide(self, raw: bytes | str | Any, session: Session) -> dict[str, Any]:
         request_id = self._request_id(session)
@@ -583,14 +658,31 @@ class ReferenceHost:
                 request_id=request_id,
             )
 
-        impl = self._registry[tool_name]
         snapshot = dict(args)
 
         def run_registered() -> Any:
-            return impl(snapshot)
+            # The name selects the registry function copied into the executor
+            # at startup. The request cannot replace that function.
+            return self._executor.call(tool_name, snapshot)
 
         try:
             finished, result = complete_invoke(pending, run_registered)
+        except ToolExecutionError as exc:
+            detail = (
+                "host tool was denied access outside the executor"
+                if exc.kind == "permission"
+                else "host tool raised after entry"
+            )
+            return self._record(
+                session,
+                "DENY",
+                "tool_failed",
+                detail,
+                [{"name": "registry_tool", "outcome": "raised"}],
+                tool_name=tool_name,
+                now=now,
+                request_id=request_id,
+            )
         except Exception:
             return self._record(
                 session,
@@ -637,6 +729,9 @@ class ReferenceHost:
             finished.receipt.reason_detail,
             request_id,
         )
+        if isinstance(result, UnencodableResult):
+            response["reason_detail"] = "host tool returned a value that is not JSON"
+            return response
         try:
             encoded = json.dumps(result, ensure_ascii=True)
             parsed = json.loads(encoded)
@@ -651,14 +746,16 @@ class ReferenceHost:
         session: Session | None = None
         try:
             try:
-                peer = peer_credentials(conn)
+                peer = self._peer_of(conn)
             except HostError as exc:
                 self._refuse_unattested(conn, str(exc), reason="envelope_invalid")
                 return
-            if not self.peer_permitted(peer):
+            denial = self._agent_peer_denial(peer)
+            if denial is not None:
+                self._note_rejected_agent(peer)
                 self._refuse_unattested(
                     conn,
-                    "peer is not on the host allow list",
+                    denial,
                     reason="peer_rejected",
                     peer=peer,
                 )
@@ -771,14 +868,18 @@ class ReferenceHost:
     def _serve_admin(self, conn: socket.socket) -> None:
         try:
             try:
-                peer = peer_credentials(conn)
+                peer = self._peer_of(conn)
             except HostError:
                 _send_line(conn, {"ok": False, "error": "peer credentials unreadable"})
                 return
             # The admin socket is the operator's. An allow-listed agent uid
-            # does not become an operator by connecting here.
-            if peer.uid != os.getuid():
-                _send_line(conn, {"ok": False, "error": "admin peer is not the host user"})
+            # does not become an operator by connecting here. A process id
+            # already refused on the agent socket is not an operator either.
+            # A different process that simply shares this user id can still
+            # connect: the kernel credential is the same one the operator has.
+            denial = self._admin_peer_denial(peer)
+            if denial is not None:
+                _send_line(conn, {"ok": False, "error": denial})
                 return
             opened = self._monotonic()
             buf = b""
@@ -1000,7 +1101,7 @@ class ReferenceHost:
         if self._policy_path is None:
             return policy if policy is not None else DEMO_POLICY
         try:
-            raw = self._policy_path.read_bytes()
+            raw = self._read_policy_bytes()
             document = json.loads(raw.decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
             self._sticky_halt = True
@@ -1010,6 +1111,14 @@ class ReferenceHost:
             raise HostError("policy file must be a JSON object")
         self._file_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
         return PolicyStore.from_document(document)
+
+    def _read_policy_bytes(self) -> bytes:
+        if self._policy_path is None:
+            raise HostError("policy path is not set")
+        try:
+            return read_private_file(self._policy_path)
+        except PathGuardError as exc:
+            raise HostError(str(exc)) from exc
 
     def _copy_registry(self, registry: Mapping[str, RegistryTool] | None) -> dict[str, RegistryTool]:
         from pep.envelope import TOOL_NAME_RE
@@ -1125,8 +1234,8 @@ class ReferenceHost:
             digest = "sha256:" + self._policy.digest
             return True, {"name": "policy_digest", "outcome": "recorded", "digest": digest}, ""
         try:
-            raw = self._policy_path.read_bytes()
-        except OSError:
+            raw = self._read_policy_bytes()
+        except (OSError, HostError):
             return (
                 False,
                 {"name": "policy_file_reread", "outcome": "unreadable"},
@@ -1432,6 +1541,15 @@ class ReferenceHost:
             self._sticky_halt = True
             return False
         return True
+
+
+def _refuse_unsafe_allow_list(uids: frozenset[int] | None) -> None:
+    """An allow list must not opt the host user or root back in."""
+    if uids is None:
+        return
+    host = os.getuid()
+    if 0 in uids or host in uids:
+        raise HostError("agent allow list must not name root or the host user")
 
 
 def _id_set(values: Collection[int] | None, label: str) -> frozenset[int] | None:

@@ -3,7 +3,7 @@
 """Run the reference host: ``python -m pep.host``.
 
 Start this process as its own operating-system user. It does not switch
-user itself.
+user itself. It refuses to start when that user is root.
 
 ``serve`` without ``--admin`` has no way to mint a grant, so every tool
 call is denied. Grants are minted with ``grant`` on the admin socket.
@@ -23,7 +23,7 @@ from pep.halt import HaltStoreError
 from pep.host.client import admin_call
 from pep.host.haltfile import init_active, write_killed
 from pep.host.log import DecisionLogError
-from pep.host.server import HostError, ReferenceHost
+from pep.host.server import HostError, ReferenceHost, running_as_root
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         "--policy",
         type=Path,
         default=None,
-        help="Policy JSON owned by this process. Omit to use the built-in stub policy.",
+        help="Policy JSON owned by this user, mode owner-only, in a private directory. Omit for the built-in stub.",
     )
     serve_parser.add_argument(
         "--admin",
@@ -60,14 +60,14 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         action="append",
         default=None,
-        help="Repeat to allow only these peer user ids. Omit to allow any peer that can connect.",
+        help="Repeat to name an agent user id. serve requires this or --allow-gid. Root and this user are refused.",
     )
     serve_parser.add_argument(
         "--allow-gid",
         type=int,
         action="append",
         default=None,
-        help="Repeat to allow only these peer group ids. With --allow-uid, the peer must match both.",
+        help="Repeat to name an agent group id. With --allow-uid, the peer must match both.",
     )
 
     sessions_parser = sub.add_parser("sessions", help="List live connections on the admin socket.")
@@ -82,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        if running_as_root():
+            raise HostError("refusing to run as root")
         if args.command == "init-halt":
             init_active(args.halt)
             return 0
@@ -118,7 +120,10 @@ def main(argv: list[str] | None = None) -> int:
             allowed_uids=args.allow_uid,
             allowed_gids=args.allow_gid,
         )
-        _serve_until_signal(host)
+        try:
+            _serve_until_signal(host)
+        finally:
+            host.close()
         return 0
     except (HaltStoreError, HostError, DecisionLogError, OSError) as exc:
         print(f"pep.host: {exc}", file=sys.stderr)
