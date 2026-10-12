@@ -16,6 +16,7 @@ The state and run directories are test paths, not the production ones.
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
 import pwd
@@ -95,6 +96,10 @@ def host_python(lay: Layout, python: str, *args: str) -> subprocess.CompletedPro
 
 
 def ensure_users() -> None:
+    try:
+        grp.getgrnam(AGENT_GROUP)
+    except KeyError:
+        run(["groupadd", "-r", AGENT_GROUP])
     try:
         pwd.getpwnam(HOST_USER)
     except KeyError:
