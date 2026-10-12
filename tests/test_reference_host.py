@@ -30,7 +30,7 @@ import pytest
 from pep.evaluate import PepRuntime, evaluate
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.host.__main__ import main
-from pep.host.client import invoke
+from pep.host.client import AgentConnection, invoke
 from pep.host.haltfile import ACTIVE, init_active, read_fail_closed
 from pep.host.log import FORBIDDEN_KEYS, MAX_LOG_STARTUP_BYTES, DecisionLog, DecisionLogError
 from pep.host.protocol import ProtocolError, parse_host_request
@@ -1385,3 +1385,41 @@ def _listen_at(tmp_path: Path, socket_path: Path) -> ReferenceHost:
     )
     host.serve_in_background()
     return host
+
+
+def test_held_connection_is_allowed_only_once_the_operator_grants_it(tmp_path: Path):
+    host = _listen(tmp_path)
+    try:
+        with AgentConnection(host.socket_path, host_uid=os.getuid()) as held:
+            assert held.call("echo.ping", ARGS)["decision"] == "DENY"
+            _wait_sessions(host, 1)
+            session = host.sessions()[0]
+            host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+            allowed = held.call("echo.ping", ARGS)
+            assert allowed["decision"] == "ALLOW"
+            assert held.call("echo.ping", {"message": "other"})["decision"] == "DENY"
+    finally:
+        host.close()
+
+
+def test_held_connection_gives_deny_once_the_host_has_closed_it(tmp_path: Path):
+    host = _listen(tmp_path)
+    try:
+        with AgentConnection(host.socket_path, host_uid=os.getuid()) as held:
+            host.close()
+            reply = held.call("echo.ping", ARGS)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "host_unreachable"
+    finally:
+        host.close()
+
+
+def test_held_connection_refuses_a_host_owned_by_another_user(tmp_path: Path):
+    host = _listen(tmp_path)
+    try:
+        with AgentConnection(host.socket_path, host_uid=os.getuid() + 1) as held:
+            reply = held.call("echo.ping", ARGS)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "host_unattested"
+    finally:
+        host.close()

@@ -138,8 +138,12 @@ def _read_response(sock: socket.socket, *, require_decision: bool) -> dict[str, 
         buf += chunk
     if not buf.strip():
         return _deny("host_unreachable", "host closed the connection")
+    return _parse_reply(buf.split(b"\n", 1)[0], require_decision=require_decision)
+
+
+def _parse_reply(line: bytes, *, require_decision: bool) -> dict[str, Any]:
     try:
-        parsed = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+        parsed = json.loads(line.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError):
         return _deny("envelope_invalid", "host response is not a JSON object")
     if not isinstance(parsed, dict):
@@ -147,6 +151,72 @@ def _read_response(sock: socket.socket, *, require_decision: bool) -> dict[str, 
     if require_decision and parsed.get("decision") not in {"ALLOW", "DENY"}:
         return _deny("envelope_invalid", "host response has no decision")
     return parsed
+
+
+class AgentConnection:
+    """A held connection, which is the session the operator grants against.
+
+    The host mints a grant for one live connection, so an agent makes its
+    calls on one connection it keeps open. ``invoke`` opens a new connection
+    per call and can never receive an ALLOW. The host closes a connection
+    after 5 seconds with no bytes, and 30 seconds after it was accepted. A
+    closed connection gives DENY; the next connection is a new session with
+    no grant.
+    """
+
+    def __init__(self, socket_path: Path | str, *, host_uid: int, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:
+        self._socket_path = socket_path
+        self._host_uid = host_uid
+        self._timeout = timeout
+        self._sock: socket.socket | None = None
+        self._refused: dict[str, str] | None = None
+        self._buf = b""
+
+    def __enter__(self) -> AgentConnection:
+        try:
+            self._sock = _connect_attested(self._socket_path, self._host_uid, self._timeout)
+        except _ClientDeny as exc:
+            self._refused = _deny(exc.reason, exc.detail)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def call(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._sock is None:
+            return self._refused or _deny("host_unreachable", "connection is not open")
+        try:
+            payload = json.dumps({"args": args, "tool_name": tool_name}, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, RecursionError):
+            return _deny("envelope_invalid", "request is not JSON")
+        if len(payload) > MAX_REQUEST_BYTES:
+            return _deny("envelope_invalid", "request exceeds the host limit")
+        try:
+            self._sock.sendall(payload + b"\n")
+            line = self._read_line()
+        except (TimeoutError, OSError):
+            self.close()
+            return _deny("host_unreachable", "host did not reply")
+        if line is None:
+            self.close()
+            return _deny("host_unreachable", "host closed the connection")
+        return _parse_reply(line, require_decision=True)
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+    def _read_line(self) -> bytes | None:
+        while b"\n" not in self._buf:
+            if len(self._buf) > MAX_REQUEST_BYTES:
+                raise OSError("host response exceeds the limit")
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                return None
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        return line
 
 
 def _deny(reason: str, detail: str) -> dict[str, str]:
