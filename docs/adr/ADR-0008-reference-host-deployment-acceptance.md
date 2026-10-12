@@ -42,10 +42,12 @@ Running the README procedure by hand exposed one gap. The shipped client, `pep.h
 | A socket directory that group members can write is refused at start; a state directory that others can read is refused at start | README step 3 and the directory section | live check, exit status and message |
 | The shipped client refuses a socket owned by another user, and a symlinked path | README | live check |
 | A held client connection is allowed once granted, and denied for a dead or wrongly owned host | this ADR, decision 2 | live check and `tests/test_reference_host.py` |
+| Threads sharing one held client connection each get their own reply; an ungranted caller is never told ALLOW | follow-up to #38 | live check and `tests/test_reference_host.py` |
+| Writing the damaged halt file does not follow a symlink | follow-up to #38 | live check |
 
 ## Evidence
 
-- Live check on the working tree for this change: 55 of 55 claims pass, in about 50 seconds.
+- Live check on the working tree for this change: 55 of 55 claims pass, in about 50 seconds. After the #38 follow-up, which adds the two rows above for threads and the halt-file symlink: 57 of 57.
 - Seeded faults, each in a scratch copy of the code, run against the final harness:
   - a peer allow-list that accepts every peer: "a peer outside --allow-uid is refused" fails;
   - a connection cap of 64 instead of 8: "a ninth connection is refused" fails;

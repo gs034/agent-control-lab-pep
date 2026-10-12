@@ -155,7 +155,7 @@ with AgentConnection("/run/acl-pep/pep.sock", host_uid=<uid of acl-pep>) as held
     reply = held.call("echo.ping", {"message": "hi"})
 ```
 
-The host closes a connection after 5 seconds with no bytes, and 30 seconds after it was accepted. A closed connection gives DENY. The agent reconnects, and the operator mints a new grant for the new connection.
+Threads may share one `AgentConnection`: a lock keeps each request and its reply together, and a reply whose host request id does not belong to this connection, or does not rise, is DENY `reply_mismatch` and closes the connection. A reply that is not JSON also closes it. Every thread on one connection shares that connection's grants. The host closes a connection after 5 seconds with no bytes, and 30 seconds after it was accepted. A closed connection gives DENY. The agent reconnects, and the operator mints a new grant for the new connection.
 
 ### Check this deployment
 

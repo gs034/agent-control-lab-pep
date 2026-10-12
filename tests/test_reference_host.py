@@ -1434,3 +1434,124 @@ def test_held_connection_returns_deny_when_no_socket_can_be_opened(tmp_path: Pat
         reply = held.call("echo.ping", ARGS)
     assert reply["decision"] == "DENY"
     assert reply["reason_code"] == "host_unreachable"
+
+
+def test_held_connection_shared_by_threads_never_gives_a_caller_another_callers_reply(tmp_path: Path):
+    """Six threads share one held connection. Only thread 0 sends granted args.
+
+    Without a lock across send and read, a thread could read the reply meant
+    for another thread, so an ungranted caller could be told ALLOW.
+    """
+    host = _listen(tmp_path)
+    granted = {"message": "granted"}
+    wrong: list[str] = []
+    allowed_ids: list[str] = []
+    try:
+        with AgentConnection(host.socket_path, host_uid=os.getuid()) as held:
+            held.call("echo.ping", granted)
+            _wait_sessions(host, 1)
+            session = host.sessions()[0]
+            start = threading.Barrier(6)
+
+            def worker(index: int) -> None:
+                start.wait()
+                for n in range(40):
+                    if index == 0:
+                        host.issue_session_approval(session, tool_name="echo.ping", args=granted, ttl_seconds=60)
+                        reply = held.call("echo.ping", granted)
+                        if reply.get("decision") == "ALLOW":
+                            allowed_ids.append(reply.get("request_id"))
+                            if reply.get("result") != {"pong": "granted"}:
+                                wrong.append(f"granted caller got another result: {reply}")
+                    else:
+                        reply = held.call("echo.ping", {"message": f"other-{index}-{n}"})
+                        if reply.get("decision") == "ALLOW":
+                            wrong.append(f"ungranted caller {index} was told ALLOW: {reply}")
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+    finally:
+        host.close()
+    assert wrong == []
+    assert allowed_ids, "the granted caller was never allowed, so the check proved nothing"
+    records = [json.loads(line) for line in (tmp_path / "decisions.log").read_text(encoding="utf-8").splitlines() if line.strip()]
+    logged_allows = {r.get("request_id") for r in records if r.get("decision") == "ALLOW"}
+    assert set(allowed_ids) <= logged_allows
+
+
+def _held_on_fake_socket(reply_lines: list[bytes]) -> tuple[AgentConnection, socket.socket]:
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    held = AgentConnection("/nonexistent", host_uid=os.getuid())
+    held._sock = ours
+    theirs.sendall(b"".join(reply_lines))
+    return held, theirs
+
+
+def test_held_connection_denies_and_closes_on_a_reused_request_id():
+    line = b'{"decision":"DENY","reason_code":"no_grant","request_id":"host.3.7"}\n'
+    held, theirs = _held_on_fake_socket([line, line])
+    try:
+        first = held.call("echo.ping", ARGS)
+        assert first["request_id"] == "host.3.7"
+        second = held.call("echo.ping", ARGS)
+        assert second["decision"] == "DENY"
+        assert second["reason_code"] == "reply_mismatch"
+        assert held._sock is None
+        assert held.call("echo.ping", ARGS)["reason_code"] == "reply_mismatch"
+    finally:
+        theirs.close()
+
+
+def test_held_connection_denies_and_closes_on_another_connections_request_id():
+    held, theirs = _held_on_fake_socket(
+        [
+            b'{"decision":"DENY","reason_code":"no_grant","request_id":"host.3.7"}\n',
+            b'{"decision":"ALLOW","request_id":"host.4.8"}\n',
+        ]
+    )
+    try:
+        held.call("echo.ping", ARGS)
+        reply = held.call("echo.ping", ARGS)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "reply_mismatch"
+        assert held._sock is None
+    finally:
+        theirs.close()
+
+
+def test_held_connection_denies_a_reply_with_no_request_id():
+    held, theirs = _held_on_fake_socket([b'{"decision":"ALLOW"}\n'])
+    try:
+        reply = held.call("echo.ping", ARGS)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "reply_mismatch"
+        assert held._sock is None
+    finally:
+        theirs.close()
+
+
+def test_held_connection_closes_on_a_reply_that_is_not_json():
+    held, theirs = _held_on_fake_socket([b"not json\n", b'{"decision":"ALLOW","request_id":"host.1.1"}\n'])
+    try:
+        reply = held.call("echo.ping", ARGS)
+        assert reply["decision"] == "DENY"
+        assert reply["reason_code"] == "envelope_invalid"
+        assert held._sock is None
+        later = held.call("echo.ping", ARGS)
+        assert later["decision"] == "DENY"
+        assert later["reason_code"] == "envelope_invalid"
+    finally:
+        theirs.close()
+
+
+def test_held_connection_close_clears_the_buffer_and_keeps_the_reason():
+    held, theirs = _held_on_fake_socket([b"x"])
+    theirs.close()
+    reply = held.call("echo.ping", ARGS)
+    assert reply["reason_code"] == "host_unreachable"
+    assert held._buf == b""
+    assert held._sock is None
+    assert held.call("echo.ping", ARGS)["reason_detail"] == reply["reason_detail"]
