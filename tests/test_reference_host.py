@@ -1434,3 +1434,99 @@ def test_held_connection_returns_deny_when_no_socket_can_be_opened(tmp_path: Pat
         reply = held.call("echo.ping", ARGS)
     assert reply["decision"] == "DENY"
     assert reply["reason_code"] == "host_unreachable"
+
+
+def _scripted_host(path: Path, replies: list[bytes]) -> threading.Thread:
+    """Accept one connection and answer each request line with the next scripted reply."""
+
+    def serve() -> None:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.settimeout(5)
+        listener.bind(str(path))
+        listener.listen(1)
+        try:
+            conn, _addr = listener.accept()
+        except OSError:
+            listener.close()
+            return
+        try:
+            buf = b""
+            for reply in replies:
+                while b"\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    buf += chunk
+                buf = buf.split(b"\n", 1)[1]
+                conn.sendall(reply)
+        finally:
+            conn.close()
+            listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    return thread
+
+
+def test_held_connection_threads_share_one_connection(tmp_path: Path):
+    host = _listen(tmp_path)
+    try:
+        with AgentConnection(host.socket_path, host_uid=os.getuid()) as held:
+            held.call("echo.ping", ARGS)
+            _wait_sessions(host, 1)
+            host.issue_session_approval(host.sessions()[0], tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+            replies: list[dict[str, Any]] = []
+            guard = threading.Lock()
+
+            def worker() -> None:
+                for _ in range(15):
+                    reply = held.call("echo.ping", ARGS)
+                    with guard:
+                        replies.append(reply)
+
+            threads = [threading.Thread(target=worker) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+            assert all(not thread.is_alive() for thread in threads)
+        assert len(replies) == 90
+        allowed = [reply for reply in replies if reply["decision"] == "ALLOW"]
+        others = [reply for reply in replies if reply["decision"] != "ALLOW"]
+        # The grant is single-use: exactly one call spends it, however the threads interleave.
+        assert len(allowed) == 1
+        assert {reply["reason_code"] for reply in others} == {"capability_missing"}
+        assert len({reply["request_id"] for reply in replies}) == 90
+    finally:
+        host.close()
+
+
+def test_held_connection_closes_on_a_reply_for_another_connection(tmp_path: Path):
+    path = tmp_path / "pep.sock"
+    _scripted_host(
+        path,
+        [
+            b'{"decision":"DENY","reason_code":"capability_missing","request_id":"host.7.1"}\n',
+            b'{"decision":"ALLOW","reason_code":"allowed","request_id":"host.8.2"}\n',
+        ],
+    )
+    with AgentConnection(path, host_uid=os.getuid()) as held:
+        first = held.call("echo.ping", ARGS)
+        second = held.call("echo.ping", ARGS)
+        third = held.call("echo.ping", ARGS)
+    assert first["reason_code"] == "capability_missing"
+    assert second["decision"] == "DENY"
+    assert second["reason_code"] == "host_unattested"
+    assert third["reason_code"] == "host_unreachable"
+
+
+def test_held_connection_closes_on_a_reply_that_is_not_json(tmp_path: Path):
+    path = tmp_path / "pep.sock"
+    _scripted_host(path, [b"{not json\n"])
+    with AgentConnection(path, host_uid=os.getuid()) as held:
+        first = held.call("echo.ping", ARGS)
+        second = held.call("echo.ping", ARGS)
+    assert first["decision"] == "DENY"
+    assert first["reason_code"] == "envelope_invalid"
+    assert second["reason_code"] == "host_unreachable"

@@ -11,12 +11,18 @@ claim prints PASS or FAIL. The exit status is 1 if any claim fails.
 
 Nothing is left running. Every host started is stopped in a finally block.
 The state and run directories are test paths, not the production ones.
+
+WARNING: this check creates two operating-system users and removes and
+rewrites files under /var/lib, /run and /opt, in directories whose names end
+in "-check". Run it only on a dedicated test machine or a CI runner. Do not
+run it on a shared machine.
 """
 
 from __future__ import annotations
 
 import argparse
 import grp
+import secrets
 import json
 import os
 import pwd
@@ -75,6 +81,36 @@ class Report:
 
     def note(self, text: str) -> None:
         print(f"NOTE {text}", flush=True)
+
+
+ALLOWED_ROOTS = (Path("/var/lib"), Path("/run"), Path("/opt"))
+
+
+def _guard(path: Path) -> Path:
+    """Return the absolute path if the check may remove or rewrite it, else exit.
+
+    It must sit under one of the allowed roots, in a top-level directory whose
+    name ends in "-check", and no component below the root may be a symlink.
+    """
+    absolute = Path(os.path.abspath(path))
+    root = next((r for r in ALLOWED_ROOTS if absolute.is_relative_to(r)), None)
+    if root is None or absolute == root:
+        raise SystemExit(f"refusing to touch {path}: outside the check's test roots")
+    relative = absolute.relative_to(root)
+    if not relative.parts[0].endswith("-check"):
+        raise SystemExit(f"refusing to touch {path}: the top directory must end in -check")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if os.path.islink(current):
+            raise SystemExit(f"refusing to touch {path}: {current} is a symlink")
+    return absolute
+
+
+def _remove_tree(path: Path) -> None:
+    target = _guard(path)
+    if target.exists():
+        shutil.rmtree(target)
 
 
 def run(argv: list[str]) -> None:
@@ -309,7 +345,7 @@ def mode_of(path: Path) -> int:
 def reset_state(lay: Layout, python: str) -> None:
     """Create the directories with the README's own commands (steps 2 and 3)."""
     for path in (lay.state, lay.run):
-        shutil.rmtree(path, ignore_errors=True)
+        _remove_tree(path)
     run(["install", "-d", "-o", HOST_USER, "-g", HOST_USER, "-m", "0700", str(lay.state)])
     run(["install", "-d", "-o", HOST_USER, "-g", AGENT_GROUP, "-m", "2750", str(lay.run)])
     result = host_python(lay, python, "init-halt", "--halt", str(lay.halt))
@@ -319,7 +355,7 @@ def reset_state(lay: Layout, python: str) -> None:
 
 def provision(lay: Layout, source: Path) -> None:
     ensure_users()
-    shutil.rmtree(lay.code, ignore_errors=True)
+    _remove_tree(lay.code)
     shutil.copytree(source / "pep", lay.code / "pep", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy2(HERE / "agent_shim.py", lay.code / "agent_shim.py")
     for root, dirs, files in os.walk(lay.code):
@@ -377,8 +413,8 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
     )
 
     halt_before = lay.halt.read_bytes()
-    write = as_user(AGENT_USER, lay, ["sh", "-c", f"printf x >> {lay.halt}"])
-    replace = as_user(AGENT_USER, lay, ["sh", "-c", f"rm -f {lay.halt} && printf active > {lay.halt}"])
+    write = as_user(AGENT_USER, lay, ["sh", "-c", 'printf x >> "$1"', "sh", str(lay.halt)])
+    replace = as_user(AGENT_USER, lay, ["sh", "-c", 'rm -f "$1" && printf active > "$1"', "sh", str(lay.halt)])
     report.check(
         "agent cannot write or replace the halt file",
         write.returncode != 0 and replace.returncode != 0 and lay.halt.read_bytes() == halt_before,
@@ -387,7 +423,7 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
     listing = as_user(AGENT_USER, lay, ["ls", str(lay.state)])
     report.check("agent cannot list the state directory", listing.returncode != 0, f"ls rc={listing.returncode}")
     log_before = lay.log.read_bytes() if lay.log.exists() else b""
-    log_append = as_user(AGENT_USER, lay, ["sh", "-c", f"printf x >> {lay.log}"])
+    log_append = as_user(AGENT_USER, lay, ["sh", "-c", 'printf x >> "$1"', "sh", str(lay.log)])
     log_remove = as_user(AGENT_USER, lay, ["rm", "-f", str(lay.log)])
     log_after = lay.log.read_bytes() if lay.log.exists() else b""
     report.check(
@@ -652,8 +688,7 @@ def client_checks(lay: Layout, python: str, report: Report) -> None:
         decode(wrong.stdout.strip()).get("reason_code") == "host_unattested",
         wrong.stdout.strip()[:120] or wrong.stderr.strip()[-120:],
     )
-    link = Path("/tmp/acl-pep-check-link")
-    link.unlink(missing_ok=True)
+    link = Path(f"/tmp/acl-pep-check-link-{secrets.token_hex(8)}")
     as_user(AGENT_USER, lay, ["ln", "-s", str(lay.sock), str(link)])
     via_link = as_user(AGENT_USER, lay, [python, "-c", _invoke_script(str(link), host_uid)], timeout=20)
     link.unlink(missing_ok=True)
@@ -783,20 +818,32 @@ def scenario_halt(lay: Layout, python: str, report: Report) -> None:
     host.stop()
 
     host_python(lay, python, "init-halt", "--halt", str(lay.halt))
-    lay.halt.unlink()
+    removed = as_user(HOST_USER, lay, ["rm", "-f", str(lay.halt)])
+    if removed.returncode != 0:
+        raise SystemExit("could not remove the halt file as the host user")
     host = Host(lay, python)
     started = host.wait_ready()
     report.check("a missing halt file is halted, not active, on start", started and _denied_on_start(lay, python, host), "")
     host.stop()
 
     reset_state(lay, python)
-    lay.halt.write_text("not json {{{", encoding="utf-8")
-    os.chown(lay.halt, pwd.getpwnam(HOST_USER).pw_uid, pwd.getpwnam(HOST_USER).pw_gid)
-    os.chmod(lay.halt, 0o600)
+    write_damaged_halt(lay)
     host = Host(lay, python)
     started = host.wait_ready()
     report.check("a damaged halt file is halted on start", started and _denied_on_start(lay, python, host), "")
     host.stop()
+
+
+def write_damaged_halt(lay: Layout) -> None:
+    """Write a damaged halt file owned by the host user. O_NOFOLLOW refuses a symlink in place."""
+    pw = pwd.getpwnam(HOST_USER)
+    fd = os.open(lay.halt, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchown(fd, pw.pw_uid, pw.pw_gid)
+        os.fchmod(fd, 0o600)
+        os.write(fd, b"not json {{{")
+    finally:
+        os.close(fd)
 
 
 def _denied_on_start(lay: Layout, python: str, host: Host) -> bool:
@@ -853,7 +900,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         parser.error("run as root: the check creates users and switches to them")
-    lay = Layout(code=args.code_dir, state=args.state_dir, run=args.run_dir)
+    lay = Layout(code=_guard(args.code_dir), state=_guard(args.state_dir), run=_guard(args.run_dir))
+    print(
+        "WARNING: this check creates OS users and removes and rewrites files in *-check directories "
+        "under /var/lib, /run and /opt. Run it only on a dedicated test machine or CI runner, never a shared machine.",
+        file=sys.stderr,
+    )
     report = Report()
     try:
         provision(lay, args.source)

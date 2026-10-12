@@ -15,7 +15,7 @@ Running the README procedure by hand exposed one gap. The shipped client, `pep.h
 ## Decision
 
 1. **A live check.** `scripts/reference_host_check/live_check.py` provisions two operating-system users, creates the directories with the README's own `install` commands, starts the host as the host user with the README's flags, and tries each claim in the table below from the agent user. It stops everything it starts. It runs as root on Linux.
-2. **A held-connection client.** `pep.host.client.AgentConnection` keeps one connection open. For a dead host, a socket owned by another user, a symlinked path, or a failure to open a socket, it returns DENY and does not raise. `invoke` is unchanged.
+2. **A held-connection client.** `pep.host.client.AgentConnection` keeps one connection open. Threads may share it: each call holds a lock from its send to its reply. A reply that is not one JSON object with a decision, or whose request id is not from this connection in increasing order, closes the connection and is a DENY. For a dead host, a socket owned by another user, a symlinked path, or a failure to open a socket, it returns DENY and does not raise. `invoke` is unchanged.
 3. **A CI run.** `.github/workflows/reference-host-live.yml` runs the live check on every push and pull request on `ubuntu-latest`.
 4. **No new claims.** The host's behaviour is unchanged. The check tests claims already written in ADR-0007 and the README.
 
@@ -41,7 +41,7 @@ Running the README procedure by hand exposed one gap. The shipped client, `pep.h
 | A peer outside `--allow-uid` is refused | README | live check |
 | A socket directory that group members can write is refused at start; a state directory that others can read is refused at start | README step 3 and the directory section | live check, exit status and message |
 | The shipped client refuses a socket owned by another user, and a symlinked path | README | live check |
-| A held client connection is allowed once granted, and denied for a dead or wrongly owned host | this ADR, decision 2 | live check and `tests/test_reference_host.py` |
+| A held client connection is allowed once granted, and denied for a dead or wrongly owned host; threads sharing it get one reply each; a reply for another connection, out of order, or not JSON closes it | this ADR, decision 2 | live check and `tests/test_reference_host.py` |
 
 ## Evidence
 
@@ -53,6 +53,7 @@ Running the README procedure by hand exposed one gap. The shipped client, `pep.h
   - a size cap of 10 MB instead of 64KiB: "a request over 64KiB" fails;
   - a decision log created with mode 0644: the host refuses to start, so the host-start check and the two scenarios that start a host fail, and the startup check on the socket directory fails with the log message. The check on the state directory still passes, because that refusal happens before the log is opened.
 - PEP unit suite: 356 tests pass, which includes four new `AgentConnection` tests. The last one covers a socket that cannot be opened.
+- Shared-connection tests: six threads share one held connection for 90 calls. Exactly one call spends the single-use grant, every other reply is a well-formed DENY, and every request id is distinct. The test passed 10 times in a row. Two mutants were caught by the test for their claim: removing the lock fails the threads test, and removing the request-id check fails the test for a reply from another connection.
 - The harness found its own faults during this work: a host imported from the working directory rather than the copy under test, a race in starting the host, a timing read of a log line, a missing group on a clean runner, and a grant made before the held connection had connected. Each is fixed. The mutant runs above were made after those fixes.
 
 ## Findings for the owner

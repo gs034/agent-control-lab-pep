@@ -7,6 +7,10 @@ from the agent side. The claims come from
 [ADR-0007](../../docs/adr/ADR-0007-reference-host-process.md), the
 "Reference host under its own user" section of the README, and ADR-0008.
 
+> **Warning:** do not run this on a shared machine. It creates two operating-system
+> users and removes and rewrites files in directories named `*-check` under
+> `/var/lib`, `/run` and `/opt`. Run it on a dedicated test machine or a CI runner.
+
 It runs real operating-system users, a real Unix socket, a real halt file and
 a real decision log. Each claim prints PASS or FAIL, and the exit status is 1
 if any claim fails.
