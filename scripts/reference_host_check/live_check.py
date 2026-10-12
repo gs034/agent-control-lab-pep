@@ -21,12 +21,14 @@ import json
 import os
 import pwd
 import select
+import shlex
 import shutil
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +42,14 @@ LIVE_HOSTS: list[Host] = []
 # Set in main to the agent user's ids. Hosts that should accept the agent pass both.
 AGENT_UID = ""
 AGENT_GID = ""
+# rmtree runs as root, so it only ever deletes a path under one of these roots.
+DEFAULT_ROOTS = (Path("/opt/acl-pep-check"), Path("/var/lib/acl-pep-check"), Path("/run/acl-pep-check"))
+ALLOWED_ROOTS: list[Path] = list(DEFAULT_ROOTS)
+CREATED: dict[str, list[str]] = {"users": [], "groups": []}
+WARNING = (
+    "This check creates the system users acl-pep and acl-agent and deletes its test "
+    "directories as root. Do not run it on a shared or production host."
+)
 
 
 @dataclass(frozen=True)
@@ -99,18 +109,59 @@ def host_python(lay: Layout, python: str, *args: str) -> subprocess.CompletedPro
 
 
 def ensure_users() -> None:
+    """Create the users and group that are missing, and remember which ones this run made."""
     try:
         grp.getgrnam(AGENT_GROUP)
     except KeyError:
         run(["groupadd", "-r", AGENT_GROUP])
+        CREATED["groups"].append(AGENT_GROUP)
     try:
         pwd.getpwnam(HOST_USER)
     except KeyError:
         run(["useradd", "-r", "-M", "-s", "/usr/sbin/nologin", HOST_USER])
+        CREATED["users"].append(HOST_USER)
     try:
         pwd.getpwnam(AGENT_USER)
     except KeyError:
         run(["useradd", "-r", "-M", "-s", "/usr/sbin/nologin", "-g", AGENT_GROUP, AGENT_USER])
+        CREATED["users"].append(AGENT_USER)
+
+
+def remove_created_users() -> None:
+    """Remove only the users and group this run created. Users that existed before are kept."""
+    for user in CREATED["users"]:
+        subprocess.run(["pkill", "-KILL", "-u", user], capture_output=True)
+        subprocess.run(["userdel", user], capture_output=True)
+    for group in CREATED["groups"]:
+        subprocess.run(["groupdel", group], capture_output=True)
+    # useradd -r without -g makes a matching group for the host user on most systems.
+    if HOST_USER in CREATED["users"]:
+        subprocess.run(["groupdel", HOST_USER], capture_output=True)
+
+
+def path_is_allowed(path: Path, roots: list[Path]) -> bool:
+    """True when ``path`` is one of ``roots`` or inside one, after resolving, and is not a symlink."""
+    if not path.is_absolute():
+        return False
+    if path.is_symlink():
+        return False
+    resolved = path.resolve()
+    for root in roots:
+        root_resolved = root.resolve()
+        if root_resolved == Path("/") or len(root_resolved.parts) < 3:
+            continue
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return True
+    return False
+
+
+def safe_rmtree(path: Path) -> None:
+    """Delete a test directory as root, only under an allowed root. Anything else stops the check."""
+    if not path.exists() and not path.is_symlink():
+        return
+    if not path_is_allowed(path, ALLOWED_ROOTS):
+        raise SystemExit(f"refusing to delete {path}: not under {', '.join(str(r) for r in ALLOWED_ROOTS)}")
+    shutil.rmtree(path)
 
 
 def agent_allow_args() -> tuple[str, str, str, str]:
@@ -202,7 +253,7 @@ def _signal_group(proc: subprocess.Popen[str], sig: signal.Signals) -> None:
 class Held:
     """One agent connection that stays open between requests."""
 
-    def __init__(self, lay: Layout, python: str, via_client: bool = False) -> None:
+    def __init__(self, lay: Layout, python: str, via_client: bool = False, threads: bool = False) -> None:
         host_uid = str(pwd.getpwnam(HOST_USER).pw_uid) if via_client else None
         self.proc = subprocess.Popen(
             [
@@ -217,6 +268,7 @@ class Held:
                 str(lay.code / "agent_shim.py"),
                 str(lay.sock),
                 *([host_uid] if host_uid else []),
+                *(["threads"] if threads else []),
             ],
             cwd=lay.code,
             stdin=subprocess.PIPE,
@@ -322,7 +374,7 @@ def mode_of(path: Path) -> int:
 def reset_state(lay: Layout, python: str) -> None:
     """Create the directories with the README's own commands (steps 2 and 3)."""
     for path in (lay.state, lay.run):
-        shutil.rmtree(path, ignore_errors=True)
+        safe_rmtree(path)
     run(["install", "-d", "-o", HOST_USER, "-g", HOST_USER, "-m", "0700", str(lay.state)])
     run(["install", "-d", "-o", HOST_USER, "-g", AGENT_GROUP, "-m", "2750", str(lay.run)])
     result = host_python(lay, python, "init-halt", "--halt", str(lay.halt))
@@ -332,7 +384,7 @@ def reset_state(lay: Layout, python: str) -> None:
 
 def provision(lay: Layout, source: Path) -> None:
     ensure_users()
-    shutil.rmtree(lay.code, ignore_errors=True)
+    safe_rmtree(lay.code)
     shutil.copytree(source / "pep", lay.code / "pep", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy2(HERE / "agent_shim.py", lay.code / "agent_shim.py")
     for root, dirs, files in os.walk(lay.code):
@@ -390,8 +442,9 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
     )
 
     halt_before = lay.halt.read_bytes()
-    write = as_user(AGENT_USER, lay, ["sh", "-c", f"printf x >> {lay.halt}"])
-    replace = as_user(AGENT_USER, lay, ["sh", "-c", f"rm -f {lay.halt} && printf active > {lay.halt}"])
+    write = as_user(AGENT_USER, lay, ["sh", "-c", f"printf x >> {shlex.quote(str(lay.halt))}"])
+    halt_q = shlex.quote(str(lay.halt))
+    replace = as_user(AGENT_USER, lay, ["sh", "-c", f"rm -f {halt_q} && printf active > {halt_q}"])
     report.check(
         "agent cannot write or replace the halt file",
         write.returncode != 0 and replace.returncode != 0 and lay.halt.read_bytes() == halt_before,
@@ -400,7 +453,7 @@ def scenario_main(lay: Layout, python: str, report: Report) -> None:
     listing = as_user(AGENT_USER, lay, ["ls", str(lay.state)])
     report.check("agent cannot list the state directory", listing.returncode != 0, f"ls rc={listing.returncode}")
     log_before = lay.log.read_bytes() if lay.log.exists() else b""
-    log_append = as_user(AGENT_USER, lay, ["sh", "-c", f"printf x >> {lay.log}"])
+    log_append = as_user(AGENT_USER, lay, ["sh", "-c", f"printf x >> {shlex.quote(str(lay.log))}"])
     log_remove = as_user(AGENT_USER, lay, ["rm", "-f", str(lay.log)])
     log_after = lay.log.read_bytes() if lay.log.exists() else b""
     report.check(
@@ -665,11 +718,14 @@ def client_checks(lay: Layout, python: str, report: Report) -> None:
         decode(wrong.stdout.strip()).get("reason_code") == "host_unattested",
         wrong.stdout.strip()[:120] or wrong.stderr.strip()[-120:],
     )
-    link = Path("/tmp/acl-pep-check-link")
-    link.unlink(missing_ok=True)
-    as_user(AGENT_USER, lay, ["ln", "-s", str(lay.sock), str(link)])
-    via_link = as_user(AGENT_USER, lay, [python, "-c", _invoke_script(str(link), host_uid)], timeout=20)
-    link.unlink(missing_ok=True)
+    link_dir = Path(tempfile.mkdtemp(prefix="acl-pep-check-"))
+    try:
+        os.chown(link_dir, pwd.getpwnam(AGENT_USER).pw_uid, -1)
+        link = link_dir / "link"
+        as_user(AGENT_USER, lay, ["ln", "-s", str(lay.sock), str(link)])
+        via_link = as_user(AGENT_USER, lay, [python, "-c", _invoke_script(str(link), host_uid)], timeout=20)
+    finally:
+        shutil.rmtree(link_dir, ignore_errors=True)
     report.check(
         "the shipped client refuses a socket path that is a symlink",
         decode(via_link.stdout.strip()).get("reason_code") == "host_unattested",
@@ -687,6 +743,36 @@ def client_checks(lay: Layout, python: str, report: Report) -> None:
         )
     finally:
         held.close()
+
+    threaded = Held(lay, python, via_client=True, threads=True)
+    try:
+        threaded.send(json.dumps({"round": "probe"}))
+        rounds = []
+        for _ in range(20):
+            _grant_newest(lay, python, {"message": "granted"}, 60)
+            rounds.append(decode(threaded.send(json.dumps({"round": "go"}), timeout=20)))
+        ungranted_allows = sum(int(r.get("ungranted_allow", 1)) for r in rounds)
+        granted_allows = sum(1 for r in rounds if r.get("granted_allow"))
+        report.check(
+            "a held client connection shared by threads gives each caller its own reply",
+            ungranted_allows == 0 and granted_allows > 0,
+            f"rounds={len(rounds)} granted allows={granted_allows} ungranted allows={ungranted_allows}",
+        )
+    finally:
+        threaded.close()
+
+
+def write_damaged_halt(lay: Layout, python: str) -> subprocess.CompletedProcess[str]:
+    """Write a damaged halt file as the host user, without following a symlink.
+
+    Root never writes, chowns or chmods by path inside a directory the host user owns.
+    """
+    script = (
+        "import os,sys\n"
+        "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW, 0o600)\n"
+        "os.write(fd, b'not json {{{'); os.fchmod(fd, 0o600); os.close(fd)\n"
+    )
+    return as_user(HOST_USER, lay, [python, "-c", script, str(lay.halt)])
 
 
 def scenario_peer(lay: Layout, python: str, report: Report) -> None:
@@ -809,9 +895,29 @@ def scenario_halt(lay: Layout, python: str, report: Report) -> None:
     host.stop()
 
     reset_state(lay, python)
-    lay.halt.write_text("not json {{{", encoding="utf-8")
-    os.chown(lay.halt, pwd.getpwnam(HOST_USER).pw_uid, pwd.getpwnam(HOST_USER).pw_gid)
-    os.chmod(lay.halt, 0o600)
+    decoy_dir = Path(tempfile.mkdtemp(prefix="acl-pep-check-decoy-"))
+    try:
+        decoy = decoy_dir / "root-owned"
+        decoy.write_bytes(b"root")
+        os.chmod(decoy, 0o644)
+        before = os.stat(decoy)
+        lay.halt.unlink()
+        as_user(HOST_USER, lay, ["ln", "-s", str(decoy), str(lay.halt)])
+        followed = write_damaged_halt(lay, python)
+        after = os.stat(decoy)
+        report.check(
+            "writing the damaged halt file does not follow a symlink",
+            followed.returncode != 0
+            and decoy.read_bytes() == b"root"
+            and (after.st_uid, after.st_mode) == (before.st_uid, before.st_mode),
+            f"rc={followed.returncode}",
+        )
+        as_user(HOST_USER, lay, ["rm", "-f", str(lay.halt)])
+    finally:
+        shutil.rmtree(decoy_dir, ignore_errors=True)
+    written = write_damaged_halt(lay, python)
+    if written.returncode != 0:
+        raise SystemExit(f"could not write the damaged halt file: {written.stderr}")
     host = Host(lay, python)
     started = host.wait_ready()
     report.check("a damaged halt file is halted on start", started and _denied_on_start(lay, python, host), "")
@@ -881,9 +987,22 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Group id of the agent. Must be the acl-agent group. The host is started with this id.",
     )
+    parser.add_argument("--scratch-root", type=Path, default=None, help="Extra root under which the check may delete its directories.")
+    parser.add_argument("--yes", action="store_true", help="Confirm: this creates system users and deletes test directories as root.")
+    parser.add_argument("--cleanup", action="store_true", help="Remove the users, group and directories this run created.")
     args = parser.parse_args(argv)
+    if not args.yes:
+        print(WARNING, file=sys.stderr)
+        print(f"It would use {args.code_dir}, {args.state_dir} and {args.run_dir}. Re-run with --yes.", file=sys.stderr)
+        return 2
     if os.geteuid() != 0:
         parser.error("run as root: the check creates users and switches to them")
+    if args.scratch_root is not None:
+        ALLOWED_ROOTS.append(args.scratch_root)
+    for path in (args.code_dir, args.state_dir, args.run_dir):
+        if not path_is_allowed(path, ALLOWED_ROOTS):
+            print(f"refusing {path}: not under {', '.join(str(r) for r in ALLOWED_ROOTS)}", file=sys.stderr)
+            return 2
     lay = Layout(code=args.code_dir, state=args.state_dir, run=args.run_dir)
     report = Report()
     global AGENT_UID, AGENT_GID
@@ -913,6 +1032,11 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         for host in list(LIVE_HOSTS):
             host.stop()
+        if args.cleanup:
+            for path in (lay.code, lay.state, lay.run):
+                safe_rmtree(path)
+            remove_created_users()
+            report.note(f"cleanup removed users {CREATED['users'] or 'none'} and the test directories")
     print(f"\n{report.total - report.failed} of {report.total} claims pass")
     return 1 if report.failed else 0
 
