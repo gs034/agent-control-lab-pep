@@ -23,8 +23,15 @@ uses test paths `/var/lib/acl-pep-check` and `/run/acl-pep-check`.
 > Without `--yes` it prints what it would do and exits with status 2.
 
 ```bash
-sudo python3 scripts/reference_host_check/live_check.py --source . --yes --cleanup
+sudo python3 scripts/reference_host_check/live_check.py --source . --yes --cleanup \
+  --allow-uid "$(id -u acl-agent)" --allow-gid "$(id -g acl-agent)"
 ```
+
+`--allow-uid` and `--allow-gid` are the agent user's ids. The check passes
+both to every host it starts. The claim that a peer outside the list is
+refused uses a different user id and this same group id. Omitting the flags
+still uses the `acl-agent` user the check creates. A value that is not that
+user is refused.
 
 `--cleanup` removes the users, the group and the test directories at the end,
 but only the users and group that this run created. The check only deletes a

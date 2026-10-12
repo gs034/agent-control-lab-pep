@@ -22,6 +22,20 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[dev]"
       - name: Test
-        run: pytest
+        # The reference host refuses to run as root. GitHub-hosted runners
+        # execute this job as root, so the suite runs as its own user.
+        run: |
+          if [ "$(id -u)" -eq 0 ]; then
+            id peptest >/dev/null 2>&1 || useradd --create-home --user-group peptest
+            chown -R peptest:peptest .
+            runuser -u peptest -- env HOME=/home/peptest PATH="$PATH" PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" pytest
+          else
+            pytest
+          fi
       - name: Official eval/ deny receipt
-        run: python -m pep.demo
+        run: |
+          if [ "$(id -u)" -eq 0 ]; then
+            runuser -u peptest -- env HOME=/home/peptest PATH="$PATH" PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" python -m pep.demo
+          else
+            python -m pep.demo
+          fi

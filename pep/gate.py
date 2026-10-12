@@ -4,8 +4,8 @@
 
 The ``tool`` argument is not a security boundary. ``gated_invoke`` runs
 whatever callable the caller passes after an ALLOW. The reference host
-(``pep.host``) does not take a callable from the agent; it runs the
-function in its own registry. See ADR-0007.
+(``pep.host``) does not take a callable from the agent. It runs the
+registry function in a separate executor process. See ADR-0007.
 
 ``begin_invoke`` admits a structured envelope (no tool entry). ``complete_invoke``
 enters the tool only after ``PepRuntime.claim_entry`` records a one-shot permit

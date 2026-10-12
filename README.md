@@ -83,7 +83,7 @@ What the host keeps to itself:
 - the halt file (killed, suspended, or active)
 - an append-only decision log
 
-Run it as a user the agent does not share. The process does not switch user by itself. You start it as that user.
+Run it as a user the agent does not share. The process does not switch user by itself. You start it as that user. It refuses to start when its real or effective user id is root, including `init-halt` and `kill`.
 
 1. Create a user for the host, for example `acl-pep`, and a group for the agent, for example `acl-agent`. The agent user is in `acl-agent`. It is not `acl-pep`.
 2. Create a directory the agent cannot list or write. The halt file and the decision log live here.
@@ -111,14 +111,17 @@ sudo -u acl-pep python -m pep.host serve \
   --socket /run/acl-pep/pep.sock \
   --admin /var/lib/acl-pep/admin.sock \
   --halt /var/lib/acl-pep/halt.json \
-  --log /var/lib/acl-pep/decisions.log
+  --log /var/lib/acl-pep/decisions.log \
+  --allow-uid "$(id -u acl-agent)"
 ```
 
 The host refuses to listen unless the socket directory is owned by the host user, is not a symlink, and is not writable by group or other. It creates the socket with a umask that leaves the file mode 000, then sets mode 0660 and checks that the socket's group is the directory's group. That is why the directory is setgid: the host user does not have to be a member of `acl-agent`. An existing socket is removed only when nothing is listening on it. A live socket, a symlink, or a file that is not a socket is left in place and the host exits.
 
-The halt file and the log are mode 0600, owned by the host user. Their directories must be mode 0700 and owned by the host user. The log is opened with `O_NOFOLLOW` and the mode is set on the open file. The agent can send bytes to the socket. It cannot rewrite the halt file or the log unless it is the host user or it can write the directory.
+The halt file and the log are mode 0600, owned by the host user. Their directories must be mode 0700 and owned by the host user. The log is opened with `O_NOFOLLOW` and the mode is set on the open file. A policy file passed with `--policy` gets the same treatment on every read: `O_NOFOLLOW`, a regular file, owned by the host user, no group or other bits, and a private parent directory. The host does not change that file's mode. A symlink, the wrong owner, a loose mode, or a loose directory refuses startup. The same failure on a later read denies the call and latches a halt. The agent can send bytes to the socket. It cannot rewrite the halt file, the log, or the policy file unless it is the host user or it can write the directory.
 
-Optional `--allow-uid` and `--allow-gid` may be repeated. When either list is set, a peer that is not on it is denied. When both are set, the peer must match both. With neither, the socket mode is the connection check. The admin socket still requires the connecting process to be the host user.
+`--allow-uid` and `--allow-gid` may be repeated, and `serve` requires at least one of them. With neither, the host does not listen. When both are set, the peer must match both. Root is refused, and so is the host's own user id, even if a list names them. Putting either id on `--allow-uid` refuses to start. The socket mode is still checked. It is not a substitute for the allow list.
+
+The admin socket still requires the connecting process to be the host user, and it refuses a process id that the agent socket already refused for being root or the host user. That is as far as the kernel credential goes. A different process that simply runs as the host user can still open the admin socket and can still rewrite files that user owns. The host does not add a shared secret for the admin socket, because that same user could read it.
 
 The kernel reports the credentials of the process that called `connect`. If that process passes the connected socket to another process, the host still sees the original process.
 
@@ -142,7 +145,7 @@ sudo -u acl-pep python -m pep.host grant \
   --ttl 60
 ```
 
-The built-in registry runs `echo.ping`. The agent does not supply the function.
+The built-in registry runs `echo.ping`. The agent does not supply the function. The host forks an executor nursery before it reads the policy, the halt file, or the log, and each session's tool runs in its own worker from that nursery. A worker drops every inherited descriptor except its socket, then installs a landlock ruleset that denies filesystem access and a seccomp allow list. The list checks the architecture is x86_64 first and kills any other architecture, including a 32-bit `int 0x80` entry. It rejects an x32-style syscall number, and it does not include `memfd_create`, `io_uring`, `clone3`, `bpf`, `userfaultfd`, `perf_event_open`, `open_by_handle_at`, `keyctl`, `ptrace`, or `sendto`. The worker clears its environment and caps core dumps, file size, and new processes. At most as many workers as the connection cap are live. A call that runs longer than five seconds is denied and that session's worker is stopped. This is Linux x86_64 only. If that sandbox cannot be installed, the host does not start and does not run the tool in-process. The gate still re-reads the halt file in its own process immediately before it asks the worker to run, and a kill at that point does not enter the tool. A tool body that has already started is not unwound.
 
 The client checks two things before it trusts a reply. The socket file must be owned by the expected host user, and `SO_PEERCRED` on the connection must show that same user id. If the host is down, the peer does not match, or the reply does not arrive before the timeout (5 seconds), the client returns a DENY. It does not raise.
 
@@ -204,7 +207,7 @@ Public receipts match `eval/expected_deny_receipt.example.json` and the frozen v
 | `pep/halt.py` | Durable kill / suspend JSON store (optional; survives restart) |
 | `pep/evaluate.py` | PEP trust domain: `evaluate(envelope) -> Decision`; kill/suspend API |
 | `pep/gate.py` | Never invoke on DENY; `begin_invoke` / `complete_invoke` fence late effects. The callable argument is not a security boundary |
-| `pep/host/` | Reference host process: Unix socket, registry, clock, connection identity, halt file, append-only decision log |
+| `pep/host/` | Reference host process: Unix socket, registry, sandboxed executor, clock, connection identity, halt file, append-only decision log |
 | `pep/receipt.py` | Frozen v1 receipt (`validate_receipt`) |
 | `pep/row.py` | Loader for the official `eval/` row |
 | `pep/corpus.py` | Loader for M1 `eval/corpus/` rows (same `evaluate()` path) |
@@ -230,7 +233,10 @@ agent / optional monitor / HITL UI
               |  tool_name and args on the Unix socket
               v
      pep.host (separate process)     <-- reference gate
-              |  registry function, ALLOW only
+              |  tool name and args, ALLOW only
+              v
+     executor (sandboxed process)
+              |
               v
           tool invoke
 ```
