@@ -23,7 +23,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8,<10"]
 
 [project.scripts]
 pep-demo = "pep.demo:main"

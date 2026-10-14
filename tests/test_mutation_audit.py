@@ -769,7 +769,7 @@ def test_run_refuses_a_seal_naming_a_commit_whose_code_was_reverted(tmp_path):
     _git(root, "commit", "-q", "-m", "revert wip")
     _mutant(root, "C1", "M01", CALC, CALC.replace("return a + b", "return a - b"))
     _freeze(root, "C1", commit=planted)
-    with pytest.raises(ma.FreezeMismatch, match="differs from the freeze commit outside audits/: conftest.py"):
+    with pytest.raises(ma.FreezeMismatch, match="differs from the freeze commit outside audits/C1/: conftest.py"):
         ma.run("C1", root=root)
     assert not sentinel.exists()
 
@@ -954,3 +954,50 @@ def test_render_refuses_multi_line_results_and_equivalent_notes():
         ma.render(_results(), {"M02": {"argument": "same", "signed_off_by": "owner\nrm -rf ~"}})
     with pytest.raises(ma.AuditError, match="argument"):
         ma.render(_results(), {"M02": {"argument": "same\x1b[2J", "signed_off_by": "owner"}})
+
+
+def test_run_refuses_code_planted_before_the_freeze_and_removed_after(tmp_path):
+    """T6 follow-up to P-1: plant, freeze at HEAD, delete after the freeze, run."""
+    root = _toy(tmp_path)
+    sentinel = tmp_path / "conftest-ran"
+    (root / "conftest.py").write_text(f"open({str(sentinel)!r}, 'w').write('ran')\n")
+    _git(root, "add", "conftest.py")
+    _git(root, "commit", "-q", "-m", "wip")
+    _mutant(root, "C4", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "C4")
+    _git(root, "rm", "-q", "conftest.py")
+    _git(root, "commit", "-q", "-m", "remove after freeze")
+    with pytest.raises(ma.FreezeMismatch, match="differs from HEAD outside audits/C4/: conftest.py"):
+        ma.run("C4", root=root)
+    assert not sentinel.exists()
+
+
+def test_run_refuses_a_change_in_another_audits_folder(tmp_path):
+    """The exclusion covers only this audit's own folder."""
+    root = _toy(tmp_path)
+    (root / "audits" / "OTHER").mkdir(parents=True)
+    (root / "audits" / "OTHER" / "note.py").write_text("X = 1\n")
+    _git(root, "add", "audits/OTHER")
+    _git(root, "commit", "-q", "-m", "other audit file")
+    planted = _git(root, "rev-parse", "HEAD").strip()
+    _git(root, "rm", "-q", "audits/OTHER/note.py")
+    _git(root, "commit", "-q", "-m", "remove it")
+    _mutant(root, "C5", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "C5", commit=planted)
+    with pytest.raises(ma.FreezeMismatch, match="audits/OTHER/note.py"):
+        ma.run("C5", root=root)
+
+
+@pytest.mark.parametrize("name", ["conftest.py", "pep/conftest.py", "sitecustomize.py", "x.pth"])
+def test_run_refuses_startup_hooks_outside_tests(tmp_path, name):
+    """Even a reviewed seal may not carry code that runs before the suite."""
+    root = _toy(tmp_path)
+    target = root / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("X = 1\n")
+    _git(root, "add", name)
+    _git(root, "commit", "-q", "-m", "hook")
+    _mutant(root, "C6", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "C6")
+    with pytest.raises(ma.FreezeMismatch, match="run before the tests"):
+        ma.run("C6", root=root)
