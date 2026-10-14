@@ -314,6 +314,33 @@ def _sealed_commit(root: Path, sealed: dict) -> str:
     return commit
 
 
+def _require_reviewed_commit(root: Path, commit: str, freeze_commit: str) -> None:
+    """The archived tree must be the tree that the freeze commit shows, outside ``audits/``.
+
+    A seal is input, so naming some local commit is not enough: a branch can
+    add code, revert it, and seal the commit that still has it. The sealed
+    commit must be an ancestor of the commit that added ``freeze.json`` and
+    nothing outside ``audits/`` may change between them, so what a reviewer
+    sees at the freeze commit is what runs.
+    """
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", "--end-of-options", commit, freeze_commit],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise FreezeMismatch(f"the seal's commit {commit[:12]} is not an ancestor of the freeze commit")
+    changed = _git(
+        root, "diff", "--name-only", "--end-of-options", commit, freeze_commit, "--", ".", ":(exclude)audits"
+    ).split()
+    if changed:
+        raise FreezeMismatch(
+            f"the seal's commit {commit[:12]} differs from the freeze commit outside audits/: {', '.join(changed)}"
+        )
+
+
 def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
     """Refuse unless the seal is committed once, and everything it names still matches.
 
@@ -335,6 +362,7 @@ def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
         raise FreezeMismatch(f"{rel}/freeze.json must be committed once and never edited")
     if _git(root, "log", "--format=%H", f"{history[0]}..HEAD", "--", f"{rel}/mutants").split():
         raise FreezeMismatch(f"{rel}/mutants changed after the freeze commit")
+    _require_reviewed_commit(root, sealed["commit"], history[0])
     _refuse_untracked_tests(root, FreezeMismatch)
     audit = _audit_dir(root, audit_id)
     current = {
