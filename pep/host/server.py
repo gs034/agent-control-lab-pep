@@ -201,6 +201,7 @@ class ReferenceHost:
         self._window_written = 0
         self._suppressed = 0
         self._log_closed = False
+        self._refused_after_close = 0
         self._allowed_uids = _id_set(allowed_uids, "uid")
         self._allowed_gids = _id_set(allowed_gids, "gid")
         self._rejected_peers: set[int] = set()
@@ -371,6 +372,8 @@ class ReferenceHost:
     def handle_request(self, raw: bytes | str | Any, session: Session) -> dict[str, Any]:
         """Decide one envelope. There is no parameter for a callable or a clock."""
         if not self._begin_log_call():
+            with self._lock:
+                self._refused_after_close += 1
             return _response(
                 "DENY",
                 "kill_active",
@@ -388,7 +391,11 @@ class ReferenceHost:
             self._end_log_call()
 
     def serve_forever(self, *, stop: threading.Event | None = None, ready: threading.Event | None = None) -> None:
-        """Listen on the Unix socket until ``stop`` is set."""
+        """Listen on the Unix socket until ``stop`` is set.
+
+        A host is not reusable once this returns: the executor has aborted and
+        the decision log is closed. Start a new host object to serve again.
+        """
         if running_as_root():
             raise HostError("refusing to run as root")
         if not self._agent_allow_list_set():
@@ -446,10 +453,13 @@ class ReferenceHost:
                     pass
                 self._admin_listener = None
             # A tool call blocked on a worker would hold the log drain open.
-            executors = getattr(self, "_executors", None)
-            if executors is not None:
-                executors.abort_calls()
-            self._shutdown_log()
+            # The log is drained and closed even if stopping the workers raises.
+            try:
+                executors = getattr(self, "_executors", None)
+                if executors is not None:
+                    executors.abort_calls()
+            finally:
+                self._shutdown_log()
 
     def serve_in_background(self) -> threading.Thread:
         """Start ``serve_forever`` on a daemon thread. Used by tests and local runs."""
@@ -481,22 +491,35 @@ class ReferenceHost:
 
     def close(self) -> None:
         self.request_stop()
-        executors = getattr(self, "_executors", None)
-        if executors is not None:
-            executors.close()
-        listener = self._listener
-        if listener is not None:
-            try:
-                listener.close()
-            except OSError:
-                pass
-        admin = self._admin_listener
-        if admin is not None:
-            try:
-                admin.close()
-            except OSError:
-                pass
-        self._shutdown_log()
+        try:
+            executors = getattr(self, "_executors", None)
+            if executors is not None:
+                executors.close()
+        finally:
+            # Listeners close and the log is drained and closed even if
+            # stopping the workers raises.
+            for sock in (self._listener, self._admin_listener):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+            self._shutdown_log()
+
+    @property
+    def refused_after_close(self) -> int:
+        """Requests answered DENY after the decision log closed, with nothing appended.
+
+        Shutdown closes the listener, aborts in-flight calls, drains the log
+        and closes it. A request that an already-accepted connection sends
+        after that close is still answered DENY, and a decision that outlives
+        the drain bound cannot be appended either. Both are counted here, by
+        request (any envelope, not only tool calls). It is a snapshot: a
+        connection thread may still be answering when ``serve_forever``
+        returns, so read it after the host's threads have finished.
+        """
+        with self._lock:
+            return self._refused_after_close
 
     def __del__(self) -> None:
         executors = getattr(self, "_executors", None)
@@ -695,6 +718,8 @@ class ReferenceHost:
                 detail = "host tool timed out"
             elif exc.kind == "limit":
                 detail = "host tool executor limit reached"
+            elif exc.kind == "aborted":
+                detail = "host is shutting down; the call was refused before entry"
             else:
                 detail = "host tool raised after entry"
             return self._record(
@@ -1554,6 +1579,8 @@ class ReferenceHost:
         request_id: str,
     ) -> dict[str, Any]:
         if not self._begin_log_call():
+            with self._lock:
+                self._refused_after_close += 1
             if decision == "DENY":
                 return _response(decision, reason, detail, request_id)
             return _response("DENY", "kill_active", "host is shut down; fail-closed deny", request_id)
@@ -1607,7 +1634,11 @@ class ReferenceHost:
         try:
             self._decisions.append(record)
         except (DecisionLogError, OSError, ValueError):
-            self._sticky_halt = True
+            with self._lock:
+                self._sticky_halt = True
+                if self._log_closed:
+                    # Refused because shutdown already closed the log: counted, not appended.
+                    self._refused_after_close += 1
             return False
         return True
 

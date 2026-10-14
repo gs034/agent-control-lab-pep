@@ -2323,6 +2323,158 @@ def test_shutdown_abort_refuses_calls_that_had_not_reached_a_worker(tmp_path: Pa
         decision = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
         assert decision["decision"] == "DENY"
         assert decision["reason_code"] == "tool_failed"
+        assert decision["reason_detail"].startswith("host is shutting down")
         assert calls == []
     finally:
         host.close()
+
+
+def test_shutdown_race_many_callers_all_get_deny_and_the_log_closes(tmp_path: Path):
+    """Threaded shutdown race: a first wave of callers is inside its workers
+    when stop fires, and a second wave arrives on open sessions after the
+    accept loop has returned (abort done, log closed).
+
+    Every caller gets a DENY, serve_forever returns inside the drain bound,
+    and the decision log is closed with its held count written. No caller
+    hangs and no exception escapes a worker thread.
+    """
+
+    def registered(args: dict) -> dict:
+        # Runs in a forked worker: it is cut off by the worker's SIGKILL on abort.
+        if args.get("message") == "hang":
+            time.sleep(20)
+        return {"pong": "ok"}
+
+    (tmp_path / "sock").mkdir()
+    os.chmod(tmp_path / "sock", 0o2750)
+    host = _host(tmp_path, registry={"echo.ping": registered}, tool_timeout=30.0, allowed_uids=frozenset({_agent_uid()}))
+    serving = host.serve_in_background()
+    sessions = [host.open_session(_peer(pid=100 + index, uid=_agent_uid())) for index in range(6)]
+    for session in sessions:
+        host.issue_session_approval(session, tool_name="echo.ping", args={"message": "hang"}, ttl_seconds=60)
+    replies: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+    go = threading.Event()
+
+    def call(session: Any) -> None:
+        go.wait(timeout=5)
+        try:
+            reply = host.handle_request({"tool_name": "echo.ping", "args": {"message": "hang"}}, session)
+        except BaseException as exc:  # noqa: BLE001 - the test records every escape
+            with lock:
+                errors.append(exc)
+            return
+        with lock:
+            replies.append(reply)
+
+    first_wave = sessions[:3]
+    second_wave = sessions[3:]
+    callers = [threading.Thread(target=call, args=(session,), daemon=True) for session in first_wave]
+    for caller in callers:
+        caller.start()
+    try:
+        go.set()
+        time.sleep(0.2)
+        started = time.monotonic()
+        host.request_stop()
+        serving.join(timeout=5)
+        assert not serving.is_alive()
+        assert time.monotonic() - started < 5
+        # The second wave arrives on sessions that are still open after shutdown.
+        late = [threading.Thread(target=call, args=(session,), daemon=True) for session in second_wave]
+        for caller in late:
+            caller.start()
+        callers.extend(late)
+        for caller in callers:
+            caller.join(timeout=5)
+        assert not any(caller.is_alive() for caller in callers)
+    finally:
+        host.close()
+    assert errors == []
+    assert len(replies) == len(sessions)
+    assert all(reply["decision"] == "DENY" for reply in replies)
+    details = sorted(reply["reason_detail"] for reply in replies)
+    # First wave: inside a worker, cut off by the abort. Second wave: refused
+    # at the closed log gate, counted, not appended.
+    assert sum(detail == "host tool raised after entry" for detail in details) == len(first_wave)
+    assert sum(detail.startswith("host is shut down") for detail in details) == len(second_wave)
+    assert host.refused_after_close == len(second_wave)
+    assert host._log_closed
+    records = host.decision_records()
+    # No record says a tool completed.
+    tool_records = [record for record in records if record.get("tool_name") == "echo.ping"]
+    assert all(record["decision"] in {"PRE_ENTRY", "DENY"} for record in tool_records)
+    assert all(record["reason_code"] == "tool_failed" for record in tool_records if record["decision"] == "DENY")
+    for record in records:
+        _assert_record_claims_only_what_ran(record)
+
+
+def test_log_is_closed_even_when_aborting_the_executor_raises(tmp_path: Path):
+    """If stopping the workers raises during shutdown, the decision log is still drained and closed."""
+    (tmp_path / "sock").mkdir()
+    os.chmod(tmp_path / "sock", 0o2750)
+    host = _host(tmp_path, allowed_uids=frozenset({_agent_uid()}))
+    session = host.open_session(_peer())
+    assert host.handle_request(b"[]", session)["reason_code"] == "envelope_invalid"
+
+    def boom() -> None:
+        raise RuntimeError("worker refused to stop")
+
+    host._executors.abort_calls = boom  # type: ignore[method-assign]
+    box: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            host.serve_forever(stop=host._stop)
+        except BaseException as exc:  # noqa: BLE001 - the escape is the point
+            box.append(exc)
+
+    serving = threading.Thread(target=run, daemon=True)
+    serving.start()
+    try:
+        time.sleep(0.2)
+        host.request_stop()
+        serving.join(timeout=5)
+        assert not serving.is_alive()
+        assert box and isinstance(box[0], RuntimeError)
+        assert host._log_closed
+        with pytest.raises(Exception):
+            host._decisions.append({"decision": "DENY", "reason_code": "probe"})
+    finally:
+        host._executors.abort_calls = lambda: None  # type: ignore[method-assign]
+        host._executors.close()
+
+
+def test_a_decision_that_outlives_the_drain_is_counted_not_lost(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A call holding a log ticket when the drain bound passes cannot append; it is counted."""
+    from pep.host import server as server_module
+
+    monkeypatch.setattr(server_module, "SHUTDOWN_DRAIN_SECONDS", 0.2)
+
+    def registered(_args: dict) -> dict:
+        # Runs in a forked worker; it outlives the shortened drain and then returns.
+        time.sleep(1.0)
+        return {"pong": "ok"}
+
+    host = _host(tmp_path, registry={"echo.ping": registered})
+    session = host.open_session(_peer())
+    host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    box: list[dict[str, Any]] = []
+    caller = threading.Thread(
+        target=lambda: box.append(host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)),
+        daemon=True,
+    )
+    caller.start()
+    try:
+        time.sleep(0.3)
+        host._shutdown_log()
+        assert host._log_closed
+        assert host.refused_after_close == 0
+    finally:
+        caller.join(timeout=5)
+        host.close()
+    assert not caller.is_alive()
+    assert box[0]["decision"] == "DENY"
+    assert box[0]["reason_code"] == "kill_active"
+    assert host.refused_after_close == 1

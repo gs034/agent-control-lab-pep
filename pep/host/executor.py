@@ -200,8 +200,11 @@ class ExecutorNursery:
         """Stop every worker and refuse new calls, so in-flight calls return now.
 
         Used on shutdown before the decision log drains. After this no call
-        gets a worker: one that had not reached its worker yet is refused, and
-        the spare is closed, so no tool call can start and outlast the drain.
+        gets a worker: one that had not reached its worker yet is refused with
+        kind ``aborted``, and the spare is closed, so no tool call can start
+        and outlast the drain. The flag is never cleared: a nursery that has
+        aborted is not reusable, as a host is not reusable once
+        ``serve_forever`` has returned.
         """
         with self._lock:
             self._aborting = True
@@ -247,7 +250,7 @@ class ExecutorNursery:
     def _worker_for(self, session_id: int) -> _Worker:
         with self._lock:
             if self._closed or self._aborting:
-                raise ToolExecutionError("error")
+                raise ToolExecutionError("aborted")
             current = self._workers.get(session_id)
             if current is not None and not current.closed:
                 return current

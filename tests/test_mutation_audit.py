@@ -755,3 +755,40 @@ def test_run_passes_the_seal_commit_after_end_of_options(tmp_path, monkeypatch):
     monkeypatch.setattr(ma.subprocess, "run", _spy)
     ma.run("B4", root=root)
     assert archives == [["git", "archive", "--format=tar", "--end-of-options", sealed["commit"]]]
+
+
+def test_hung_git_fails_the_audit_closed_with_a_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every git subprocess is bounded. A git that never returns stops the audit with AuditError."""
+    root = _toy(tmp_path)
+    real_run = ma.subprocess.run
+
+    def hang(argv, *args, **kwargs):
+        if argv[:1] == ["git"]:
+            assert kwargs.get("timeout") == ma._GIT_TIMEOUT_SECONDS, "every git call must carry the bound"
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ma.subprocess, "run", hang)
+    with pytest.raises(ma.AuditError, match="git rev-parse did not finish within 60 s"):
+        ma._git(root, "rev-parse", "--verify", "HEAD")
+    with pytest.raises(ma.AuditError, match="did not finish within"):
+        ma.freeze("A01", reviewer="person", root=root, scope=SCOPE, timeout=4.0, package="toy")
+
+
+@pytest.mark.parametrize("verb", ["archive", "apply"])
+def test_hung_git_archive_or_apply_stops_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str) -> None:
+    """The git calls inside run() (archive the seal, apply a mutant) carry the same bound."""
+    root = _toy(tmp_path)
+    _mutant(root, "A01", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "A01")
+    real_run = ma.subprocess.run
+
+    def hang(argv, *args, **kwargs):
+        if argv[:2] == ["git", verb]:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ma.subprocess, "run", hang)
+    with pytest.raises(ma.AuditError, match=f"git {verb} did not finish within"):
+        ma.run("A01", root=root)
+    assert not (root / "audits" / "A01" / "results.json").exists()
