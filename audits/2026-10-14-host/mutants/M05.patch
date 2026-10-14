@@ -1,0 +1,16 @@
+Intent: Drop the SO_PEERCRED uid comparison in _connect_attested; the client trusts any listener on a socket file owned by host_uid.
+Property: The client attests the accepting process by kernel peer credentials, not only by the socket file's owner; a peer whose uid is not host_uid is DENY host_unattested.
+--- a/pep/host/client.py
++++ b/pep/host/client.py
+@@ -111,11 +111,6 @@ def _connect_attested(path: Path | str, host_uid: int, timeout: float) -> socket
+             peer = peer_credentials(sock)
+         except HostError as exc:
+             raise _ClientDeny("host_unattested", "host peer credentials unreadable") from exc
+-        if peer.uid != host_uid:
+-            raise _ClientDeny(
+-                "host_unattested",
+-                "host peer uid does not match the expected host user",
+-            )
+     except _ClientDeny:
+         sock.close()
+         raise

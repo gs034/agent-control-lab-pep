@@ -1,0 +1,13 @@
+Intent: Open the decision log without O_NOFOLLOW, so a symlink planted at the log path is followed and receives the records.
+Property: The decision log path is opened without following symlinks; a planted link at the log path is refused at host start, not written through.
+--- a/pep/host/log.py
++++ b/pep/host/log.py
+@@ -116,8 +116,6 @@ class DecisionLog:
+         self._lock = threading.Lock()
+         self._seq = 0
+         flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
+-        if hasattr(os, "O_NOFOLLOW"):
+-            flags |= os.O_NOFOLLOW
+         try:
+             fd = os.open(self.path, flags, 0o600)
+         except OSError as exc:

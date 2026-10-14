@@ -1,0 +1,12 @@
+Intent: A worker whose call timed out is not closed or killed, so the stale worker (and its late reply) stays bound to the session for the next call.
+Property: A worker that exceeded its call deadline is killed and discarded; a late reply from it can never be returned as the result of a later request.
+--- a/pep/host/executor.py
++++ b/pep/host/executor.py
+@@ -333,7 +333,6 @@ class _Worker:
+                 _write_frame(self._conn, {"tool_name": tool_name, "args": dict(args)})
+                 reply = _read_frame(self._conn, deadline=deadline)
+             except TimeoutError as exc:
+-                self.close()
+                 raise ToolExecutionError("timeout") from exc
+             except (OSError, ValueError, ToolExecutionError) as exc:
+                 self.close()

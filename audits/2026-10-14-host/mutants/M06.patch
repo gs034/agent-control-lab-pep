@@ -1,0 +1,13 @@
+Intent: Request-id monotonicity check accepts a repeated number (<= becomes <), so a replayed reply line is taken as the answer to a new request.
+Property: On a held connection every reply's host request number must strictly rise; a repeated or replayed reply is DENY reply_mismatch and the connection is closed.
+--- a/pep/host/client.py
++++ b/pep/host/client.py
+@@ -263,7 +263,7 @@ class AgentConnection:
+             self._conn_part = conn_part
+         elif conn_part != self._conn_part:
+             return "reply request id names another connection"
+-        if number <= self._last_number:
++        if number < self._last_number:
+             return "reply request id did not rise"
+         self._last_number = number
+         return None
