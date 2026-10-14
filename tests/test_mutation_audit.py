@@ -757,6 +757,47 @@ def test_run_passes_the_seal_commit_after_end_of_options(tmp_path, monkeypatch):
     assert archives == [["git", "archive", "--format=tar", "--end-of-options", sealed["commit"]]]
 
 
+def test_run_refuses_a_seal_naming_a_commit_whose_code_was_reverted(tmp_path):
+    root = _toy(tmp_path)
+    sentinel = tmp_path / "conftest-ran"
+    (root / "conftest.py").write_text(f"open({str(sentinel)!r}, 'w').write('ran')\n")
+    _git(root, "add", "conftest.py")
+    _git(root, "commit", "-q", "-m", "wip")
+    planted = _git(root, "rev-parse", "HEAD").strip()
+    _git(root, "rm", "-q", "conftest.py")
+    _git(root, "commit", "-q", "-m", "revert wip")
+    _mutant(root, "C1", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "C1", commit=planted)
+    with pytest.raises(ma.FreezeMismatch, match="differs from the freeze commit outside audits/: conftest.py"):
+        ma.run("C1", root=root)
+    assert not sentinel.exists()
+
+
+def test_run_refuses_a_seal_commit_that_is_not_an_ancestor(tmp_path):
+    root = _toy(tmp_path)
+    base = _git(root, "rev-parse", "HEAD").strip()
+    _git(root, "checkout", "-q", "-b", "side")
+    (root / "toy" / "extra.py").write_text("X = 1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "side")
+    side = _git(root, "rev-parse", "HEAD").strip()
+    _git(root, "checkout", "-q", base)
+    _mutant(root, "C2", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "C2", commit=side)
+    with pytest.raises(ma.FreezeMismatch, match="not an ancestor of the freeze commit"):
+        ma.run("C2", root=root)
+
+
+def test_run_accepts_a_seal_whose_only_later_change_is_the_audit(tmp_path):
+    root = _toy(tmp_path)
+    _mutant(root, "C3", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _git(root, "add", "audits/C3")
+    _git(root, "commit", "-q", "-m", "mutants first")
+    sealed = _freeze(root, "C3")
+    ma.verify(root, ma._read_json(root / "audits" / "C3" / "freeze.json"), "C3")
+    assert sealed["commit"] == _git(root, "rev-parse", "HEAD~1").strip()
+
+
 def test_hung_git_fails_the_audit_closed_with_a_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every git subprocess is bounded. A git that never returns stops the audit with AuditError."""
     root = _toy(tmp_path)
