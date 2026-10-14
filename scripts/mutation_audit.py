@@ -326,14 +326,16 @@ def _sealed_commit(root: Path, sealed: dict) -> str:
     return commit
 
 
-def _require_reviewed_commit(root: Path, commit: str, freeze_commit: str) -> None:
-    """The archived tree must be the tree that the freeze commit shows, outside ``audits/``.
+def _require_reviewed_commit(root: Path, commit: str, freeze_commit: str, audit_id: str) -> None:
+    """The archived tree must be the tree a reviewer sees, outside this audit's own folder.
 
     A seal is input, so naming some local commit is not enough: a branch can
-    add code, revert it, and seal the commit that still has it. The sealed
-    commit must be an ancestor of the commit that added ``freeze.json`` and
-    nothing outside ``audits/`` may change between them, so what a reviewer
-    sees at the freeze commit is what runs.
+    add code, revert it, and seal the commit that still has it, or add code,
+    freeze, and remove it again after the freeze. The sealed commit must be an
+    ancestor of the commit that added ``freeze.json``, and nothing outside
+    ``audits/<audit_id>/`` may differ between it and the freeze commit or
+    between it and HEAD. So what runs is what the freeze commit and the
+    branch tip both show.
     """
     try:
         ancestor = subprocess.run(
@@ -348,14 +350,35 @@ def _require_reviewed_commit(root: Path, commit: str, freeze_commit: str) -> Non
         raise _git_timed_out(exc) from exc
     if ancestor.returncode != 0:
         raise FreezeMismatch(f"the seal's commit {commit[:12]} is not an ancestor of the freeze commit")
-    changed = _git(
-        root, "diff", "--name-only", "-z", "--end-of-options", commit, freeze_commit, "--", ".", ":(exclude)audits"
-    ).split("\0")
-    changed = [name for name in changed if name]
-    if changed:
-        raise FreezeMismatch(
-            f"the seal's commit {commit[:12]} differs from the freeze commit outside audits/: {', '.join(changed)}"
-        )
+    own = f"audits/{audit_id}"
+    for other, label in ((freeze_commit, "the freeze commit"), ("HEAD", "HEAD")):
+        changed = _git(
+            root, "diff", "--name-only", "-z", "--no-renames", "--end-of-options", commit, other,
+            "--", ".", f":(exclude){own}",
+        ).split("\0")
+        changed = [name for name in changed if name]
+        if changed:
+            raise FreezeMismatch(
+                f"the seal's commit {commit[:12]} differs from {label} outside {own}/: {', '.join(changed)}"
+            )
+
+
+# Files pytest or Python load before any test runs. Only tests/ may carry a conftest.py.
+_STARTUP_NAMES = ("sitecustomize.py", "usercustomize.py")
+
+
+def _refuse_startup_hooks(root: Path, commit: str) -> None:
+    """Refuse a sealed tree with a conftest.py outside tests/ or a Python startup hook."""
+    names = [n for n in _git(root, "ls-tree", "-r", "-z", "--name-only", "--end-of-options", commit).split("\0") if n]
+    bad = [
+        name
+        for name in names
+        if (name.rsplit("/", 1)[-1] == "conftest.py" and not name.startswith("tests/"))
+        or name.rsplit("/", 1)[-1] in _STARTUP_NAMES
+        or name.endswith(".pth")
+    ]
+    if bad:
+        raise FreezeMismatch(f"the sealed tree carries files that run before the tests: {', '.join(bad)}")
 
 
 def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
@@ -379,7 +402,7 @@ def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
         raise FreezeMismatch(f"{rel}/freeze.json must be committed once and never edited")
     if _git(root, "log", "--format=%H", f"{history[0]}..HEAD", "--", f"{rel}/mutants").split():
         raise FreezeMismatch(f"{rel}/mutants changed after the freeze commit")
-    _require_reviewed_commit(root, sealed["commit"], history[0])
+    _require_reviewed_commit(root, sealed["commit"], history[0], audit_id)
     _refuse_untracked_tests(root, FreezeMismatch)
     audit = _audit_dir(root, audit_id)
     current = {
@@ -410,6 +433,7 @@ def run(
     sealed = _read_json(audit / "freeze.json")
     verify(root, sealed, audit_id)
     commit = _sealed_commit(root, sealed)
+    _refuse_startup_hooks(root, commit)
     try:
         archive = subprocess.run(
             ["git", "archive", "--format=tar", "--end-of-options", commit],
@@ -631,7 +655,9 @@ def _run_suite(
     if target is not None:
         env.update(MUTATION_AUDIT_TARGET=str(target), MUTATION_AUDIT_TARGETS=json.dumps(targets))
     cmd = [
-        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "mutation_activation",
+        # -P keeps the archive root off sys.path at interpreter start, so a
+        # root sitecustomize.py or usercustomize.py is never imported.
+        sys.executable, "-P", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "mutation_activation",
         f"--ignore={HARNESS_SELF_TEST}",
     ]
     proc = subprocess.Popen(
