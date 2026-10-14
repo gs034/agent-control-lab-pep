@@ -298,6 +298,18 @@ def freeze(
 
 
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# Every git subprocess is bounded. A git that hangs (a remote helper, a
+# credential prompt, an offline host) fails the audit closed with a clear error.
+_GIT_TIMEOUT_SECONDS = 60.0
+
+
+def _git_timed_out(exc: subprocess.TimeoutExpired) -> AuditError:
+    argv = exc.cmd if isinstance(exc.cmd, (list, tuple)) else [str(exc.cmd)]
+    verb = next((part for part in argv[1:] if not str(part).startswith("-")), "git")
+    return AuditError(
+        f"git {verb} did not finish within {_GIT_TIMEOUT_SECONDS:g} s; "
+        "the audit stops here because git state could not be read (offline or hung git)"
+    )
 
 
 def _sealed_commit(root: Path, sealed: dict) -> str:
@@ -323,18 +335,23 @@ def _require_reviewed_commit(root: Path, commit: str, freeze_commit: str) -> Non
     nothing outside ``audits/`` may change between them, so what a reviewer
     sees at the freeze commit is what runs.
     """
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", "--end-of-options", commit, freeze_commit],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "--end-of-options", commit, freeze_commit],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timed_out(exc) from exc
     if ancestor.returncode != 0:
         raise FreezeMismatch(f"the seal's commit {commit[:12]} is not an ancestor of the freeze commit")
     changed = _git(
-        root, "diff", "--name-only", "--end-of-options", commit, freeze_commit, "--", ".", ":(exclude)audits"
-    ).split()
+        root, "diff", "--name-only", "-z", "--end-of-options", commit, freeze_commit, "--", ".", ":(exclude)audits"
+    ).split("\0")
+    changed = [name for name in changed if name]
     if changed:
         raise FreezeMismatch(
             f"the seal's commit {commit[:12]} differs from the freeze commit outside audits/: {', '.join(changed)}"
@@ -393,9 +410,16 @@ def run(
     sealed = _read_json(audit / "freeze.json")
     verify(root, sealed, audit_id)
     commit = _sealed_commit(root, sealed)
-    archive = subprocess.run(
-        ["git", "archive", "--format=tar", "--end-of-options", commit], cwd=root, check=True, capture_output=True
-    ).stdout
+    try:
+        archive = subprocess.run(
+            ["git", "archive", "--format=tar", "--end-of-options", commit],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        ).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timed_out(exc) from exc
     mutants = _load_mutants(audit, tuple(sealed["scope"]))
 
     started = time.monotonic()
@@ -551,9 +575,17 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
         return {**row, "outcome": "invalid", "detail": "the target file is not in the frozen commit"}
     original = target.read_text(encoding="utf-8")
     files_before = _tree_digests(copy, mutant.target)
-    applied = subprocess.run(
-        ["git", "apply", str(patch)], cwd=copy, env=_git_apply_env(work), capture_output=True, text=True
-    )
+    try:
+        applied = subprocess.run(
+            ["git", "apply", str(patch)],
+            cwd=copy,
+            env=_git_apply_env(work),
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timed_out(exc) from exc
     if applied.returncode != 0:
         return {**row, "outcome": "invalid", "detail": applied.stderr.strip()}
     mutated = target.read_text(encoding="utf-8")
@@ -781,7 +813,12 @@ def _reason_lines(row: dict) -> list[str]:
 
 
 def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=root, check=True, capture_output=True, text=True, timeout=_GIT_TIMEOUT_SECONDS
+        ).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timed_out(exc) from exc
 
 
 def _sha256(path: Path) -> str:
