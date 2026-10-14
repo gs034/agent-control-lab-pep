@@ -13,6 +13,7 @@ import json
 from typing import Any, Mapping
 
 from pep.envelope import PROSE_COAX_KEYS, TOOL_NAME_RE
+from pep.host.log import describe_keys
 
 HOST_KEYS = frozenset({"args", "tool_name"})
 MAX_REQUEST_BYTES = 65_536
@@ -180,7 +181,7 @@ def _interpret(body: Any) -> tuple[str, dict[str, Any], list[dict[str, str]]]:
             {
                 "name": "envelope_keys",
                 "outcome": "deny",
-                "detail": "unknown keys: " + ", ".join(sorted(extra)),
+                "detail": "unknown keys: " + describe_keys(extra),
             }
         )
         raise ProtocolError(

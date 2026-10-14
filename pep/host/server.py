@@ -52,7 +52,7 @@ from pep.host.haltfile import (
     read_fail_closed,
     write_killed,
 )
-from pep.host.log import DecisionLog, DecisionLogError
+from pep.host.log import DecisionLog, DecisionLogError, describe_keys
 from pep.host.protocol import MAX_REQUEST_BYTES, ProtocolError, parse_host_request
 from pep.policy import DEMO_POLICY, PolicyStore
 
@@ -607,7 +607,7 @@ class ReferenceHost:
                 {
                     "name": "args_keys",
                     "outcome": "deny",
-                    "detail": "unknown keys: " + ", ".join(extra_args),
+                    "detail": "unknown keys: " + describe_keys(extra_args),
                 }
             )
             return self._logged(

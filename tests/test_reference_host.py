@@ -2478,3 +2478,88 @@ def test_a_decision_that_outlives_the_drain_is_counted_not_lost(tmp_path: Path, 
     assert box[0]["decision"] == "DENY"
     assert box[0]["reason_code"] == "kill_active"
     assert host.refused_after_close == 1
+
+
+# Finding P-3: an agent controls the names in its request. A denial must not
+# copy an unbounded list of them into the log, and no line may exceed the cap.
+
+
+def _log_lines(path: Path) -> list[bytes]:
+    return [line for line in path.read_bytes().split(b"\n") if line]
+
+
+def _assert_listed_keys_are_clipped(detail: str, total: int) -> None:
+    import pep.host.log as host_log
+
+    assert detail.startswith("unknown keys: ")
+    assert detail.endswith(f" (+{total - host_log.MAX_LISTED_KEYS} more)")
+    listed = detail[len("unknown keys: ") :].rsplit(" (+", 1)[0].split(", ")
+    assert len(listed) == host_log.MAX_LISTED_KEYS
+    assert all(len(name) <= host_log.MAX_KEY_CHARS for name in listed)
+
+
+def test_unknown_envelope_key_flood_is_clipped_in_the_log(tmp_path: Path):
+    import pep.host.log as host_log
+
+    host = _host(tmp_path)
+    session = host.open_session(_peer())
+    extras: dict[str, Any] = {f"k{i:05d}": 1 for i in range(4000)}
+    extras["a" + "x" * 5000] = 1
+    decision = host.handle_request({"tool_name": "echo.ping", "args": ARGS, **extras}, session)
+    assert decision["decision"] == "DENY"
+    assert decision["reason_code"] == "envelope_invalid"
+    lines = _log_lines(tmp_path / "decisions.log")
+    assert all(len(line) <= host_log.MAX_RECORD_BYTES for line in lines)
+    record = json.loads(lines[-1])
+    check = next(item for item in record["checks"] if item["name"] == "envelope_keys")
+    _assert_listed_keys_are_clipped(check["detail"], len(extras))
+    assert "truncated" not in record
+    _assert_record_claims_only_what_ran(record)
+
+
+def test_unknown_args_key_flood_is_clipped_in_the_log(tmp_path: Path):
+    import pep.host.log as host_log
+
+    host = _host(tmp_path)
+    session = host.open_session(_peer())
+    args: dict[str, Any] = {"message": "hi", **{f"arg{i:05d}" + "y" * 80: 1 for i in range(500)}}
+    decision = host.handle_request({"tool_name": "echo.ping", "args": args}, session)
+    assert decision["decision"] == "DENY"
+    assert decision["reason_code"] == "envelope_invalid"
+    lines = _log_lines(tmp_path / "decisions.log")
+    assert all(len(line) <= host_log.MAX_RECORD_BYTES for line in lines)
+    record = json.loads(lines[-1])
+    check = next(item for item in record["checks"] if item["name"] == "args_keys")
+    _assert_listed_keys_are_clipped(check["detail"], 500)
+
+
+def test_decision_log_caps_one_record_and_marks_it(tmp_path: Path):
+    import pep.host.log as host_log
+
+    path = tmp_path / "decisions.log"
+    log = DecisionLog(path)
+    small = log.append({"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r1", "checks": []})
+    assert "truncated" not in small
+
+    long_detail = {"name": "args_keys", "outcome": "deny", "detail": "z" * 50_000}
+    clipped = log.append(
+        {"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r2", "checks": [long_detail]}
+    )
+    assert clipped["truncated"].startswith("record of ")
+    assert len(clipped["checks"][0]["detail"]) == host_log.MAX_FIELD_CHARS
+
+    many = [{"name": f"c{i}", "outcome": "deny", "detail": "w" * 200} for i in range(60)]
+    flat = log.append({"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r3", "checks": many})
+    assert "check names and outcomes kept" in flat["truncated"]
+    assert flat["checks"][0] == {"name": "c0", "outcome": "deny"}
+
+    flood = [{"name": f"c{i}", "outcome": "deny"} for i in range(5000)]
+    core = log.append({"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r4", "checks": flood})
+    assert "only core fields kept" in core["truncated"]
+    assert core["decision"] == "DENY" and core["reason_code"] == "envelope_invalid" and core["seq"] == 4
+
+    lines = _log_lines(path)
+    assert len(lines) == 4
+    assert all(len(line) <= host_log.MAX_RECORD_BYTES for line in lines)
+    assert log.read_records() == [small, clipped, flat, core]
+    log.close()
