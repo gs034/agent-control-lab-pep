@@ -69,7 +69,7 @@ Running the README procedure by hand exposed one gap. The shipped client, `pep.h
 ## What this does not claim
 
 - Everything ADR-0007 does not claim still holds.
-- The check runs one configuration: the built-in stub policy, the echo tool, the default limits, and one Linux machine. The `reference-host-live` workflow has since run green on GitHub on every main push from `e092d93` onward (14 October 2026); a green run is evidence for those 55 claims on that runner only.
+- The check runs one configuration: the built-in stub policy, the echo tool, the default limits, and one Linux machine. The `reference-host-live` workflow has since run green on GitHub on every main push since `50be0ca` (#38, 12 October 2026); a green run is evidence for the claims the check prints, on that runner only.
 - The check does not test the rest of the README. Behaviour the README describes but the table does not list, such as the accept loop waking about every 0.2 seconds, is untested.
 - The check does not prove production readiness. No outside review of this host has been done.
 - The check does not test an agent running as the host user, or with write access to its directories. ADR-0007 says those break the separation.
