@@ -61,6 +61,8 @@ RegistryTool = Callable[[Mapping[str, Any]], Any]
 MAX_CONNECTIONS = 8
 IDLE_TIMEOUT_SECONDS = 5.0
 CONNECTION_DEADLINE_SECONDS = 30.0
+# Upper bound on waiting for in-flight calls at shutdown before the held count is written.
+SHUTDOWN_DRAIN_SECONDS = 10.0
 TOOL_CALL_TIMEOUT_SECONDS = DEFAULT_CALL_TIMEOUT_SECONDS
 DENY_LOG_BURST = 30
 DENY_LOG_WINDOW_SECONDS = 1.0
@@ -443,6 +445,10 @@ class ReferenceHost:
                 except OSError:
                     pass
                 self._admin_listener = None
+            # A tool call blocked on a worker would hold the log drain open.
+            executors = getattr(self, "_executors", None)
+            if executors is not None:
+                executors.abort_calls()
             self._shutdown_log()
 
     def serve_in_background(self) -> threading.Thread:
@@ -836,13 +842,44 @@ class ReferenceHost:
                     response = self.handle_request(b" " * (MAX_REQUEST_BYTES + 1), session)
                     _send_line(conn, response)
                     break
+                # One chunk can carry many lines. The deadline and stop are checked per
+                # line, and a reply the peer does not take closes the connection.
+                closing = False
                 while b"\n" in buf:
+                    if self._stop.is_set():
+                        closing = True
+                        break
+                    remaining = self._connection_deadline - (self._monotonic() - opened)
+                    if remaining <= 0:
+                        request_id = self._request_id(session)
+                        response = self._logged(
+                            session,
+                            "DENY",
+                            "connection_deadline",
+                            "connection deadline passed and the connection was closed",
+                            [{"name": "connection_deadline", "outcome": "deny"}],
+                            tool_name=None,
+                            now=None,
+                            request_id=request_id,
+                        )
+                        _send_line(conn, response)
+                        closing = True
+                        break
                     line, buf = buf.split(b"\n", 1)
                     try:
                         response = self.handle_request(line, session)
                     except Exception:
                         response = self._parse_failure(session, "request could not be read")
-                    _send_line(conn, response)
+                    try:
+                        conn.settimeout(max(0.05, min(self._idle_timeout, remaining)))
+                    except OSError:
+                        closing = True
+                        break
+                    if not _send_line(conn, response):
+                        closing = True
+                        break
+                if closing:
+                    break
         finally:
             if session is not None:
                 self._drop_session(session)
@@ -1456,8 +1493,14 @@ class ReferenceHost:
             self._log_draining = True
             close_file = True
             try:
+                # Bounded: calls are cut off by the executor deadline and aborted
+                # above, so a call still in flight here is not waited on for ever.
+                drain_until = time.monotonic() + SHUTDOWN_DRAIN_SECONDS
                 while self._log_inflight > 0:
-                    self._log_idle.wait()
+                    left = drain_until - time.monotonic()
+                    if left <= 0:
+                        break
+                    self._log_idle.wait(timeout=left)
                 pending = self._suppressed
                 self._suppressed = 0
                 self._window_written = 0
@@ -1714,9 +1757,11 @@ def _clip(text: str, limit: int = 240) -> str:
     return text[: limit - 3] + "..."
 
 
-def _send_line(conn: socket.socket, payload: Mapping[str, Any]) -> None:
+def _send_line(conn: socket.socket, payload: Mapping[str, Any]) -> bool:
+    """Send one reply line. False when it could not be delivered (timeout or error)."""
     try:
         line = json.dumps(dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         conn.sendall(line.encode("utf-8") + b"\n")
     except (OSError, TypeError, ValueError, RecursionError):
-        pass
+        return False
+    return True

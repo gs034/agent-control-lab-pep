@@ -297,12 +297,37 @@ def freeze(
     return record
 
 
-def verify(root: Path, sealed: dict) -> None:
-    """Refuse unless the seal is committed once, and everything it names still matches."""
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _sealed_commit(root: Path, sealed: dict) -> str:
+    """The seal is input. Its commit must be a full object id that names a local commit."""
+    commit = sealed.get("commit")
+    if not isinstance(commit, str) or not _OBJECT_ID.fullmatch(commit):
+        raise FreezeMismatch("the seal's commit is not a full hexadecimal object id")
+    try:
+        resolved = _git(root, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{commit}^{{commit}}").strip()
+    except subprocess.CalledProcessError as exc:
+        raise FreezeMismatch(f"the seal's commit {commit[:12]} is not a commit in this repository") from exc
+    if resolved != commit:
+        raise FreezeMismatch(f"the seal's commit {commit[:12]} does not resolve to itself")
+    return commit
+
+
+def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
+    """Refuse unless the seal is committed once, and everything it names still matches.
+
+    Every path comes from ``audit_id``, the directory being run. A seal that
+    names another audit is refused, so its checks cannot point elsewhere.
+    """
+    audit_id = sealed.get("audit_id") if audit_id is None else audit_id
+    if not isinstance(audit_id, str) or sealed.get("audit_id") != audit_id:
+        raise FreezeMismatch(f"the seal names audit {sealed.get('audit_id')!r}, not {audit_id!r}")
     _refuse_shallow(root, FreezeMismatch)
+    _sealed_commit(root, sealed)
     if _python_version().rsplit(".", 1)[0] != sealed["python"].rsplit(".", 1)[0]:
         raise FreezeMismatch(f"sealed under Python {sealed['python']}, running {_python_version()}")
-    rel = f"audits/{sealed['audit_id']}"
+    rel = f"audits/{audit_id}"
     if _git(root, "status", "--porcelain", "--untracked-files=all", "--", rel).strip():
         raise FreezeMismatch(f"{rel} has uncommitted changes; commit the mutants and freeze.json first")
     history = _git(root, "log", "--format=%H", "--", f"{rel}/freeze.json").split()
@@ -311,7 +336,7 @@ def verify(root: Path, sealed: dict) -> None:
     if _git(root, "log", "--format=%H", f"{history[0]}..HEAD", "--", f"{rel}/mutants").split():
         raise FreezeMismatch(f"{rel}/mutants changed after the freeze commit")
     _refuse_untracked_tests(root, FreezeMismatch)
-    audit = _audit_dir(root, sealed["audit_id"])
+    audit = _audit_dir(root, audit_id)
     current = {
         "files": _sealed_hashes(root),
         "mutants": {f"mutants/{p.name}": _sha256(p) for p in sorted((audit / "mutants").glob("*.patch"))},
@@ -338,9 +363,10 @@ def run(
     if (audit / "results.json").exists():
         raise AuditError(f"{audit_id} has already run; a re-run needs its own freeze")
     sealed = _read_json(audit / "freeze.json")
-    verify(root, sealed)
+    verify(root, sealed, audit_id)
+    commit = _sealed_commit(root, sealed)
     archive = subprocess.run(
-        ["git", "archive", "--format=tar", sealed["commit"]], cwd=root, check=True, capture_output=True
+        ["git", "archive", "--format=tar", "--end-of-options", commit], cwd=root, check=True, capture_output=True
     ).stdout
     mutants = _load_mutants(audit, tuple(sealed["scope"]))
 
@@ -370,7 +396,7 @@ def run(
         if after_each is not None:
             after_each(mutant_id)
         try:
-            verify(root, sealed)
+            verify(root, sealed, audit_id)
         except FreezeMismatch as exc:
             raise AuditAborted(f"aborted after {mutant_id}: {exc}") from exc
 

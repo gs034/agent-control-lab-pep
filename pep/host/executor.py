@@ -36,6 +36,7 @@ import resource
 import signal
 import socket
 import threading
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -194,6 +195,18 @@ class ExecutorNursery:
                 self._discard(session_id, worker)
             raise
 
+    def abort_calls(self) -> None:
+        """Stop every session worker so a call blocked on one returns now.
+
+        Used on shutdown before the decision log drains. The nursery stays
+        open; a later call gets a fresh worker.
+        """
+        with self._lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+        for worker in workers:
+            worker.close()
+
     def release(self, session_id: int) -> None:
         """Stop the worker that belonged to a session that has gone away."""
         with self._lock:
@@ -302,10 +315,13 @@ class _Worker:
         with self._lock:
             if self._closed:
                 raise ToolExecutionError("error")
+            # One deadline for the whole call, not a fresh window per recv:
+            # a worker that drips bytes is cut off at call_timeout.
+            deadline = time.monotonic() + self._timeout
             self._conn.settimeout(self._timeout)
             try:
                 _write_frame(self._conn, {"tool_name": tool_name, "args": dict(args)})
-                reply = _read_frame(self._conn)
+                reply = _read_frame(self._conn, deadline=deadline)
             except TimeoutError as exc:
                 self.close()
                 raise ToolExecutionError("timeout") from exc
@@ -625,12 +641,12 @@ def _encode_frame(payload: Mapping[str, Any]) -> bytes:
     return len(body).to_bytes(4, "big") + body
 
 
-def _read_frame(conn: socket.socket) -> dict[str, Any] | None:
-    header = _read_exact(conn, 4)
+def _read_frame(conn: socket.socket, *, deadline: float | None = None) -> dict[str, Any] | None:
+    header = _read_exact(conn, 4, deadline=deadline)
     if header is None:
         return None
     size = _frame_size(header)
-    body = _read_exact(conn, size)
+    body = _read_exact(conn, size, deadline=deadline)
     if body is None:
         raise ToolExecutionError("error")
     return _decode_body(body)
@@ -661,9 +677,15 @@ def _decode_body(body: bytes) -> dict[str, Any]:
     return parsed
 
 
-def _read_exact(conn: socket.socket, size: int) -> bytes | None:
+def _read_exact(conn: socket.socket, size: int, *, deadline: float | None = None) -> bytes | None:
+    """Read ``size`` bytes. With ``deadline`` (monotonic), the whole read is bounded by it."""
     chunks = bytearray()
     while len(chunks) < size:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("tool call deadline passed")
+            conn.settimeout(remaining)
         try:
             block = conn.recv(size - len(chunks))
         except TimeoutError:
