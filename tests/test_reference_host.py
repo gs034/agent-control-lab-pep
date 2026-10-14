@@ -2303,3 +2303,26 @@ def test_shutdown_does_not_wait_for_ever_on_a_blocked_tool_call(tmp_path: Path):
         assert box["reply"]["decision"] == "DENY"
     finally:
         host.close()
+
+
+def test_shutdown_abort_refuses_calls_that_had_not_reached_a_worker(tmp_path: Path):
+    calls: list[str] = []
+
+    def registered(_args: dict) -> dict:
+        calls.append("ran")
+        return {"pong": "ok"}
+
+    host = _host(tmp_path, registry={"echo.ping": registered})
+    try:
+        session = host.open_session(_peer(uid=_agent_uid()))
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+        nursery = host._executors
+        assert nursery._spare is not None
+        nursery.abort_calls()
+        assert nursery._spare is None
+        decision = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        assert decision["decision"] == "DENY"
+        assert decision["reason_code"] == "tool_failed"
+        assert calls == []
+    finally:
+        host.close()

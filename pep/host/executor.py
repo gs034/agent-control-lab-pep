@@ -140,6 +140,7 @@ class ExecutorNursery:
         self._workers: dict[int, _Worker] = {}
         self._spare: _Worker | None = None
         self._closed = False
+        self._aborting = False
 
     @classmethod
     def start(
@@ -196,16 +197,22 @@ class ExecutorNursery:
             raise
 
     def abort_calls(self) -> None:
-        """Stop every session worker so a call blocked on one returns now.
+        """Stop every worker and refuse new calls, so in-flight calls return now.
 
-        Used on shutdown before the decision log drains. The nursery stays
-        open; a later call gets a fresh worker.
+        Used on shutdown before the decision log drains. After this no call
+        gets a worker: one that had not reached its worker yet is refused, and
+        the spare is closed, so no tool call can start and outlast the drain.
         """
         with self._lock:
+            self._aborting = True
             workers = list(self._workers.values())
             self._workers.clear()
+            spare = self._spare
+            self._spare = None
         for worker in workers:
             worker.close()
+        if spare is not None:
+            spare.close()
 
     def release(self, session_id: int) -> None:
         """Stop the worker that belonged to a session that has gone away."""
@@ -239,7 +246,7 @@ class ExecutorNursery:
 
     def _worker_for(self, session_id: int) -> _Worker:
         with self._lock:
-            if self._closed:
+            if self._closed or self._aborting:
                 raise ToolExecutionError("error")
             current = self._workers.get(session_id)
             if current is not None and not current.closed:

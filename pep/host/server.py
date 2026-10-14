@@ -1477,10 +1477,15 @@ class ReferenceHost:
     def _shutdown_log(self) -> None:
         """Drain in-flight denials, write a held count, then close the log.
 
-        Safe to call twice. A denial that has already entered the host is
-        counted before the snapshot. The file is closed only after that
-        write. A denial that starts later still returns DENY to its caller
-        and is not appended, because the file is already closed.
+        Safe to call twice. In-flight tool calls are stopped before this runs
+        (``serve_forever`` aborts the executor), and the wait for in-flight
+        decisions is bounded by ``SHUTDOWN_DRAIN_SECONDS``. A denial that has
+        already entered the host and finishes within that bound is counted
+        before the snapshot. One still in flight when the bound passes (an
+        in-process registry tool that does not return) is not counted in the
+        held summary. The file is closed only after the summary write. A
+        denial that starts later still returns DENY to its caller and is not
+        appended, because the file is already closed.
         """
         close_file = False
         with self._lock:
