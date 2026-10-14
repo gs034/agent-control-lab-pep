@@ -2182,3 +2182,124 @@ def test_held_connection_close_clears_the_buffer_and_keeps_the_reason():
     assert held._buf == b""
     assert held._sock is None
     assert held.call("echo.ping", ARGS)["reason_detail"] == reply["reason_detail"]
+
+
+def test_newline_flood_from_a_peer_that_never_reads_releases_the_slot(tmp_path: Path):
+    host = _listen(tmp_path, max_connections=1, connection_deadline=2, idle_timeout=0.5)
+    flood = _connect(host.socket_path)
+    again: socket.socket | None = None
+    try:
+        _wait_sessions(host, 1)
+        flood.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        flood.sendall(b"\n" * 4096)
+        # Bound: the deadline plus one in-flight request and one blocked send.
+        bound = time.monotonic() + 2 + 0.5 + 3
+        while time.monotonic() < bound and host.sessions():
+            time.sleep(0.05)
+        assert host.sessions() == ()
+        again = _connect(host.socket_path)
+        _wait_sessions(host, 1)
+        _send(again, {"tool_name": "echo.ping", "args": ARGS})
+        reply = _recv(again)
+        assert reply["reason_code"] != "connection_limit"
+    finally:
+        flood.close()
+        if again is not None:
+            again.close()
+        host.close()
+
+
+def test_deadline_is_checked_between_lines_of_one_chunk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    clock = _Mono()
+    host = _listen(tmp_path, monotonic=clock, connection_deadline=10, idle_timeout=30)
+    real = host.handle_request
+    handled = {"n": 0}
+
+    def _counting(line, session):  # type: ignore[no-untyped-def]
+        handled["n"] += 1
+        clock.now = 10
+        return real(line, session)
+
+    monkeypatch.setattr(host, "handle_request", _counting)
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        client.sendall(b"\n" * 50)
+        first = _recv(client)
+        assert first["reason_code"] == "envelope_invalid"
+        deadline = time.time() + 2
+        while time.time() < deadline and host.sessions():
+            time.sleep(0.01)
+        assert host.sessions() == ()
+        assert handled["n"] == 1
+        assert any(record["reason_code"] == "connection_deadline" for record in host.decision_records())
+    finally:
+        client.close()
+        host.close()
+
+
+def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
+    from pep.host.executor import ToolExecutionError, _Worker
+
+    gate, worker_end = socket.socketpair()
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    stop = threading.Event()
+
+    def drip() -> None:
+        try:
+            worker_end.recv(65536)
+            worker_end.sendall((1_000_000).to_bytes(4, "big"))
+            while not stop.is_set():
+                worker_end.sendall(b" ")
+                time.sleep(0.05)
+        except OSError:
+            return
+
+    thread = threading.Thread(target=drip, daemon=True)
+    thread.start()
+    worker = _Worker(dummy.pid, gate, call_timeout=0.5)
+    started = time.monotonic()
+    try:
+        with pytest.raises(ToolExecutionError, match="timeout"):
+            worker.call("echo.ping", ARGS)
+        assert time.monotonic() - started < 2
+        assert worker.closed
+        assert dummy.wait(timeout=5) is not None
+    finally:
+        stop.set()
+        worker_end.close()
+        worker.close()
+        thread.join(timeout=2)
+
+
+def test_shutdown_does_not_wait_for_ever_on_a_blocked_tool_call(tmp_path: Path):
+    def registered(args: dict) -> dict:
+        if args.get("message") == "hang":
+            time.sleep(20)
+        return {"pong": "ok"}
+
+    (tmp_path / "sock").mkdir()
+    os.chmod(tmp_path / "sock", 0o2750)
+    host = _host(tmp_path, registry={"echo.ping": registered}, tool_timeout=30.0, allowed_uids=frozenset({_agent_uid()}))
+    serving = host.serve_in_background()
+    session = host.open_session(_peer(uid=_agent_uid()))
+    host.issue_session_approval(session, tool_name="echo.ping", args={"message": "hang"}, ttl_seconds=60)
+    box: dict[str, Any] = {}
+    caller = threading.Thread(
+        target=lambda: box.setdefault(
+            "reply", host.handle_request({"tool_name": "echo.ping", "args": {"message": "hang"}}, session)
+        ),
+        daemon=True,
+    )
+    caller.start()
+    try:
+        time.sleep(0.3)
+        started = time.monotonic()
+        host.request_stop()
+        serving.join(timeout=5)
+        assert not serving.is_alive()
+        assert time.monotonic() - started < 5
+        caller.join(timeout=2)
+        assert box["reply"]["decision"] == "DENY"
+    finally:
+        host.close()

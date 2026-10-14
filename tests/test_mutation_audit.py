@@ -680,3 +680,78 @@ def test_cli_freeze_takes_the_scope(tmp_path):
     assert not (root / "audits" / "C1" / "freeze.json").exists()
     assert ma.main(["freeze", "C1", "--reviewer", "person", "--scope", "toy/calc.py", "--root", str(root)]) == 0
     assert ma._read_json(root / "audits" / "C1" / "freeze.json")["scope"] == ["toy/calc.py"]
+
+
+def _rewrite_seal(root: Path, directory: str, **changes) -> None:
+    import json
+
+    path = root / "audits" / directory / "freeze.json"
+    record = json.loads(path.read_text())
+    record.update(changes)
+    path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+@pytest.mark.parametrize(
+    "commit",
+    [
+        "--remote=git://127.0.0.1:9/x",
+        "--output=OUTPUT-PLANTED",
+        "-o.git/HEAD",
+        "HEAD",
+        "deadbeef",
+        "0" * 40,
+        "A" * 40,
+    ],
+)
+def test_run_refuses_a_hand_written_seal_commit_before_git_archive(tmp_path, monkeypatch, commit):
+    root = _toy(tmp_path)
+    _mutant(root, "B1", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "B1", commit_seal=False)
+    _rewrite_seal(root, "B1", commit=commit)
+    _git(root, "add", "audits/B1")
+    _git(root, "commit", "-q", "-m", "hand-written seal")
+    head_before = (root / ".git" / "HEAD").read_bytes()
+    archives = []
+    real_run = subprocess.run
+
+    def _spy(argv, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if list(argv[:2]) == ["git", "archive"]:
+            archives.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ma.subprocess, "run", _spy)
+    with pytest.raises(ma.FreezeMismatch, match="seal's commit"):
+        ma.run("B1", root=root)
+    assert archives == []
+    assert not (root / "OUTPUT-PLANTED").exists()
+    assert (root / ".git" / "HEAD").read_bytes() == head_before
+
+
+def test_run_refuses_a_seal_that_names_another_audit(tmp_path):
+    root = _toy(tmp_path)
+    _mutant(root, "B2", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "B2")
+    _mutant(root, "B3", "M01", CALC, CALC.replace("return a + b", "return a * b"))
+    _freeze(root, "B3", commit_seal=False)
+    _rewrite_seal(root, "B3", audit_id="B2")
+    _git(root, "add", "audits/B3")
+    _git(root, "commit", "-q", "-m", "seal that points at B2")
+    with pytest.raises(ma.FreezeMismatch, match="names audit 'B2', not 'B3'"):
+        ma.run("B3", root=root)
+
+
+def test_run_passes_the_seal_commit_after_end_of_options(tmp_path, monkeypatch):
+    root = _toy(tmp_path)
+    _mutant(root, "B4", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    sealed = _freeze(root, "B4")
+    archives = []
+    real_run = subprocess.run
+
+    def _spy(argv, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if list(argv[:2]) == ["git", "archive"]:
+            archives.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(ma.subprocess, "run", _spy)
+    ma.run("B4", root=root)
+    assert archives == [["git", "archive", "--format=tar", "--end-of-options", sealed["commit"]]]
