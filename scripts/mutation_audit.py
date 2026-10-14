@@ -18,9 +18,12 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 import re
+import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -45,6 +48,17 @@ MODULE = "<module>"
 ANY_CODE = "*"
 _MUTANT_NAME = re.compile(r"M\d{2}\.patch")
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# Everything committed under audits/<id>/ is input from a pull request. These
+# are the names the harness writes there, and the files it reads.
+_OUTPUTS = ("freeze.json", "results.json", "results.md")
+_INPUTS = ("equivalent.json",)
+_AUDIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_PACKAGE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_PYTHON = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# C0, DEL, C1 and the Unicode line and paragraph separators.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+MAX_SEAL_TEXT = 256
 _NOT_IN_PLACE = (
     "rename ", "copy ", "old mode ", "new mode ", "new file mode ", "deleted file mode ",
     "similarity index ", "dissimilarity index ", "Binary files ", "GIT binary patch",
@@ -268,7 +282,8 @@ def freeze(
     if reviewer not in REVIEWER_CLASSES:
         raise AuditError(f"reviewer must be one of {', '.join(REVIEWER_CLASSES)}")
     audit = _audit_dir(root, audit_id)
-    if (audit / "freeze.json").exists():
+    _check_audit_tree(audit)
+    if os.path.lexists(audit / "freeze.json"):
         raise AuditError(f"{audit_id} is already frozen")
     sha = _git(root, "rev-parse", "--verify", f"{commit}^{{commit}}").strip()
     drift = _git(root, "diff", "--name-only", sha, "--", "tests", "pyproject.toml").split()
@@ -276,9 +291,12 @@ def freeze(
         raise AuditError(f"tests differ from {sha[:7]}: {', '.join(drift)}")
     _refuse_untracked_tests(root)
     mutants = _load_mutants(audit, scope)
-    mutant_hashes = {f"mutants/{m}.patch": _sha256(audit / "mutants" / f"{m}.patch") for m in mutants}
+    mutant_hashes = {f"mutants/{m}.patch": _sha256_of(_read_regular(audit / "mutants" / f"{m}.patch")) for m in mutants}
     if repair_of is not None:
-        original = _read_json(_audit_dir(root, repair_of) / "freeze.json")
+        original_dir = _audit_dir(root, repair_of)
+        _check_audit_tree(original_dir)
+        original = _read_json(original_dir / "freeze.json")
+        _check_seal(original, AuditError)
         if original["mutants"] != mutant_hashes:
             raise AuditError(f"a repair re-run uses the same sealed mutants as {repair_of}")
     record = {
@@ -293,7 +311,9 @@ def freeze(
         "scope": list(scope),
         "timeout_seconds": timeout,
     }
-    _write_json(audit / "freeze.json", record)
+    # The seal run reads back must pass the same checks, so freeze never writes one run would refuse.
+    _check_seal(record, AuditError)
+    _write_json(audit, "freeze.json", record)
     return record
 
 
@@ -367,6 +387,7 @@ def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
     audit_id = sealed.get("audit_id") if audit_id is None else audit_id
     if not isinstance(audit_id, str) or sealed.get("audit_id") != audit_id:
         raise FreezeMismatch(f"the seal names audit {sealed.get('audit_id')!r}, not {audit_id!r}")
+    _check_seal(sealed)
     _refuse_shallow(root, FreezeMismatch)
     _sealed_commit(root, sealed)
     if _python_version().rsplit(".", 1)[0] != sealed["python"].rsplit(".", 1)[0]:
@@ -382,9 +403,13 @@ def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
     _require_reviewed_commit(root, sealed["commit"], history[0])
     _refuse_untracked_tests(root, FreezeMismatch)
     audit = _audit_dir(root, audit_id)
+    _check_audit_tree(audit, FreezeMismatch)
     current = {
         "files": _sealed_hashes(root),
-        "mutants": {f"mutants/{p.name}": _sha256(p) for p in sorted((audit / "mutants").glob("*.patch"))},
+        "mutants": {
+            f"mutants/{p.name}": _sha256_of(_read_regular(p, FreezeMismatch))
+            for p in sorted((audit / "mutants").glob("*.patch"))
+        },
     }
     drifted = sorted(
         path
@@ -403,9 +428,10 @@ def run(
     after_each: Callable[[str], None] | None = None,
 ) -> dict:
     audit = _audit_dir(root, audit_id)
-    if not (audit / "freeze.json").exists():
+    _check_audit_tree(audit)
+    if not os.path.lexists(audit / "freeze.json"):
         raise AuditError(f"{audit_id} is not frozen")
-    if (audit / "results.json").exists():
+    if os.path.lexists(audit / "results.json"):
         raise AuditError(f"{audit_id} has already run; a re-run needs its own freeze")
     sealed = _read_json(audit / "freeze.json")
     verify(root, sealed, audit_id)
@@ -463,15 +489,17 @@ def run(
         "summary": summarise(rows),
         "timeout_seconds": sealed["timeout_seconds"],
     }
-    _write_json(audit / "results.json", results)
-    (audit / "results.md").write_text(render(results, _equivalents(audit)), encoding="utf-8")
+    text = render(results, _equivalents(audit))
+    _write_json(audit, "results.json", results)
+    _write_in_audit(audit, "results.md", text)
     return results
 
 
 def report(audit_id: str, *, root: Path = ROOT) -> str:
     audit = _audit_dir(root, audit_id)
+    _check_audit_tree(audit)
     text = render(_read_json(audit / "results.json"), _equivalents(audit))
-    (audit / "results.md").write_text(text, encoding="utf-8")
+    _write_in_audit(audit, "results.md", text)
     return text
 
 
@@ -492,6 +520,7 @@ def summarise(rows: list[dict], equivalent: set[str] | frozenset[str] = frozense
 
 
 def render(results: dict, equivalents: dict[str, dict]) -> str:
+    _check_rendered(results, equivalents)
     rows = results["mutants"]
     by_id = {r["id"]: r for r in rows}
     signed = {m for m, e in equivalents.items() if str(e.get("signed_off_by", "")).strip()}
@@ -729,7 +758,7 @@ def _load_mutants(audit: Path, scope: tuple[str, ...]) -> dict[str, Mutant]:
     for path in paths:
         if not _MUTANT_NAME.fullmatch(path.name):
             raise AuditError(f"mutant files are named Mnn.patch: {path.name}")
-        mutant = parse_mutant(path.stem, path.read_text(encoding="utf-8"))
+        mutant = parse_mutant(path.stem, _read_regular(path).decode("utf-8"))
         if mutant.target not in scope:
             raise AuditError(f"{path.stem} mutates {mutant.target}, outside the scope {', '.join(scope)}")
         mutants[path.stem] = mutant
@@ -751,13 +780,183 @@ def _refuse_untracked_tests(root: Path, error: type[AuditError] = AuditError) ->
 
 def _equivalents(audit: Path) -> dict[str, dict]:
     path = audit / "equivalent.json"
-    return _read_json(path) if path.exists() else {}
+    return _read_json(path) if os.path.lexists(path) else {}
 
 
 def _audit_dir(root: Path, audit_id: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", audit_id):
+    if not _AUDIT_ID.fullmatch(audit_id):
         raise AuditError(f"bad audit id: {audit_id!r}")
     return root / "audits" / audit_id
+
+
+def _check_audit_tree(audit: Path, error: type[AuditError] = AuditError) -> None:
+    """Refuse ``audits/<id>/`` unless it, and every entry the harness reads or writes there, is plain.
+
+    A pull request can commit a symlink, and a local checkout can hold a FIFO
+    or a hard link. ``audits/``, the audit directory and ``mutants/`` must be
+    real directories. Each output and input name, when present, and each file
+    in ``mutants/`` must be a regular file with one link. A missing directory
+    is not refused here; the caller reports what is missing.
+    """
+    rel = f"audits/{audit.name}"
+    mutants = audit / "mutants"
+    for directory, label in ((audit.parent, "audits"), (audit, rel), (mutants, f"{rel}/mutants")):
+        try:
+            info = os.lstat(directory)
+        except FileNotFoundError:
+            break
+        if not stat.S_ISDIR(info.st_mode):
+            raise error(f"{label} is not a directory (a symlink or special file is refused)")
+    for name in (*_OUTPUTS, *_INPUTS):
+        _check_entry(audit / name, f"{rel}/{name}", error)
+    try:
+        entries = sorted(os.listdir(mutants))
+    except (FileNotFoundError, NotADirectoryError):
+        entries = []
+    for entry in entries:
+        _check_entry(mutants / entry, f"{rel}/mutants/{entry}", error)
+
+
+def _check_entry(path: Path, label: str, error: type[AuditError]) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise error(f"{label} is not a regular file (a symlink or special file is refused)")
+    if info.st_nlink > 1:
+        raise error(f"{label} has {info.st_nlink} hard links; the harness reads and replaces only single-link files")
+
+
+def _seal_text(value: object, limit: int = MAX_SEAL_TEXT) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= limit and not _CONTROL.search(value)
+
+
+def _check_seal(sealed: object, error: type[AuditError] = FreezeMismatch) -> None:
+    """A committed seal is input. Refuse any field the harness uses or renders that freeze would not write.
+
+    ``commit`` is checked by ``_sealed_commit``. Messages name the field, not
+    its value, so a crafted value is not echoed.
+    """
+    if not isinstance(sealed, dict):
+        raise error("the seal is not a JSON object")
+    if sealed.get("reviewer") not in REVIEWER_CLASSES:
+        raise error(f"the seal's reviewer must be one of {', '.join(REVIEWER_CLASSES)}")
+    if not isinstance(sealed.get("audit_id"), str) or not _AUDIT_ID.fullmatch(sealed["audit_id"]):
+        raise error("the seal's audit_id is not an audit id")
+    repair_of = sealed.get("repair_of")
+    if repair_of is not None and (not isinstance(repair_of, str) or not _AUDIT_ID.fullmatch(repair_of)):
+        raise error("the seal's repair_of is not an audit id")
+    if not isinstance(sealed.get("python"), str) or not _PYTHON.fullmatch(sealed["python"]):
+        raise error("the seal's python is not a version like 3.12.1")
+    if not isinstance(sealed.get("package"), str) or not _PACKAGE.fullmatch(sealed["package"]):
+        raise error("the seal's package is not a dotted Python name")
+    timeout = sealed.get("timeout_seconds")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise error("the seal's timeout_seconds is not a positive number")
+    scope = sealed.get("scope")
+    if not isinstance(scope, list) or not scope or not all(_seal_text(path) for path in scope):
+        raise error(f"the seal's scope must list single-line paths of at most {MAX_SEAL_TEXT} characters")
+    for key in ("files", "mutants"):
+        table = sealed.get(key)
+        if not isinstance(table, dict) or not all(
+            _seal_text(path) and isinstance(digest, str) and _DIGEST.fullmatch(digest) for path, digest in table.items()
+        ):
+            raise error(f"the seal's {key} must map single-line paths to sha256 digests")
+
+
+def _check_rendered(results: dict, equivalents: dict[str, dict]) -> None:
+    """``results.json`` and ``equivalent.json`` can be committed too. Refuse a header or note that is not one line."""
+    if results.get("reviewer") not in REVIEWER_CLASSES:
+        raise AuditError(f"the results' reviewer must be one of {', '.join(REVIEWER_CLASSES)}")
+    for key in ("audit_id", "commit", "python"):
+        if not _seal_text(results.get(key)):
+            raise AuditError(f"the results' {key} is not a single line of at most {MAX_SEAL_TEXT} characters")
+    if results.get("repair_of") is not None and not _seal_text(results["repair_of"]):
+        raise AuditError(f"the results' repair_of is not a single line of at most {MAX_SEAL_TEXT} characters")
+    timeout = results.get("timeout_seconds")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise AuditError("the results' timeout_seconds is not a number")
+    for row in results.get("mutants", []):
+        for key in ("id", "file", "intent", "property", "outcome"):
+            if not isinstance(row.get(key), str) or _CONTROL.search(row[key]):
+                raise AuditError(f"a result row's {key} is not a single line")
+    for mutant_id, note in equivalents.items():
+        if not isinstance(note, dict):
+            raise AuditError(f"equivalent.json: {mutant_id!r} is not an object")
+        for key in ("signed_off_by", "argument"):
+            value = note.get(key, "")
+            if not isinstance(value, str) or _CONTROL.search(value):
+                raise AuditError(f"equivalent.json: {mutant_id!r} {key} is not a single line")
+
+
+def _read_regular(path: Path, error: type[AuditError] = AuditError) -> bytes:
+    """Read a committed file without following a link, and only if it is a regular file.
+
+    ``O_NONBLOCK`` keeps a FIFO from blocking the open; the ``fstat`` then refuses it.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise error(f"cannot read {path.name} as a regular file: {exc.strerror}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise error(f"{path.name} is not a regular file")
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _write_in_audit(audit: Path, name: str, text: str) -> None:
+    """Replace ``audit/name`` through descriptors, so a link at either path cannot redirect the write.
+
+    The audit directory is opened with ``O_NOFOLLOW`` relative to an
+    ``audits/`` opened the same way. A fresh temporary name is created with
+    ``O_EXCL | O_NOFOLLOW`` in that directory, written and synced, then
+    renamed over ``name``. A rename replaces a link; it never writes through it.
+    """
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent = os.open(audit.parent, dir_flags)
+        try:
+            dir_fd = os.open(audit.name, dir_flags, dir_fd=parent)
+        finally:
+            os.close(parent)
+    except OSError as exc:
+        raise AuditError(f"audits/{audit.name} is not a directory the harness can write: {exc.strerror}") from exc
+    try:
+        try:
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is not None and (not stat.S_ISREG(info.st_mode) or info.st_nlink > 1):
+            raise AuditError(f"audits/{audit.name}/{name} is not a single-link regular file; refusing to replace it")
+        tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o666,
+            dir_fd=dir_fd,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(text.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _rate(killed: int, total: int) -> str:
@@ -822,7 +1021,11 @@ def _git(root: Path, *args: str) -> str:
 
 
 def _sha256(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    return _sha256_of(path.read_bytes())
+
+
+def _sha256_of(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 def _python_version() -> str:
@@ -830,11 +1033,11 @@ def _python_version() -> str:
 
 
 def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(_read_regular(path).decode("utf-8"))
 
 
-def _write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def _write_json(audit: Path, name: str, data: dict) -> None:
+    _write_in_audit(audit, name, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
