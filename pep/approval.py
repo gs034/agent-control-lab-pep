@@ -85,6 +85,9 @@ class ApprovalRecord:
     principal: str | None = None
     # ADR-0004: optional digest of the implementation resolved at mint.
     implementation_digest: str | None = None
+    # ADR-0011: set by the operator's revoke or by kill. A revoked grant can
+    # never be consumed; the mark is not cleared by resume.
+    revoked_at: datetime | None = None
 
     def covers(self, tool_name: str) -> bool:
         return tool_name in self.tools
@@ -104,6 +107,13 @@ class ApprovalRecord:
 
     def consumed(self) -> bool:
         return self.consumed_at is not None
+
+    def revoked(self) -> bool:
+        return self.revoked_at is not None
+
+    def outstanding(self) -> bool:
+        """Still spendable as far as this record knows: neither consumed nor revoked."""
+        return not self.consumed() and not self.revoked()
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +298,8 @@ class ApprovalStore:
             failed = _principal_failure(record.principal, principal, envelope_identity)
             if failed is not None:
                 return ConsumeResult(ReasonCode.APPROVAL_PRINCIPAL_MISMATCH, failed)
+            if record.revoked():
+                return ConsumeResult(ReasonCode.APPROVAL_REVOKED, "grant revoked before it was spent")
             if record.consumed():
                 return ConsumeResult(ReasonCode.APPROVAL_CONSUMED)
             if record.expired(clock):
@@ -324,6 +336,42 @@ class ApprovalStore:
                 frozen_state_digest=record.state_digest,
                 frozen_implementation_digest=record.implementation_digest,
             )
+
+    def revoke(self, approval_id: str, now: datetime | None = None) -> bool:
+        """Revoke one outstanding grant (ADR-0011).
+
+        Returns True when a grant that was neither consumed nor revoked is now
+        revoked. An unknown id, a spent grant and an already revoked grant
+        return False and change nothing. Revocation is not undone by resume.
+        """
+        self._refuse_reentry()
+        clock = _aware(now)
+        with self._lock:
+            record = self._records.get(approval_id)
+            if record is None or not record.outstanding():
+                return False
+            self._records[approval_id] = replace(record, revoked_at=clock)
+            return True
+
+    def revoke_all(self, *, principal: str | None = None, now: datetime | None = None) -> int:
+        """Revoke every outstanding grant, or only those bound to ``principal``.
+
+        Returns how many grants this call revoked. Spent and already revoked
+        grants are left as they are. ``PepRuntime.kill`` calls this with no
+        principal, so a kill leaves no spendable grant behind it.
+        """
+        self._refuse_reentry()
+        clock = _aware(now)
+        count = 0
+        with self._lock:
+            for approval_id, record in list(self._records.items()):
+                if not record.outstanding():
+                    continue
+                if principal is not None and record.principal != principal:
+                    continue
+                self._records[approval_id] = replace(record, revoked_at=clock)
+                count += 1
+        return count
 
     def _implementation_failure(
         self, frozen: str, observe: Callable[[], object] | None

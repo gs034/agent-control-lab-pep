@@ -34,6 +34,9 @@ class ReasonCode(StrEnum):
     # The grant froze an implementation digest and the host-observed
     # implementation is missing, unreadable or different (ADR-0004).
     APPROVAL_IMPLEMENTATION_MISMATCH = "approval_implementation_mismatch"
+    # The grant was revoked by the operator, or by kill, before it was spent
+    # (ADR-0011). Distinct from consumed and from expired.
+    APPROVAL_REVOKED = "approval_revoked"
     ENVELOPE_INVALID = "envelope_invalid"
     # Exact Deep Research receipt code for the official eval row.
     TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY = "TOOL_NOT_ALLOWLISTED_AND_NO_CAPABILITY"
