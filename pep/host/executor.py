@@ -33,6 +33,7 @@ import ctypes
 import json
 import os
 import resource
+import select
 import signal
 import socket
 import threading
@@ -79,7 +80,18 @@ _X86_64_ALLOWED = (
 _AUDIT_ARCH_X86_64 = 0xC000003E
 _X32_SYSCALL_BIT = 0x40000000
 
-_MAX_FRAME = 16 * 1024 * 1024
+# One frame either way. A request frame carries arguments the gate already
+# held to 64KiB (``MAX_REQUEST_BYTES``), and the reference client refuses a
+# reply line over that size, so a legitimate result is under 64KiB. 256KiB
+# leaves room for JSON escaping and the reply envelope. It also bounds what a
+# compromised worker can make the gate hold: the frame, and the objects
+# ``json.loads`` builds from it (at most about 25 times the frame for a body
+# of empty lists). The earlier 16MiB limit let one reply cost the gate about
+# 400MB in decoded objects.
+_MAX_FRAME = 256 * 1024
+# Per call the gate reads from the worker one 4-byte header and one body of
+# at most ``_MAX_FRAME`` bytes. That is the whole per-call budget: a worker
+# that sends a second frame, or anything between calls, is discarded.
 _HANDSHAKE_SECONDS = 5.0
 DEFAULT_CALL_TIMEOUT_SECONDS = 5.0
 
@@ -330,12 +342,25 @@ class _Worker:
             deadline = time.monotonic() + self._timeout
             self._conn.settimeout(self._timeout)
             try:
+                if _bytes_pending(self._conn):
+                    # The worker spoke between calls. A reply read now could
+                    # be one it queued earlier, not the answer to this call.
+                    raise ToolExecutionError("protocol")
                 _write_frame(self._conn, {"tool_name": tool_name, "args": dict(args)})
                 reply = _read_frame(self._conn, deadline=deadline)
+                if _bytes_pending(self._conn):
+                    # A second frame. The budget is one reply per call.
+                    raise ToolExecutionError("protocol")
             except TimeoutError as exc:
                 self.close()
                 raise ToolExecutionError("timeout") from exc
-            except (OSError, ValueError, ToolExecutionError) as exc:
+            except ToolExecutionError as exc:
+                # Over budget, or more than one frame: the worker is not
+                # trusted for another call. Discard it as on any error.
+                self.close()
+                kind = exc.kind if exc.kind in {"oversize", "protocol"} else "error"
+                raise ToolExecutionError(kind) from exc
+            except (OSError, ValueError, RecursionError) as exc:
                 self.close()
                 raise ToolExecutionError("error") from exc
         if not isinstance(reply, dict):
@@ -348,6 +373,8 @@ class _Worker:
             return UnencodableResult()
         if status == "permission":
             raise ToolExecutionError("permission")
+        if status == "oversize":
+            raise ToolExecutionError("oversize")
         raise ToolExecutionError("error")
 
     def close(self) -> None:
@@ -480,7 +507,13 @@ def _run_tool(registry: Mapping[str, Any], message: Mapping[str, Any]) -> dict[s
         parsed = json.loads(encoded)
     except (TypeError, ValueError, RecursionError):
         return {"status": "unencodable"}
-    return {"status": "ok", "result": parsed}
+    reply = {"status": "ok", "result": parsed}
+    try:
+        _encode_frame(reply)
+    except ToolExecutionError:
+        # Too large for one reply frame. Say so rather than send it.
+        return {"status": "oversize"}
+    return reply
 
 
 def _drop_inherited_fds(keep: int) -> None:
@@ -675,13 +708,37 @@ def _read_fd(fd: int) -> dict[str, Any] | None:
 
 def _frame_size(header: bytes) -> int:
     size = int.from_bytes(header, "big")
-    if size < 1 or size > _MAX_FRAME:
+    if size < 1:
         raise ToolExecutionError("error")
+    if size > _MAX_FRAME:
+        # Refused from the header, before any of the body is read.
+        raise ToolExecutionError("oversize")
     return size
 
 
+def _bytes_pending(conn: socket.socket) -> bool:
+    """True when the peer has sent bytes nobody asked for yet. Does not block.
+
+    A socket with a timeout waits for readability inside ``recv`` whatever
+    the flags, so readiness is polled first with a zero timeout.
+    """
+    poller = select.poll()
+    poller.register(conn.fileno(), select.POLLIN)
+    try:
+        if not poller.poll(0):
+            return False
+        peeked = conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+    except OSError:
+        return False
+    return bool(peeked)
+
+
 def _decode_body(body: bytes) -> dict[str, Any]:
-    parsed = json.loads(body.decode("utf-8"))
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except RecursionError as exc:
+        # Deep nesting inside one frame. Not a reply the gate will use.
+        raise ToolExecutionError("error") from exc
     if not isinstance(parsed, dict):
         raise ToolExecutionError("error")
     return parsed

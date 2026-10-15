@@ -1425,6 +1425,56 @@ def test_suspended_halt_at_startup_is_not_latched(tmp_path: Path):
     assert allowed["decision"] == "ALLOW"
 
 
+def test_gate_resume_rewrite_does_not_lose_a_concurrent_kill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """P-5: ``pep.host kill`` lands between the gate's resume read and its rename."""
+    import pep.halt as halt_module
+    from pep.host.haltfile import write_killed
+
+    halt = tmp_path / "halt.json"
+    HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+    host = ReferenceHost(
+        halt_path=halt,
+        log_path=tmp_path / "decisions.log",
+        registry={"echo.ping": lambda _args: {"pong": "ok"}},
+    )
+    session = host.open_session(_peer())
+    for _ in range(3):
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert denied["reason_code"] == "suspend_active"
+    HaltStore(halt).write(HaltState(mode=HaltMode.ACTIVE, available=True))
+
+    real_merge = halt_module._merge_sticky_kill
+    box: dict[str, Any] = {"armed": True}
+    landed = threading.Event()
+
+    def kill() -> None:
+        try:
+            write_killed(halt)
+        except (HaltStoreError, OSError) as exc:
+            box["error"] = exc
+        finally:
+            landed.set()
+
+    def merge_after_kill(current, requested):  # type: ignore[no-untyped-def]
+        if box.pop("armed", False):
+            box["thread"] = threading.Thread(target=kill, daemon=True)
+            box["thread"].start()
+            landed.wait(timeout=1.0)
+        return real_merge(current, requested)
+
+    monkeypatch.setattr(halt_module, "_merge_sticky_kill", merge_after_kill)
+    host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert "thread" in box, "the gate did not rewrite the halt file on resume"
+    box["thread"].join(timeout=10)
+    assert "error" not in box
+    _state, observed = read_fail_closed(halt)
+    assert observed == "killed"
+    after = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert after["decision"] == "DENY"
+    assert after["reason_code"] == "kill_active"
+
+
 def test_halt_file_vanishing_at_startup_is_not_left_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_path / "halt.json"
     init_active(path)
@@ -2248,7 +2298,7 @@ def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
     def drip() -> None:
         try:
             worker_end.recv(65536)
-            worker_end.sendall((1_000_000).to_bytes(4, "big"))
+            worker_end.sendall((200_000).to_bytes(4, "big"))
             while not stop.is_set():
                 worker_end.sendall(b" ")
                 time.sleep(0.05)
@@ -2270,6 +2320,123 @@ def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
         worker_end.close()
         worker.close()
         thread.join(timeout=2)
+
+
+def _fake_worker_call(reply: bytes) -> tuple[Any, bool, bool]:
+    """Answer one gate call with ``reply`` from a fake worker. Returns (outcome, closed, reaped)."""
+    from pep.host.executor import ToolExecutionError, _Worker
+
+    gate, worker_end = socket.socketpair()
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+    def answer() -> None:
+        try:
+            worker_end.recv(65536)
+            worker_end.sendall(reply)
+        except OSError:
+            return
+
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    worker = _Worker(dummy.pid, gate, call_timeout=5.0)
+    try:
+        try:
+            outcome: Any = worker.call("echo.ping", ARGS)
+        except ToolExecutionError as exc:
+            outcome = exc
+        thread.join(timeout=5)
+        closed = worker.closed
+        try:
+            reaped = dummy.wait(timeout=5) is not None
+        except subprocess.TimeoutExpired:
+            reaped = False
+        return outcome, closed, reaped
+    finally:
+        worker_end.close()
+        worker.close()
+        dummy.kill()
+        dummy.wait(timeout=5)
+
+
+def _frame(payload: bytes) -> bytes:
+    return len(payload).to_bytes(4, "big") + payload
+
+
+def test_a_worker_reply_over_the_frame_limit_is_refused_and_the_worker_discarded():
+    """P-4: one oversized reply frame is refused from its header; the worker is killed."""
+    from pep.host.executor import ToolExecutionError
+
+    body = json.dumps({"status": "ok", "result": "x" * (1024 * 1024)}).encode()
+    outcome, closed, reaped = _fake_worker_call(_frame(body))
+    assert isinstance(outcome, ToolExecutionError)
+    assert outcome.kind == "oversize"
+    assert closed and reaped
+
+
+def test_a_worker_that_sends_a_second_frame_is_refused_and_discarded():
+    """P-4: the per-call budget is one reply frame. A second frame is not left queued."""
+    from pep.host.executor import ToolExecutionError
+
+    one = _frame(json.dumps({"status": "ok", "result": {"pong": "hi"}}).encode())
+    outcome, closed, reaped = _fake_worker_call(one + one)
+    assert isinstance(outcome, ToolExecutionError)
+    assert outcome.kind == "protocol"
+    assert closed and reaped
+
+
+def test_a_worker_that_speaks_between_calls_is_discarded_before_the_next_call():
+    from pep.host.executor import ToolExecutionError, _Worker
+
+    gate, worker_end = socket.socketpair()
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    worker = _Worker(dummy.pid, gate, call_timeout=2.0)
+    try:
+        worker_end.sendall(_frame(json.dumps({"status": "ok", "result": {"pong": "queued"}}).encode()))
+        with pytest.raises(ToolExecutionError) as raised:
+            worker.call("echo.ping", ARGS)
+        assert raised.value.kind == "protocol"
+        assert worker.closed
+        assert dummy.wait(timeout=5) is not None
+    finally:
+        worker_end.close()
+        worker.close()
+
+
+def test_a_deeply_nested_worker_reply_fails_closed_and_discards_the_worker():
+    from pep.host.executor import ToolExecutionError
+
+    depth = 100_000
+    body = b'{"status":"ok","result":' + b"[" * depth + b"]" * depth + b"}"
+    outcome, closed, reaped = _fake_worker_call(_frame(body))
+    assert isinstance(outcome, ToolExecutionError)
+    assert outcome.kind == "error"
+    assert closed and reaped
+
+
+def test_an_honest_tool_result_over_the_frame_limit_is_denied_with_a_reason(tmp_path: Path):
+    def registered(args: dict) -> dict:
+        if args.get("message") == "big":
+            return {"pong": "x" * (300 * 1024)}
+        return {"pong": args.get("message", "")}
+
+    host = _host(tmp_path, registry={"echo.ping": registered})
+    try:
+        session = host.open_session(_peer())
+        big = {"message": "big"}
+        host.issue_session_approval(session, tool_name="echo.ping", args=big, ttl_seconds=60)
+        denied = host.handle_request({"tool_name": "echo.ping", "args": big}, session)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "tool_failed"
+        assert "frame limit" in denied["reason_detail"]
+        assert "result" not in denied
+        # The largest echo a request can carry still fits one reply frame.
+        largest = {"message": "y" * 60_000}
+        host.issue_session_approval(session, tool_name="echo.ping", args=largest, ttl_seconds=60)
+        allowed = host.handle_request({"tool_name": "echo.ping", "args": largest}, session)
+        assert allowed["decision"] == "ALLOW"
+        assert allowed["result"] == {"pong": "y" * 60_000}
+    finally:
+        host.close()
 
 
 def test_shutdown_does_not_wait_for_ever_on_a_blocked_tool_call(tmp_path: Path):
@@ -2485,3 +2652,88 @@ def test_a_decision_that_outlives_the_drain_is_counted_not_lost(tmp_path: Path, 
     assert box[0]["decision"] == "DENY"
     assert box[0]["reason_code"] == "kill_active"
     assert host.refused_after_close == 1
+
+
+# Finding P-3: an agent controls the names in its request. A denial must not
+# copy an unbounded list of them into the log, and no line may exceed the cap.
+
+
+def _log_lines(path: Path) -> list[bytes]:
+    return [line for line in path.read_bytes().split(b"\n") if line]
+
+
+def _assert_listed_keys_are_clipped(detail: str, total: int) -> None:
+    import pep.host.log as host_log
+
+    assert detail.startswith("unknown keys: ")
+    assert detail.endswith(f" (+{total - host_log.MAX_LISTED_KEYS} more)")
+    listed = detail[len("unknown keys: ") :].rsplit(" (+", 1)[0].split(", ")
+    assert len(listed) == host_log.MAX_LISTED_KEYS
+    assert all(len(name) <= host_log.MAX_KEY_CHARS for name in listed)
+
+
+def test_unknown_envelope_key_flood_is_clipped_in_the_log(tmp_path: Path):
+    import pep.host.log as host_log
+
+    host = _host(tmp_path)
+    session = host.open_session(_peer())
+    extras: dict[str, Any] = {f"k{i:05d}": 1 for i in range(4000)}
+    extras["a" + "x" * 5000] = 1
+    decision = host.handle_request({"tool_name": "echo.ping", "args": ARGS, **extras}, session)
+    assert decision["decision"] == "DENY"
+    assert decision["reason_code"] == "envelope_invalid"
+    lines = _log_lines(tmp_path / "decisions.log")
+    assert all(len(line) <= host_log.MAX_RECORD_BYTES for line in lines)
+    record = json.loads(lines[-1])
+    check = next(item for item in record["checks"] if item["name"] == "envelope_keys")
+    _assert_listed_keys_are_clipped(check["detail"], len(extras))
+    assert "truncated" not in record
+    _assert_record_claims_only_what_ran(record)
+
+
+def test_unknown_args_key_flood_is_clipped_in_the_log(tmp_path: Path):
+    import pep.host.log as host_log
+
+    host = _host(tmp_path)
+    session = host.open_session(_peer())
+    args: dict[str, Any] = {"message": "hi", **{f"arg{i:05d}" + "y" * 80: 1 for i in range(500)}}
+    decision = host.handle_request({"tool_name": "echo.ping", "args": args}, session)
+    assert decision["decision"] == "DENY"
+    assert decision["reason_code"] == "envelope_invalid"
+    lines = _log_lines(tmp_path / "decisions.log")
+    assert all(len(line) <= host_log.MAX_RECORD_BYTES for line in lines)
+    record = json.loads(lines[-1])
+    check = next(item for item in record["checks"] if item["name"] == "args_keys")
+    _assert_listed_keys_are_clipped(check["detail"], 500)
+
+
+def test_decision_log_caps_one_record_and_marks_it(tmp_path: Path):
+    import pep.host.log as host_log
+
+    path = tmp_path / "decisions.log"
+    log = DecisionLog(path)
+    small = log.append({"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r1", "checks": []})
+    assert "truncated" not in small
+
+    long_detail = {"name": "args_keys", "outcome": "deny", "detail": "z" * 50_000}
+    clipped = log.append(
+        {"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r2", "checks": [long_detail]}
+    )
+    assert clipped["truncated"].startswith("record of ")
+    assert len(clipped["checks"][0]["detail"]) == host_log.MAX_FIELD_CHARS
+
+    many = [{"name": f"c{i}", "outcome": "deny", "detail": "w" * 200} for i in range(60)]
+    flat = log.append({"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r3", "checks": many})
+    assert "check names and outcomes kept" in flat["truncated"]
+    assert flat["checks"][0] == {"name": "c0", "outcome": "deny"}
+
+    flood = [{"name": f"c{i}", "outcome": "deny"} for i in range(5000)]
+    core = log.append({"decision": "DENY", "reason_code": "envelope_invalid", "request_id": "r4", "checks": flood})
+    assert "only core fields kept" in core["truncated"]
+    assert core["decision"] == "DENY" and core["reason_code"] == "envelope_invalid" and core["seq"] == 4
+
+    lines = _log_lines(path)
+    assert len(lines) == 4
+    assert all(len(line) <= host_log.MAX_RECORD_BYTES for line in lines)
+    assert log.read_records() == [small, clipped, flat, core]
+    log.close()

