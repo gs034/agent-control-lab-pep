@@ -2410,8 +2410,15 @@ def test_shutdown_race_many_callers_all_get_deny_and_the_log_closes(tmp_path: Pa
         _assert_record_claims_only_what_ran(record)
 
 
-def test_log_is_closed_even_when_aborting_the_executor_raises(tmp_path: Path):
-    """If stopping the workers raises during shutdown, the decision log is still drained and closed."""
+@pytest.mark.parametrize("abort_error", [RuntimeError, KeyboardInterrupt])
+def test_log_is_closed_even_when_aborting_the_executor_raises(
+    tmp_path: Path, abort_error: type[BaseException]
+) -> None:
+    """If stopping the workers raises during shutdown, the decision log is still drained and closed.
+
+    KeyboardInterrupt is a BaseException. It still propagates out of
+    serve_forever, and the log is closed afterwards.
+    """
     (tmp_path / "sock").mkdir()
     os.chmod(tmp_path / "sock", 0o2750)
     host = _host(tmp_path, allowed_uids=frozenset({_agent_uid()}))
@@ -2419,7 +2426,7 @@ def test_log_is_closed_even_when_aborting_the_executor_raises(tmp_path: Path):
     assert host.handle_request(b"[]", session)["reason_code"] == "envelope_invalid"
 
     def boom() -> None:
-        raise RuntimeError("worker refused to stop")
+        raise abort_error("worker refused to stop")
 
     host._executors.abort_calls = boom  # type: ignore[method-assign]
     box: list[BaseException] = []
@@ -2437,7 +2444,7 @@ def test_log_is_closed_even_when_aborting_the_executor_raises(tmp_path: Path):
         host.request_stop()
         serving.join(timeout=5)
         assert not serving.is_alive()
-        assert box and isinstance(box[0], RuntimeError)
+        assert box and isinstance(box[0], abort_error)
         assert host._log_closed
         with pytest.raises(Exception):
             host._decisions.append({"decision": "DENY", "reason_code": "probe"})
