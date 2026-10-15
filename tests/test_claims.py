@@ -40,8 +40,16 @@ def _record(request_id: str, decision: str, tool_name: str = "echo.ping", digest
     return {"decision": decision, "request_id": request_id, "tool_name": tool_name, "checks": checks}
 
 
-def _absence(tool: str = "echo.ping"):
-    return parse_claim({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": tool, "outcome": "not_called"})
+def _absence(tool: str = "echo.ping", session: str = "u1.c1"):
+    return parse_claim(
+        {
+            "schema": CLAIM_SCHEMA,
+            "kind": "absence",
+            "tool_name": tool,
+            "outcome": "not_called",
+            "session_id": session,
+        }
+    )
 
 
 def _pre_entry(request_id: str, tool: str = "echo.ping") -> dict:
@@ -144,6 +152,11 @@ def test_nan_result_is_unencodable():
         ({"schema": CLAIM_SCHEMA, "kind": "action", "request_id": "r", "tool_name": "t", "outcome": "allowed", "result_digest": "abc"}, "sha256"),
         ({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "t", "outcome": "allowed"}, "not_called"),
         ({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "t", "outcome": "not_called", "request_id": "r"}, "no request_id"),
+        ({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "t", "outcome": "not_called"}, "session_id"),
+        ({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "t", "outcome": "not_called", "session_id": ""}, "session_id"),
+        ({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "t", "outcome": "not_called", "session_id": None}, "session_id"),
+        ({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "t", "outcome": "not_called", "session_id": 1}, "session_id"),
+        ({"schema": CLAIM_SCHEMA, "kind": "action", "request_id": "r", "tool_name": "t", "outcome": "allowed", "session_id": "u1.c1"}, "no session_id"),
         ({"schema": CLAIM_SCHEMA, "kind": "belief", "tool_name": "t", "outcome": "allowed"}, "action or absence"),
     ],
 )
@@ -190,7 +203,7 @@ def test_unverifiable_is_not_consistent():
 
 def test_absence_claim_is_contradicted_by_any_allow_for_that_tool():
     claim = _absence()
-    hit = verify_claim(claim, [_record("host.1.2", "DENY"), _record("host.1.3", "ALLOW")])
+    hit = verify_claim(claim, _bounded([_record("host.1.2", "DENY"), _record("host.1.3", "ALLOW")]))
     assert (hit.verdict, hit.field) == (CONTRADICTED, "tool_name")
     assert "host.1.3" in hit.detail
 
@@ -226,16 +239,41 @@ def test_absence_is_consistent_only_inside_a_complete_session():
     assert verify_claim(claim, closed).verdict == UNVERIFIABLE
 
 
+def test_absence_checks_only_the_named_sessions_span():
+    """A finished other session is not this claim. A neighbor's call is not either.
+
+    Seq from this session's open through its close must all be present.
+    Dropping the neighbor's line leaves a gap.
+    """
+    claim = _absence(session="u1.c1")
+    other_session = _bounded([_record("host.9.1", "ALLOW")], session="u2.c2")
+    assert verify_claim(claim, other_session).verdict == UNVERIFIABLE
+
+    neighbors_call = _record("host.2.3", "ALLOW")
+    neighbors_call["session_id"] = "u2.c2"
+    neighbors_call["seq"] = 3
+    interleaved = [
+        _marker("SESSION_OPEN", "u1.c1", 1),
+        _marker("SESSION_OPEN", "u2.c2", 2),
+        neighbors_call,
+        _marker("SESSION_CLOSE", "u2.c2", 4),
+        _marker("SESSION_CLOSE", "u1.c1", 5),
+    ]
+    assert verify_claim(claim, interleaved).verdict == CONSISTENT
+    assert verify_claim(_absence(session="u2.c2"), interleaved).verdict == CONTRADICTED
+    gapped = [record for record in interleaved if record["seq"] != 3]
+    assert verify_claim(claim, gapped).verdict == UNVERIFIABLE
+
+
 def test_absence_entered_then_raised_is_contradicted():
     """PRE_ENTRY admits the call. A later DENY tool_failed with raised means it did not return."""
     claim = _absence()
-    records = [_pre_entry("host.4.1"), _tool_failed("host.4.1", "host tool raised after entry")]
+    records = _bounded([_pre_entry("host.4.1"), _tool_failed("host.4.1", "host tool raised after entry")])
     verdict = verify_claim(claim, records)
     assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
     assert "host.4.1" in verdict.detail
-    # The admission line alone is enough. The tool may not have returned.
-    assert verify_claim(claim, [_pre_entry("host.4.2")]).verdict == CONTRADICTED
-    # entered on its own is a call, including when the checks survived without the decision.
+    # The same admission outside a session span does not settle the claim.
+    assert verify_claim(claim, [_pre_entry("host.4.2")]).verdict == UNVERIFIABLE
     entered = {
         "decision": "DENY",
         "reason_code": "kill_active",
@@ -243,12 +281,12 @@ def test_absence_entered_then_raised_is_contradicted():
         "tool_name": "echo.ping",
         "checks": [{"name": "registry_tool", "outcome": "entered"}],
     }
-    assert verify_claim(claim, [entered]).verdict == CONTRADICTED
+    assert verify_claim(claim, _bounded([entered])).verdict == CONTRADICTED
 
 
 def test_absence_timeout_is_contradicted():
     claim = _absence()
-    records = [_pre_entry("host.5.1"), _tool_failed("host.5.1", "host tool timed out")]
+    records = _bounded([_pre_entry("host.5.1"), _tool_failed("host.5.1", "host tool timed out")])
     assert verify_claim(claim, records).verdict == CONTRADICTED
     # Clipping can drop the raised check and still keep reason_code tool_failed.
     clipped = {
@@ -258,15 +296,17 @@ def test_absence_timeout_is_contradicted():
         "request_id": "host.5.2",
         "tool_name": "echo.ping",
     }
-    assert verify_claim(claim, [clipped]).verdict == CONTRADICTED
+    assert verify_claim(claim, _bounded([clipped])).verdict == CONTRADICTED
 
 
 def test_absence_frame_cap_is_contradicted():
     claim = _absence()
-    records = [
-        _pre_entry("host.6.1"),
-        _tool_failed("host.6.1", "host tool reply exceeded the executor frame limit"),
-    ]
+    records = _bounded(
+        [
+            _pre_entry("host.6.1"),
+            _tool_failed("host.6.1", "host tool reply exceeded the executor frame limit"),
+        ]
+    )
     assert verify_claim(claim, records).verdict == CONTRADICTED
     # A raise recorded only as the check, with no tool_failed reason, is still a call.
     raised = {
@@ -276,12 +316,12 @@ def test_absence_frame_cap_is_contradicted():
         "tool_name": "echo.ping",
         "checks": [{"name": "registry_tool", "outcome": "raised"}],
     }
-    assert verify_claim(claim, [raised]).verdict == CONTRADICTED
+    assert verify_claim(claim, _bounded([raised])).verdict == CONTRADICTED
 
 
 def test_absence_with_no_records_is_unverifiable():
     verdict = verify_claim(_absence(), [])
-    assert (verdict.verdict, verdict.field) == (UNVERIFIABLE, "tool_name")
+    assert (verdict.verdict, verdict.field) == (UNVERIFIABLE, "session_id")
     assert verdict.verdict != CONSISTENT
 
 

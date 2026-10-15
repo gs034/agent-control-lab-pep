@@ -532,6 +532,25 @@ def _wait_sessions(host: ReferenceHost, count: int) -> None:
     raise AssertionError(f"expected {count} sessions, saw {len(host.sessions())}")
 
 
+def _records_after_session_closes(host: ReferenceHost) -> list[dict[str, Any]]:
+    """Log lines once the served connection has written open and close."""
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        if host.sessions():
+            time.sleep(0.01)
+            continue
+        try:
+            records = host.decision_records()
+        except (json.JSONDecodeError, DecisionLogError, OSError, UnicodeError):
+            time.sleep(0.01)
+            continue
+        decisions = [record.get("decision") for record in records]
+        if "SESSION_OPEN" in decisions and "SESSION_CLOSE" in decisions:
+            return records
+        time.sleep(0.01)
+    raise AssertionError("session did not close with open and close lines")
+
+
 def _send(client: socket.socket, payload: dict) -> None:
     client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
 
@@ -1937,8 +1956,17 @@ def test_host_observes_the_result_and_claims_are_checked_against_its_record(tmp_
         assert (hidden.verdict, hidden.field) == (CONTRADICTED, "outcome")
         unknown = verify_claim(claim(request_id="host.9.9"), records)
         assert unknown.verdict == UNVERIFIABLE
-        absent = parse_claim({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"})
-        assert verify_claim(absent, records).verdict == CONTRADICTED
+        # This path does not serve a socket, so the log has no session span.
+        absent = parse_claim(
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "echo.ping",
+                "outcome": "not_called",
+                "session_id": session.principal,
+            }
+        )
+        assert verify_claim(absent, records).verdict == UNVERIFIABLE
     finally:
         host.close()
 
@@ -1960,25 +1988,21 @@ def test_a_served_session_bounds_a_not_called_claim(tmp_path: Path):
         denied = _recv(client)
         assert denied["decision"] == "DENY"
         client.close()
-        deadline = time.time() + 2
-        records: list[dict[str, Any]] = []
-        while time.time() < deadline:
-            if host.sessions():
-                time.sleep(0.01)
-                continue
-            records = host.decision_records()
-            decisions = [record["decision"] for record in records]
-            if "SESSION_OPEN" in decisions and "SESSION_CLOSE" in decisions:
-                break
-            time.sleep(0.01)
-        assert host.sessions() == ()
+        records = _records_after_session_closes(host)
         assert [record["decision"] for record in records][0] == "SESSION_OPEN"
         assert records[-1]["decision"] == "SESSION_CLOSE"
-        assert records[0]["session_id"] == records[-1]["session_id"]
+        session_id = records[0]["session_id"]
+        assert records[-1]["session_id"] == session_id
         seqs = [record["seq"] for record in records]
         assert seqs == list(range(seqs[0], seqs[0] + len(seqs)))
         other = parse_claim(
-            {"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "file.read", "outcome": "not_called"}
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "file.read",
+                "outcome": "not_called",
+                "session_id": session_id,
+            }
         )
         assert verify_claim(other, records).verdict == CONSISTENT
         denial = [record for record in records if record["decision"] == "DENY"]
@@ -1986,57 +2010,89 @@ def test_a_served_session_bounds_a_not_called_claim(tmp_path: Path):
         assert verify_claim(other, denial).verdict == UNVERIFIABLE
         gapped = [records[0], records[-1]]
         assert verify_claim(other, gapped).verdict == UNVERIFIABLE
+        different = parse_claim(
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "file.read",
+                "outcome": "not_called",
+                "session_id": "u9.c9",
+            }
+        )
+        assert verify_claim(different, records).verdict == UNVERIFIABLE
     finally:
         client.close()
         host.close()
 
 
 def test_a_raised_tool_contradicts_not_called_on_the_host_log(tmp_path: Path):
-    """A tool that raises is on the host log, so not_called is contradicted."""
+    """A tool that raises is on the host log, so not_called for that session is contradicted."""
     from pep.host.claims import CLAIM_SCHEMA, CONTRADICTED, parse_claim, verify_claim
 
     def registered(_args: dict) -> dict:
         raise RuntimeError("boom")
 
-    host = _host(tmp_path, registry={"echo.ping": registered})
+    host = _listen(tmp_path, registry={"echo.ping": registered})
+    client = _connect(host.socket_path)
     try:
-        session = host.open_session(_peer())
+        _wait_sessions(host, 1)
+        session = host.sessions()[0]
         host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
-        denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        _send(client, {"tool_name": "echo.ping", "args": ARGS})
+        denied = _recv(client)
         assert denied["decision"] == "DENY"
         assert denied["reason_code"] == "tool_failed"
         assert "raised after entry" in denied["reason_detail"]
+        client.close()
         absent = parse_claim(
-            {"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"}
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "echo.ping",
+                "outcome": "not_called",
+                "session_id": session.principal,
+            }
         )
-        verdict = verify_claim(absent, host.decision_records())
+        verdict = verify_claim(absent, _records_after_session_closes(host))
         assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
     finally:
+        client.close()
         host.close()
 
 
 def test_a_frame_limit_denial_contradicts_not_called_on_the_host_log(tmp_path: Path):
-    """A reply over the frame limit is a call, so not_called is contradicted."""
+    """A reply over the frame limit is a call, so not_called for that session is contradicted."""
     from pep.host.claims import CLAIM_SCHEMA, CONTRADICTED, parse_claim, verify_claim
 
     def registered(args: dict) -> dict:
         return {"pong": "x" * (300 * 1024)}
 
-    host = _host(tmp_path, registry={"echo.ping": registered})
+    host = _listen(tmp_path, registry={"echo.ping": registered})
+    client = _connect(host.socket_path)
     try:
-        session = host.open_session(_peer())
+        _wait_sessions(host, 1)
+        session = host.sessions()[0]
         big = {"message": "big"}
         host.issue_session_approval(session, tool_name="echo.ping", args=big, ttl_seconds=60)
-        denied = host.handle_request({"tool_name": "echo.ping", "args": big}, session)
+        _send(client, {"tool_name": "echo.ping", "args": big})
+        denied = _recv(client)
         assert denied["decision"] == "DENY"
         assert denied["reason_code"] == "tool_failed"
         assert "frame limit" in denied["reason_detail"]
+        client.close()
         absent = parse_claim(
-            {"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"}
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "echo.ping",
+                "outcome": "not_called",
+                "session_id": session.principal,
+            }
         )
-        verdict = verify_claim(absent, host.decision_records())
+        verdict = verify_claim(absent, _records_after_session_closes(host))
         assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
     finally:
+        client.close()
         host.close()
 
 
