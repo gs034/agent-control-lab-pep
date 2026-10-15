@@ -188,6 +188,21 @@ def _private_halt(tmp_path: Path) -> Path:
     return directory / "halt.json"
 
 
+def test_empty_or_whitespace_halt_file_is_corrupt_not_active(tmp_path: Path):
+    """Mutation audit 2026-10-14-host, M12: bytes that do not parse as an active
+    record are halted. Emptiness is corruption, never an active state."""
+    from pep.host.haltfile import CORRUPT, read_fail_closed
+
+    halt = _private_halt(tmp_path)
+    for raw in (b"", b"   \n\t"):
+        halt.write_bytes(raw)
+        os.chmod(halt, 0o600)
+        state, observed = read_fail_closed(halt)
+        assert observed == CORRUPT, raw
+        assert state.mode is HaltMode.KILLED, raw
+        assert state.available is False, raw
+
+
 def test_gate_resume_write_does_not_overwrite_a_concurrent_kill(tmp_path: Path, monkeypatch):
     from pep.host.haltfile import KILLED, init_active, read_fail_closed
 
