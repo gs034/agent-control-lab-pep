@@ -70,16 +70,22 @@ def _agent_uid() -> int:
 def _cpu_and_load() -> dict[str, object]:
     """CPU count and load averages for the JSON report. Not a latency sample."""
     cpu_count = os.cpu_count()
+    absent: dict[str, float | None] = {"load_1m": None, "load_5m": None, "load_15m": None}
+    getloadavg = getattr(os, "getloadavg", None)
+    if getloadavg is None:
+        return {"cpu_count": cpu_count, "load": absent}
     try:
-        load1, load5, load15 = os.getloadavg()
-        load: dict[str, float | None] = {
+        load1, load5, load15 = getloadavg()
+    except OSError:
+        return {"cpu_count": cpu_count, "load": absent}
+    return {
+        "cpu_count": cpu_count,
+        "load": {
             "load_1m": round(float(load1), 3),
             "load_5m": round(float(load5), 3),
             "load_15m": round(float(load15), 3),
-        }
-    except OSError:
-        load = {"load_1m": None, "load_5m": None, "load_15m": None}
-    return {"cpu_count": cpu_count, "load": load}
+        },
+    }
 
 
 def run(iterations: int, gaps: list[float] | None) -> dict:
@@ -134,7 +140,7 @@ def run(iterations: int, gaps: list[float] | None) -> dict:
             "with the log append; allow_echo includes the executor worker round trip. Not a socket "
             "round trip and not an attack-success measurement. cpu_count and load (1, 5, and 15 "
             "minute averages) describe the machine at the end of the run. The allow_echo max on "
-            "the 14 October run (8 ms) was noisy and not reproducible: a re-run gave 22 to 147 ms."
+            "the 14 October run (8 ms) was noisy and not reproducible: a reviewer re-run gave 22 to 147 ms."
         ),
     }
     if gaps is not None:
