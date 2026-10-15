@@ -11,6 +11,11 @@ This covers mediated actions only. A claim about intent, belief or any
 fact the host did not observe cannot be checked here and is not accepted
 as a claim at all. This is claim-record reconciliation, not deception
 detection, not a transcript judge, and not a polygraph.
+
+An agent-facing check does not trust ``session_id`` in the claim body.
+``verify_connected_claim`` replaces it with the connection's own session
+principal before ``verify_claim``. ``verify_claim`` itself still reads the
+``session_id`` on a claim the host has already attested.
 """
 
 from __future__ import annotations
@@ -173,10 +178,51 @@ def verify_claim(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVer
     of them contradicts the claim on ``tool_name`` or ``result_digest``, the
     verdict is ``contradicted`` instead. When the duplicate finals agree on
     the decision, each record is checked, and the first contradiction stands.
+
+    This trusts the ``session_id`` already on the parsed claim. That is the
+    offline check of a claim the host has attested. An agent-facing caller
+    uses ``verify_connected_claim``, which replaces the body's ``session_id``
+    with the connection principal before parsing.
     """
     if claim.kind == "absence":
         return _verify_absence(claim, records)
     return _verify_action(claim, records)
+
+
+def bind_claim_session(raw: Mapping[str, Any], session_principal: str) -> dict[str, Any]:
+    """Copy a claim and set its session from the connection, not the body.
+
+    An agent-facing path calls this before ``parse_claim``. The ``session_id``
+    in the body is ignored. An absence claim is checked as
+    ``session_principal``. An action claim carries no ``session_id``, so one
+    in the body is dropped. The caller's mapping is left unchanged.
+    """
+    if not isinstance(session_principal, str) or not session_principal:
+        raise ClaimError("the connection has no session principal")
+    if not isinstance(raw, Mapping):
+        raise ClaimError("claim is not an object")
+    body = dict(raw)
+    if body.get("kind") == "absence":
+        body["session_id"] = session_principal
+    else:
+        body.pop("session_id", None)
+    return body
+
+
+def verify_connected_claim(
+    raw: Mapping[str, Any],
+    session_principal: str,
+    records: Sequence[Mapping[str, Any]],
+) -> ClaimVerdict:
+    """Check a claim an agent submitted on a connection.
+
+    ``session_principal`` is that connection's own principal
+    (``Session.principal``, stored on each record as ``session_id``). The
+    ``session_id`` in ``raw`` is not used. ``verify_claim`` remains the
+    offline check of a claim whose ``session_id`` the host has already
+    attested.
+    """
+    return verify_claim(parse_claim(bind_claim_session(raw, session_principal)), records)
 
 
 def _verify_absence(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVerdict:

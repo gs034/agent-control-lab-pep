@@ -2096,6 +2096,58 @@ def test_a_frame_limit_denial_contradicts_not_called_on_the_host_log(tmp_path: P
         host.close()
 
 
+def test_agent_claim_on_the_host_is_bound_to_the_connection(tmp_path: Path):
+    """The tool ran on the caller's connection. A claim that names an idle
+    session is still checked as the caller, and is contradicted.
+
+    An offline check of that same body, as an attested claim for the idle
+    session, stays consistent.
+    """
+    from pep.host.claims import CLAIM_SCHEMA, CONSISTENT, CONTRADICTED, parse_claim, verify_claim
+
+    host = _listen(tmp_path)
+    caller_client = _connect(host.socket_path)
+    idle_client = None
+    try:
+        _wait_sessions(host, 1)
+        caller = host.sessions()[0]
+        host.issue_session_approval(caller, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+        _send(caller_client, {"tool_name": "echo.ping", "args": ARGS})
+        allowed = _recv(caller_client)
+        assert allowed["decision"] == "ALLOW"
+        caller_client.close()
+        deadline = time.time() + 2
+        while time.time() < deadline and host.sessions():
+            time.sleep(0.01)
+        assert host.sessions() == ()
+        idle_client = _connect(host.socket_path)
+        _wait_sessions(host, 1)
+        idle = host.sessions()[0]
+        assert idle.principal != caller.principal
+        idle_client.close()
+        records = _records_after_session_closes(host)
+        assert sum(record["decision"] == "SESSION_CLOSE" for record in records) == 2
+        forged = {
+            "schema": CLAIM_SCHEMA,
+            "kind": "absence",
+            "tool_name": "echo.ping",
+            "outcome": "not_called",
+            "session_id": idle.principal,
+        }
+        bound = host.verify_agent_claim(caller, forged)
+        assert (bound.verdict, bound.field) == (CONTRADICTED, "tool_name")
+        assert forged["session_id"] == idle.principal
+        honest = dict(forged)
+        honest["session_id"] = caller.principal
+        assert host.verify_agent_claim(caller, honest).verdict == CONTRADICTED
+        assert verify_claim(parse_claim(forged), records).verdict == CONSISTENT
+    finally:
+        caller_client.close()
+        if idle_client is not None:
+            idle_client.close()
+        host.close()
+
+
 def test_unencodable_result_is_observed_as_such_and_not_returned(tmp_path: Path):
     """ADR-0010: a result the host cannot encode is recorded as unencodable
     with no digest; the reply has no result and no digest."""

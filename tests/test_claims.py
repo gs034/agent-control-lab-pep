@@ -16,9 +16,11 @@ from pep.host.claims import (
     UNVERIFIABLE,
     ClaimError,
     observe_result,
+    bind_claim_session,
     parse_claim,
     result_digest,
     verify_claim,
+    verify_connected_claim,
 )
 from pep.host.executor import UnencodableResult
 
@@ -345,3 +347,74 @@ def test_duplicate_final_records_do_not_let_the_last_win():
     assert (wrong_digest.verdict, wrong_digest.field) == (CONTRADICTED, "result_digest")
     # Agreeing finals still match. The last line is not a special case.
     assert verify_claim(_action(request_id="r1"), [allowed, _record("r1", "ALLOW")]).verdict == CONSISTENT
+
+
+def _span(session: str, start: int, middle: list[dict]) -> list[dict]:
+    """One session's open-to-close range, with seq starting at ``start``."""
+    records = [_marker("SESSION_OPEN", session, start)]
+    seq = start + 1
+    for record in middle:
+        item = dict(record)
+        item["seq"] = seq
+        item["session_id"] = session
+        records.append(item)
+        seq += 1
+    records.append(_marker("SESSION_CLOSE", session, seq))
+    return records
+
+
+def _not_called(session: str, tool: str = "echo.ping") -> dict:
+    return {
+        "schema": CLAIM_SCHEMA,
+        "kind": "absence",
+        "tool_name": tool,
+        "outcome": "not_called",
+        "session_id": session,
+    }
+
+
+def test_bind_claim_session_overwrites_the_body():
+    """The helper replaces the body's session_id and does not edit the original."""
+    raw = _not_called("u2.c2")
+    bound = bind_claim_session(raw, "u1.c1")
+    assert bound["session_id"] == "u1.c1"
+    assert raw["session_id"] == "u2.c2"
+    assert parse_claim(bound).session_id == "u1.c1"
+    missing = dict(raw)
+    del missing["session_id"]
+    assert bind_claim_session(missing, "u1.c1")["session_id"] == "u1.c1"
+    action = {
+        "schema": CLAIM_SCHEMA,
+        "kind": "action",
+        "request_id": "host.1.2",
+        "tool_name": "echo.ping",
+        "outcome": "allowed",
+        "session_id": "u2.c2",
+    }
+    stripped = bind_claim_session(action, "u1.c1")
+    assert "session_id" not in stripped
+    assert action["session_id"] == "u2.c2"
+    assert parse_claim(stripped).session_id is None
+    with pytest.raises(ClaimError, match="session principal"):
+        bind_claim_session(raw, "")
+
+
+def test_agent_facing_absence_claim_is_bound_to_the_connection():
+    """A tool ran on s1. The agent names idle s2. The connection forces s1.
+
+    The same body checked offline, as an already attested claim, still
+    trusts s2 and is consistent. An honest body that already names s1 is
+    contradicted too.
+    """
+    caller = "u1.c1"
+    idle = "u2.c2"
+    records = _span(caller, 1, [_record("host.1.2", "ALLOW")]) + _span(idle, 10, [])
+    forged = _not_called(idle)
+    honest = _not_called(caller)
+    forced = verify_connected_claim(forged, caller, records)
+    assert (forced.verdict, forced.field) == (CONTRADICTED, "tool_name")
+    assert forged["session_id"] == idle
+    assert verify_connected_claim(honest, caller, records).verdict == CONTRADICTED
+    # Offline attested check: the body session stands.
+    assert verify_claim(parse_claim(forged), records).verdict == CONSISTENT
+    assert verify_claim(parse_claim(honest), records).verdict == CONTRADICTED

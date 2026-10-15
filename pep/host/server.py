@@ -43,7 +43,7 @@ from pep.host.executor import (
     ExecutorStartError,
     ToolExecutionError,
 )
-from pep.host.claims import SESSION_CLOSE, SESSION_OPEN, observe_result
+from pep.host.claims import SESSION_CLOSE, SESSION_OPEN, ClaimVerdict, observe_result, verify_connected_claim
 from pep.host.fsguard import PathGuardError, read_private_file, require_directory
 from pep.host.haltfile import (
     ACTIVE,
@@ -257,6 +257,14 @@ class ReferenceHost:
     def decision_records(self) -> list[dict[str, Any]]:
         """Records this process appended. The agent socket cannot call this."""
         return self._decisions.read_records()
+
+    def verify_agent_claim(self, session: Session, raw: Mapping[str, Any]) -> ClaimVerdict:
+        """Check a claim from the agent on this connection.
+
+        The ``session_id`` in the claim body is ignored. The claim is checked
+        as this connection's principal.
+        """
+        return verify_connected_claim(raw, session.principal, self.decision_records())
 
     def halted(self) -> bool:
         if self._sticky_halt or self._runtime.kill_active:
