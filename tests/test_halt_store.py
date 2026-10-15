@@ -265,8 +265,36 @@ def test_a_held_halt_lock_fails_the_write_after_the_bounded_wait(tmp_path: Path,
     fd = os.open(store.lock_path, os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        with pytest.raises(HaltStoreError, match="held by another writer"):
+        with pytest.raises(HaltStoreError, match="the write did not happen"):
             HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED))
     finally:
         os.close(fd)
     assert HaltStore(halt).read().mode is HaltMode.ACTIVE
+
+
+def test_kill_fails_loudly_when_the_lock_wait_expires(tmp_path: Path, monkeypatch, capsys):
+    import fcntl
+
+    import pytest
+
+    import pep.halt as halt_module
+    from pep.host.__main__ import main
+    from pep.host.haltfile import ACTIVE, init_active, read_fail_closed, write_killed
+
+    halt = _private_halt(tmp_path)
+    init_active(halt)
+    monkeypatch.setattr(halt_module, "LOCK_WAIT_SECONDS", 0.2)
+    fd = os.open(HaltStore(halt).lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with pytest.raises(HaltStoreError, match="kill did not land"):
+            write_killed(halt)
+        code = main(["kill", "--halt", str(halt)])
+        err = capsys.readouterr().err
+    finally:
+        os.close(fd)
+    assert code == 1
+    assert "kill did not land" in err
+    assert "still held" in err
+    _state, observed = read_fail_closed(halt)
+    assert observed == ACTIVE

@@ -20,7 +20,10 @@ An x32-style number (bit 0x40000000) is rejected. ``memfd_create``,
 ``open_by_handle_at``, ``keyctl``, ``ptrace``, and ``sendto`` are not
 on the list. The agent does not choose the function.
 The gate sends a tool name and the argument snapshot, and a call that
-exceeds its timeout is denied.
+exceeds its timeout is denied. Stopping a worker sends SIGKILL to its
+process group. The gate does not waitpid the worker. The nursery reaps
+it on SIGCHLD. The worker is put in its own process group at fork, so
+a grandchild that stayed in that group is killed with the worker.
 
 Linux x86_64 only. If the sandbox cannot be installed, the gate does
 not run the tool.
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+import errno
 import json
 import os
 import resource
@@ -91,7 +95,9 @@ _X32_SYSCALL_BIT = 0x40000000
 _MAX_FRAME = 256 * 1024
 # Per call the gate reads from the worker one 4-byte header and one body of
 # at most ``_MAX_FRAME`` bytes. That is the whole per-call budget: a worker
-# that sends a second frame, or anything between calls, is discarded.
+# that sends a second frame, or anything between calls, is discarded. A late
+# second frame, not yet readable when this call checks, is only caught at
+# the next call.
 _HANDSHAKE_SECONDS = 5.0
 DEFAULT_CALL_TIMEOUT_SECONDS = 5.0
 
@@ -350,6 +356,7 @@ class _Worker:
                 reply = _read_frame(self._conn, deadline=deadline)
                 if _bytes_pending(self._conn):
                     # A second frame. The budget is one reply per call.
+                    # A frame that is not readable yet is only caught at the next call.
                     raise ToolExecutionError("protocol")
             except TimeoutError as exc:
                 self.close()
@@ -393,14 +400,30 @@ class _Worker:
 
 
 def _kill(pid: int) -> None:
+    """SIGKILL the worker's process group.
+
+    The worker leads its own process group, set at fork. Signalling that
+    group kills a child and a grandchild that stayed in it. Signalling
+    only the pid would leave them running. The gate does not waitpid the
+    worker. The nursery is the parent and reaps on SIGCHLD.
+    """
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        # Not a process group id (already gone, or setpgid has not landed).
+        # The pid is signalled so the worker still stops.
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _kill_and_reap(pid: int) -> None:
+    """SIGKILL one nursery process and reap it. The nursery is not a group leader."""
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
-
-
-def _kill_and_reap(pid: int) -> None:
-    _kill(pid)
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:
@@ -451,12 +474,20 @@ def _spawn_from_zygote(gate: socket.socket, registry: dict[str, Any]) -> None:
     pid = os.fork()
     if pid == 0:
         try:
+            # Own process group, so the gate can SIGKILL the group without
+            # signalling the nursery or the host.
+            os.setpgid(0, 0)
             gate.close()
             gate_end.close()
             _set_die_with_parent()
             _executor_main(worker_end, registry)
         finally:
             os._exit(0)
+    # Close the race: the parent sets the group too, in case it runs first.
+    try:
+        os.setpgid(pid, pid)
+    except OSError:
+        pass
     worker_end.close()
     try:
         _send_fd(gate, gate_end.fileno(), pid)
@@ -720,15 +751,21 @@ def _bytes_pending(conn: socket.socket) -> bool:
     """True when the peer has sent bytes nobody asked for yet. Does not block.
 
     A socket with a timeout waits for readability inside ``recv`` whatever
-    the flags, so readiness is polled first with a zero timeout.
+    the flags, so readiness is polled first with a zero timeout. A socket
+    error is not an empty socket: it propagates, and the caller discards
+    the worker instead of trusting the next frame.
     """
     poller = select.poll()
     poller.register(conn.fileno(), select.POLLIN)
+    ready = poller.poll(0)
+    if not ready:
+        return False
+    _fd, event = ready[0]
+    if event & (select.POLLERR | select.POLLNVAL):
+        raise OSError(errno.EIO, "worker socket error")
     try:
-        if not poller.poll(0):
-            return False
         peeked = conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-    except OSError:
+    except BlockingIOError:
         return False
     return bool(peeked)
 

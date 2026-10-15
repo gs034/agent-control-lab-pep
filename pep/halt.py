@@ -13,7 +13,8 @@ same file: the reference gate rewrites it on suspend and resume, and
 ``flock`` on a lock file next to the halt file (``.<name>.lock``) from the
 read to the rename, so a kill that lands first is read by the next writer
 and merged as sticky. Without that lock a gate that read "active" before
-the kill landed could rename "active" over it.
+the kill landed could rename "active" over it. The halt file must be on
+local disk, because flock is unreliable on NFS.
 
 The late-effect fence (cut epoch for queued or in-flight admissions) lives
 on ``PepRuntime``, not in this file. Reloading a killed store denies new
@@ -201,7 +202,9 @@ def _flock_bounded(fd: int) -> None:
             return
         except BlockingIOError:
             if time.monotonic() >= deadline:
-                raise HaltStoreError("halt store lock is held by another writer") from None
+                raise HaltStoreError(
+                    f"halt lock still held after {LOCK_WAIT_SECONDS:g} seconds; the write did not happen"
+                ) from None
             time.sleep(0.01)
 
 
