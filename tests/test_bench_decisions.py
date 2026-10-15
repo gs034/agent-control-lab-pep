@@ -31,6 +31,18 @@ def test_benchmark_reports_three_series_and_a_gap_distribution(tmp_path: Path) -
         assert series["p50_ms"] <= series["p99_ms"] <= series["max_ms"]
     assert report["call_gaps"]["n"] == 3
     assert report["call_gaps"]["max_ms"] == 6000.0
+    assert isinstance(report["cpu_count"], int) and report["cpu_count"] >= 1
+    assert set(report["load"]) == {"load_1m", "load_5m", "load_15m"}
+    for sample in report["load"].values():
+        assert isinstance(sample, (int, float)) and sample >= 0
+
+
+def test_cpu_and_load_records_count_and_three_averages() -> None:
+    recorded = bench._cpu_and_load()
+    assert recorded["cpu_count"] == os.cpu_count()
+    load = recorded["load"]
+    assert list(load) == ["load_1m", "load_5m", "load_15m"]
+    assert all(isinstance(sample, float) for sample in load.values())
 
 
 def test_percentiles_are_order_statistics() -> None:

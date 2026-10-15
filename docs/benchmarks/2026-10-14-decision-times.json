@@ -3,7 +3,7 @@
   "iterations": 2000,
   "machine": "x86_64",
   "measured_at_utc": "2026-10-14T17:34:37Z",
-  "note": "In-process handle_request timings on one machine. deny_* are rules-only decisions with the log append; allow_echo includes the executor worker round trip. Not a socket round trip and not an attack-success measurement.",
+  "note": "In-process handle_request timings on one machine. deny_* are rules-only decisions with the log append; allow_echo includes the executor worker round trip. Not a socket round trip and not an attack-success measurement. The allow_echo max (8.044 ms) is noisy and not reproducible: a re-run gave 22 to 147 ms. cpu_count and load were not recorded for this run.",
   "platform": "Linux-6.18.44-fc-v114-x86_64-with-glibc2.39",
   "python": "3.13.16",
   "series": {
