@@ -42,8 +42,8 @@ from pep.host.executor import (
     ExecutorNursery,
     ExecutorStartError,
     ToolExecutionError,
-    UnencodableResult,
 )
+from pep.host.claims import observe_result
 from pep.host.fsguard import PathGuardError, read_private_file, require_directory
 from pep.host.haltfile import (
     ACTIVE,
@@ -760,6 +760,11 @@ class ReferenceHost:
             )
         outcome = [dict(item) for item in checks]
         outcome.append({"name": "registry_tool", "outcome": "entered"})
+        # The host observes the result itself, before the ALLOW is written.
+        # The digest in the record is what a later claim about this call is
+        # checked against (ADR-0010). The result body is not logged.
+        observation = observe_result(result)
+        outcome.append(dict(observation.check))
         if not self._append(
             session,
             "ALLOW",
@@ -782,17 +787,12 @@ class ReferenceHost:
             finished.receipt.reason_detail,
             request_id,
         )
-        if isinstance(result, UnencodableResult):
+        if observation.digest is None:
             response["reason_detail"] = "host tool returned a value that is not JSON"
             return response
-        try:
-            encoded = json.dumps(result, ensure_ascii=True)
-            parsed = json.loads(encoded)
-        except (TypeError, ValueError, RecursionError):
-            response["reason_detail"] = "host tool returned a value that is not JSON"
-            return response
-        response["result"] = parsed
+        response["result"] = observation.parsed
         response["result_origin"] = "host-registry"
+        response["result_digest"] = observation.digest
         return response
 
     def _serve_connection(self, conn: socket.socket) -> None:

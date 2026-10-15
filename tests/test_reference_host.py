@@ -1889,6 +1889,83 @@ def test_policy_replaced_by_a_symlink_halts(tmp_path: Path):
         host.close()
 
 
+def test_host_observes_the_result_and_claims_are_checked_against_its_record(tmp_path: Path):
+    """ADR-0010: the ALLOW record carries the host's own digest of the result,
+    the reply carries the same digest, and an agent's claim about the call is
+    judged against the record, never against the agent's words."""
+    from pep.host.claims import (
+        CLAIM_SCHEMA,
+        CONSISTENT,
+        CONTRADICTED,
+        UNVERIFIABLE,
+        parse_claim,
+        result_digest,
+        verify_claim,
+    )
+
+    def registered(args: dict) -> dict:
+        return {"pong": args["message"], "ran": "registry"}
+
+    host = _host(tmp_path, registry={"echo.ping": registered})
+    try:
+        session = host.open_session(_peer())
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+        allowed = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        assert allowed["decision"] == "ALLOW"
+        expected = result_digest({"pong": "hi", "ran": "registry"})
+        assert allowed["result_digest"] == expected
+        record = host.decision_records()[-1]
+        assert record["decision"] == "ALLOW"
+        assert record["request_id"] == allowed["request_id"]
+        observed = [check for check in record["checks"] if check["name"] == "result"]
+        assert observed == [{"name": "result", "outcome": "returned", "digest": expected}]
+        # The result body is in the reply, not in the record.
+        assert "pong" not in json.dumps(record)
+
+        records = host.decision_records()
+
+        def claim(**fields: Any):
+            body = {"schema": CLAIM_SCHEMA, "kind": "action", "request_id": allowed["request_id"],
+                    "tool_name": "echo.ping", "outcome": "allowed", "result_digest": expected}
+            body.update(fields)
+            return parse_claim(body)
+
+        assert verify_claim(claim(), records).verdict == CONSISTENT
+        forged = verify_claim(claim(result_digest=result_digest({"pong": "forged"})), records)
+        assert (forged.verdict, forged.field) == (CONTRADICTED, "result_digest")
+        hidden = verify_claim(claim(outcome="denied", result_digest=None), records)
+        assert (hidden.verdict, hidden.field) == (CONTRADICTED, "outcome")
+        unknown = verify_claim(claim(request_id="host.9.9"), records)
+        assert unknown.verdict == UNVERIFIABLE
+        absent = parse_claim({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"})
+        assert verify_claim(absent, records).verdict == CONTRADICTED
+    finally:
+        host.close()
+
+
+def test_unencodable_result_is_observed_as_such_and_not_returned(tmp_path: Path):
+    """ADR-0010: a result the host cannot encode is recorded as unencodable
+    with no digest; the reply has no result and no digest."""
+
+    def registered(_args: dict) -> object:
+        return object()
+
+    host = _host(tmp_path, registry={"echo.ping": registered})
+    try:
+        session = host.open_session(_peer())
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+        allowed = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        assert allowed["decision"] == "ALLOW"
+        assert "result" not in allowed
+        assert "result_digest" not in allowed
+        assert "not JSON" in allowed["reason_detail"]
+        record = host.decision_records()[-1]
+        observed = [check for check in record["checks"] if check["name"] == "result"]
+        assert observed == [{"name": "result", "outcome": "unencodable"}]
+    finally:
+        host.close()
+
+
 def test_tool_runs_outside_the_gate_process(tmp_path: Path):
     calls: list[str] = []
 
