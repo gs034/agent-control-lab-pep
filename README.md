@@ -27,7 +27,7 @@ The official eval row lives under `eval/` (Deep Research artefacts). The PEP loa
 
 ## How to run
 
-Requires Python 3.11+. Stdlib-only runtime; pytest for tests.
+Requires Python 3.11.4+. Stdlib-only runtime; pytest for tests.
 
 ```bash
 python -m pip install -e ".[dev]"
