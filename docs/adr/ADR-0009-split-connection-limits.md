@@ -1,7 +1,8 @@
 # ADR-0009: split the reference host's connection limits
 
-- Status: Proposed (awaiting owner approval; no limit changes in this ADR)
+- Status: Proposed. A security review held the first draft on 2026-10-15. This text is that revision. No limit changes until the owner accepts it.
 - Date: 2026-10-14
+- Revised: 2026-10-15
 - Brand: Agent Control Lab
 - Licence: Apache-2.0
 - Supersedes nothing yet. Amends the limits ADR-0007 set and ADR-0008 recorded.
@@ -12,15 +13,18 @@ ADR-0007 set three limits on the agent socket and ADR-0008 recorded them: an idl
 
 The owner's decision of 14 October 2026: do not accept 5 seconds idle and 30 seconds deadline as they stand. Split the single limit into separate ones, measure first, then propose numbers with the measurements. This ADR is that proposal. It changes no constant.
 
+The first draft was held. A session bound only by the last grant could live as long as that grant, and the library still accepts a grant TTL up to 86400 seconds. A keep-alive that resets idle with no live grant could hold a slot, and nothing recorded how long the slot was held. The cap of 8 dropped the client that had waited longest without a complete request, so a client that only sent keep-alive lines was not the one removed, and one user id could take every slot. The 10 ms figure could be read as a check that still applies after a tool has started. The 2 second partial-message bound could be read as a timer that starts again on each read. The 90 second idle figure had no trace behind it. The operator range up to 64 connections had no memory or file-handle budget. Those conditions are the decision below.
+
 ## Decision proposed
 
-One limit becomes five, each with its own name, default and reason.
+One limit becomes five, and the top of the connection range gains a resource budget. Each has its own name, default, and reason.
 
-1. **Partial-frame limit.** Once the first byte of a request has arrived, the whole request line must arrive within this bound, or the connection is closed. This is the slow-drip defence that the 5 second idle timeout was really for.
-2. **Idle limit between requests, with keep-alive.** A connection with no request in flight may stay open for this long without bytes. A keep-alive request (an envelope the host answers without a decision and without a log line beyond a counter) resets it. This is what an agent waiting on a long model turn needs.
-3. **Session lifetime bound by grant time-to-live.** A session ends when its last grant's TTL has passed, not at a fixed 30 seconds after accept. `kill` and (once it exists, L3.7) `revoke` stay instant and are not bounded by this limit.
-4. **Gate decision-time budget.** The time the host allows itself to reach a decision, measured and budgeted separately for rules-only decisions (the only kind this host makes) and for any future model-based check (none exists on the decision path; the budget is reserved, not spent). A decision that overruns its budget is DENY, logged as such.
-5. **Configurable connection cap.** The cap stays, becomes an operator setting with a bounded range, and the host drops the client that has held a slot longest without a complete request when the cap is reached.
+1. **Partial-message limit.** Once the first byte of a request line has arrived, the whole line must arrive within 2 seconds or the connection is closed. This deadline is fixed. It starts at that first byte and never restarts on a read. A later byte does not move it. The reference host today arms the socket timeout again on each read, so a byte starts a new wait. This limit must not be armed that way. A completed line ends the deadline. The next unfinished line gets a new 2 second deadline of its own. This is the bound that stops a slow drip.
+2. **Idle limit between requests, with keep-alive.** A connection with no request in flight may stay open for this long without bytes. The 90 second figure below is unsupported by data. A keep-alive is an envelope the host answers without a decision and without running a tool. The host counts a keep-alive, and lets it reset the idle timer, only while a live grant exists or up to the fixed session ceiling, and not past either bound. With no live grant, the idle limit alone applies, so a ping is not counted and does not reset the idle timer. Once the ceiling has passed, a ping is not counted either. Accepted keep-alives are rate-limited to one per 30 seconds on that connection. A faster repeat does not reset idle and does not get its own log line. The 30 second rate is a proposal and is unsupported by data. It stays its own constant so a later change to the idle figure does not silently change the rate. When a slot is released, the host logs once how long that slot was held, with the close reason and the peer user id.
+3. **Session lifetime.** The session ends at whichever comes first of the last grant's expiry, a fixed ceiling of 1 hour after accept, or the idle limit alone when there is no live grant. Keep-alives do not move the grant expiry or the ceiling. When no grant is live, only the idle limit keeps the connection open, and pings do not extend it. The ceiling is always in force, so an idle figure larger than 1 hour still loses to the ceiling. The ceiling uses the host monotonic clock from accept. Grant expiry uses the host clock the grant was minted with. `kill` and (once it exists, L3.7) `revoke` stay instant and are not bounded by this limit. The grant TTL is capped. The host refuses a grant whose TTL is above 3600 seconds, and refuses a grant whose expiry would fall after that connection's ceiling. Today `MAX_TTL_SECONDS` in the approval library is 86400. This ADR does not change that constant. The implementing change caps what the host will mint. It does not raise the session ceiling to 86400.
+4. **Gate decision-time budget.** The time the host allows itself to reach a decision, budgeted separately for rules-only decisions (the only kind this host makes) and for any future model-based check (none exists on the decision path; the budget is reserved, not spent). The 10 ms rules-only budget is checked before the request goes to the executor, never after a tool has started. If the budget is already spent at that check, the result is DENY and the executor is not asked. A tool that has started is not judged again against this budget. It keeps the tool-call timeout. A decision that overruns is DENY, logged as such.
+5. **Connection cap.** The cap stays 8. It becomes an operator setting with a bounded range of 1 to 64. A per-user sub-cap of 2 applies inside that cap: one attested peer user id may hold at most 2 agent slots. The sub-cap of 2 is a proposal and is unsupported by data. Two slots let that user id reconnect while the previous connection closes, and they cannot take all 8. When the cap is full, the host evicts a client that has only sent keep-alive pings, longest hold first. It does not evict a client that has a live grant or a request in flight in preference to a ping-only client. If no ping-only client exists, the new connection is refused and nobody is evicted. A user id already at its sub-cap is refused even when the global cap has room. Each eviction is logged once. That line is the slot-release line, with the hold duration and the reason. The close path must not write it twice.
+6. **Resource budget at 64 connections.** The operator range may reach 64 only if 64 live agent connections stay inside this budget. In the host process the design holds, per connection, the accepted socket and one worker socket, plus one nursery socket, one spare worker socket, the listener, the log, and the halt file. At 64 connections that is under 200 descriptors. The file-handle budget is 256 open descriptors for that set. It does not count descriptors a test runner inherited into the process. Workers drop inherited descriptors, and the process group of the host plus those workers stays within 512 open file descriptors. The memory budget is 1GiB resident set for that same process group. The memory figure is a planning ceiling and is unsupported by data. The file-handle figures are the descriptor count above plus headroom, not a measured high-water mark. A result over any of these ceilings fails the test. The budget is not raised to match the result without a new owner decision.
 
 ## Measurements
 
@@ -32,25 +36,42 @@ One limit becomes five, each with its own name, default and reason.
 | `deny_envelope_invalid` | rules-only DENY for a malformed envelope | 0.032 ms | 0.065 ms | 0.116 ms | 2.7 ms |
 | `allow_echo` | granted `echo.ping` through the executor worker and back | 2.44 ms | 3.63 ms | 5.07 ms | 8.0 ms |
 
-What is not measured: the Unix-socket round trip (the benchmark is in-process; the client and host must be different users, which one process cannot be), and the gap between an agent's successive tool calls (this tree holds no agent traces; the script accepts one with `--gaps` and reports the distribution when given). The idle-limit number below therefore rests on the owner's starting range, not on data.
+The 10 ms decision budget is compared with the rules-only series only. Those samples end before the request would go to the executor. `allow_echo` includes the executor worker and is not the decision budget. The check this budget names happens before that handoff, never after a tool has started.
+
+What is not measured: the Unix-socket round trip (the benchmark is in-process; the client and host must be different users, which one process cannot be), the gap between an agent's successive tool calls (this tree holds no agent traces; the script accepts one with `--gaps` and reports the distribution when given), memory at 64 connections, and file handles at 64 connections. The 90 second idle figure is unsupported by data. It rests on the owner's starting range, not on a trace.
 
 ## Proposed numbers (for owner approval, not yet applied)
 
 | Limit | Proposed default | Basis |
 | --- | --- | --- |
-| Partial-frame | 2 s | Owner's starting range 1 to 2 s. A 64 KiB request line arrives in well under that on loopback; the bound is for a drip, not for throughput. Measured decision time plays no part. |
-| Idle between requests | 90 s, keep-alive resets | Owner's starting range 60 to 120 s. No trace data; chosen mid-range. To be revisited with a measured gap distribution. |
-| Session lifetime | bound by the last grant's TTL; no fixed deadline | Follows the decision. The operator's TTL is the bound. |
-| Decision budget, rules-only | 10 ms p99 | Measured p99 is 0.4 ms worst series, so 10 ms gives twenty-five times headroom on this machine and sits well under the owner's starting point of 100 ms. The executor round trip (5 ms p99) is a tool-call budget, not a decision budget, and keeps its own limit. |
+| Partial-message | 2 s, fixed from the first byte. Never restarts on a read. | Owner's starting range 1 to 2 s. A 64 KiB request line arrives in well under that on loopback. The bound is for a drip, not for throughput. Measured decision time plays no part. |
+| Idle between requests | 90 s. Unsupported by data. | Owner's starting range 60 to 120 s. 90 s is the middle of that range. This tree holds no agent traces. This is not a measured default. Revisit when a gap distribution exists. |
+| Keep-alive | Counted only while a live grant exists or up to the 1 hour ceiling, and not past either bound. At most one accepted ping per 30 s. Slot hold duration logged once on release. | The 30 s rate is a proposal and is unsupported by data. One accepted ping can still refresh a waiting agent inside the idle window. Pings with no live grant, pings after the ceiling, and a further ping before 30 seconds have passed do not reset idle. |
+| Session lifetime | Whichever comes first: last grant's expiry, 1 hour after accept, or the idle limit alone when no grant is live. | A grant must not hold a slot past the ceiling. No live grant means idle only. |
+| Grant TTL | Capped at 3600 s, and not past that connection's ceiling. | The library still allows 86400 s. This ADR does not change that constant. The host refuses a longer mint. |
+| Decision budget, rules-only | 10 ms, checked before the request goes to the executor, never after a tool has started. | Measured rules-only p99 is 0.381 ms (`deny_unknown_tool`), so 10 ms is more than twenty-five times that sample on this machine and sits under the owner's starting point of 100 ms. `allow_echo` p99 is 5.07 ms and includes the executor. That series is the tool-call path, not this budget. |
 | Decision budget, model-based | reserved, not set | No model on the decision path. Set only if one is ever added, with its own measurement. |
-| Connection cap | 8, operator-settable 1 to 64 | Current value kept; the range is a proposal. Drop policy: longest slot held without a complete request. |
+| Connection cap | 8, operator-settable 1 to 64, per-user sub-cap 2 | Current cap kept. The sub-cap of 2 is a proposal and is unsupported by data. When the cap is full, evict a ping-only client, longest hold first. Otherwise refuse the new connection. Each eviction is one log line. |
+| Resource budget at 64 connections | 256 host file descriptors for the sockets and fixed files named above; 512 for the host and its workers; 1GiB resident set for that process group | The file-handle ceilings are the descriptor count plus headroom, not a measured high-water mark. The 1GiB memory ceiling is unsupported by data. The test records both and fails over the ceiling. |
+
+## Tests planned
+
+One test per limit. The implementing change adds these tests. This ADR does not add them.
+
+1. **Partial-message.** Send one byte every 1.9 seconds and never a newline. The connection closes at the 2 second deadline. A byte that arrives before the deadline does not move it. A line that is complete before 2 seconds is accepted, and the next unfinished line gets a new deadline.
+2. **Idle and keep-alive.** With no bytes and no grant, the connection closes at the configured idle limit. The test uses that configured value. It does not treat 90 seconds as a measured truth. A keep-alive while a grant is live and the ceiling has not passed resets the idle timer. A second keep-alive before 30 seconds have passed does not reset the idle timer. A keep-alive with no live grant does not reset idle, and a keep-alive after the ceiling does not either. Releasing the slot appends one log line with how long the slot was held.
+3. **Session lifetime and grant TTL.** The session ends at whichever comes first of the last grant's expiry, 1 hour after accept, and the idle limit when no grant is live. The host refuses a grant whose TTL is above 3600 seconds, and refuses a grant whose expiry would pass the ceiling. A grant inside the cap does not push the session past the hour.
+4. **Decision budget.** The host checks the 10 ms budget before the request goes to the executor. A decision that overruns is DENY, and the tool is not started. A tool that has already started is not failed because the call then runs past 10 ms. That case stays on the tool-call timeout.
+5. **Connection cap.** Eight granted connections fill the cap, and a ninth is refused when none of them is ping-only. A client that has only sent keep-alive pings is the one evicted when the cap is full, and that eviction is one log line. A third connection from the same user id is refused while the per-user sub-cap is 2, even if the global cap has room.
+6. **Resource budget.** 64 live connections stay within 256 counted host file descriptors, 512 file descriptors for the host and its workers, and 1GiB resident set. The test records all three. The memory check is against the planning ceiling, which is unsupported by data until this test records a real resident set.
 
 ## Consequences
 
-- Each limit gets a constant, a constructor argument and a README row; the live check gains a row per limit. This is a protocol-visible change for the idle and lifetime limits, so it lands as its own phased change after approval (tests, code, docs, minor version bump per ADR-0003 and ADR-0005 practice).
-- A keep-alive envelope is a new request kind. Its shape is decided in the implementing change, not here.
-- Nothing in this ADR is a claim of efficacy. The numbers describe one machine on one day.
+- Each limit gets a constant, a constructor argument, and a README row. The live check gains a row per limit. This is a protocol-visible change for the idle and lifetime limits, so it lands as its own phased change after approval (tests, code, docs, minor version bump per ADR-0003 and ADR-0005 practice).
+- A keep-alive envelope is a new request kind. Its shape is decided in the implementing change. The counting rule, the rate limit, and the single slot-hold log line are decided here.
+- The partial-message deadline, the session ceiling, the grant TTL cap, the per-user sub-cap, ping-only eviction, and the resource budget are part of that same implementing change. They are not applied by this ADR.
+- Nothing in this ADR is a claim of efficacy. The decision-time numbers describe one machine on one day. The 90 second idle figure and the 1GiB memory ceiling are unsupported by data.
 
 ## Owner decision
 
-Pending. STOP 3 in the production brief.
+Pending. STOP 3 in the production brief. The security review held the first draft. This revision is the text that review asked for. It is not an acceptance.
