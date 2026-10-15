@@ -354,8 +354,9 @@ def _require_reviewed_commit(root: Path, commit: str, freeze_commit: str, audit_
     freeze, and remove it again after the freeze. The sealed commit must be an
     ancestor of the commit that added ``freeze.json``, and nothing outside
     ``audits/<audit_id>/`` may differ between it and the freeze commit or
-    between it and HEAD. So what runs is what the freeze commit and the
-    branch tip both show.
+    between it and HEAD. That folder is left out of the archive, and
+    ``_refuse_unsafe_tree`` limits what the sealed commit may hold there, so
+    what runs is what the freeze commit and the branch tip both show.
     """
     try:
         ancestor = subprocess.run(
@@ -401,6 +402,120 @@ def _refuse_startup_hooks(root: Path, commit: str) -> None:
         raise FreezeMismatch(f"the sealed tree carries files that run before the tests: {', '.join(bad)}")
 
 
+# The audit folders are input from a pull request and are never part of what runs.
+_AUDITS = "audits"
+_REGULAR_MODES = ("100644", "100755")
+# Run git so that no attributes file outside the repository can change what it writes.
+_ATTRIBUTE_NEUTRAL = {
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.attributesFile",
+    "GIT_CONFIG_VALUE_0": os.devnull,
+}
+
+
+def _ls_tree(root: Path, treeish: str, *paths: str) -> list[tuple[str, str, str, str]]:
+    """Every non-tree entry under ``treeish`` as (mode, type, object id, path from the top)."""
+    out = _git(root, "ls-tree", "-r", "-z", "--full-tree", "--end-of-options", treeish, *paths)
+    entries = []
+    for record in out.split("\0"):
+        if record:
+            meta, _, path = record.partition("\t")
+            mode, kind, oid = meta.split(" ")
+            entries.append((mode, kind, oid, path))
+    return entries
+
+
+def _in_audits(path: str) -> bool:
+    return path == _AUDITS or path.startswith(f"{_AUDITS}/")
+
+
+def _refuse_unsafe_tree(root: Path, commit: str, freeze_commit: str, audit_id: str) -> None:
+    """Refuse a sealed tree whose archive could differ from the blobs a reviewer reads.
+
+    Every entry must be a regular file: no symlink, which could point into an
+    audit folder or out of its directory, and no submodule. No
+    ``.gitattributes`` file may appear anywhere, because ``git archive``
+    honours ``export-subst`` and ``export-ignore`` from the tree it writes.
+    The audit's own folder may hold only the mutants, unchanged at the freeze
+    commit, since the diff check does not cover that folder.
+    """
+    own = f"{_AUDITS}/{audit_id}/"
+    frozen = {(m, o, p) for m, _, o, p in _ls_tree(root, freeze_commit, f"{own}mutants")}
+    bad = []
+    for mode, _, oid, path in _ls_tree(root, commit):
+        if path.rsplit("/", 1)[-1] == ".gitattributes":
+            bad.append(f"{path} (attributes change what git archive writes)")
+        elif mode not in _REGULAR_MODES:
+            bad.append(f"{path} (mode {mode}, not a regular file)")
+        elif path.startswith(own) and not (
+            path.startswith(f"{own}mutants/")
+            and _MUTANT_NAME.fullmatch(path[len(own) + len("mutants/"):])
+            and (mode, oid, path) in frozen
+        ):
+            bad.append(f"{path} (inside {own} at the sealed commit)")
+    if bad:
+        raise FreezeMismatch(f"the sealed tree at {commit[:12]} is refused: {', '.join(bad)}")
+
+
+def _archived_tree(root: Path, commit: str) -> dict[str, tuple[str, str]]:
+    """What the archive must hold: every path outside audits/, with its mode and blob id."""
+    return {path: (mode, oid) for mode, _, oid, path in _ls_tree(root, commit) if not _in_audits(path)}
+
+
+def _archive(root: Path, commit: str) -> bytes:
+    """The sealed commit as a tar, without audits/ and with no attributes from outside the repository.
+
+    Pathspec settings from the environment are dropped so the exclusion is
+    read as magic. The extracted copy is still checked blob by blob, because
+    the repository's own ``info/attributes`` can rewrite what this writes.
+    """
+    try:
+        return subprocess.run(
+            ["git", "archive", "--format=tar", "--end-of-options", commit, ".", f":(exclude){_AUDITS}"],
+            cwd=root,
+            env={**{k: v for k, v in os.environ.items() if not k.endswith("_PATHSPECS")}, **_ATTRIBUTE_NEUTRAL},
+            check=True,
+            capture_output=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        ).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise _git_timed_out(exc) from exc
+
+
+def _blob_id(data: bytes, oid_length: int) -> str:
+    algorithm = hashlib.sha1 if oid_length == 40 else hashlib.sha256
+    return algorithm(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _materialised_drift(copy: Path, tree: dict[str, tuple[str, str]]) -> list[str]:
+    """Every path where the extracted copy is not exactly the sealed blobs: extra, missing or different."""
+    found: dict[str, Path] = {}
+    drift = []
+    for dirpath, dirnames, filenames in os.walk(copy):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            rel = path.relative_to(copy).as_posix()
+            info = path.lstat()
+            if stat.S_ISREG(info.st_mode):
+                found[rel] = path
+            elif not stat.S_ISDIR(info.st_mode):
+                drift.append(f"{rel} (not a regular file)")
+    for rel in sorted(set(found) | set(tree)):
+        if rel not in tree:
+            drift.append(f"{rel} (not in the sealed tree)")
+        elif rel not in found:
+            drift.append(f"{rel} (missing)")
+        else:
+            mode, oid = tree[rel]
+            path = found[rel]
+            if _blob_id(path.read_bytes(), len(oid)) != oid:
+                drift.append(f"{rel} (content differs from blob {oid[:12]})")
+            elif bool(path.stat().st_mode & stat.S_IXUSR) != (mode == "100755"):
+                drift.append(f"{rel} (mode differs from {mode})")
+    return drift
+
+
 def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
     """Refuse unless the seal is committed once, and everything it names still matches.
 
@@ -424,6 +539,7 @@ def verify(root: Path, sealed: dict, audit_id: str | None = None) -> None:
     if _git(root, "log", "--format=%H", f"{history[0]}..HEAD", "--", f"{rel}/mutants").split():
         raise FreezeMismatch(f"{rel}/mutants changed after the freeze commit")
     _require_reviewed_commit(root, sealed["commit"], history[0], audit_id)
+    _refuse_unsafe_tree(root, sealed["commit"], history[0], audit_id)
     _refuse_untracked_tests(root, FreezeMismatch)
     audit = _audit_dir(root, audit_id)
     _check_audit_tree(audit, FreezeMismatch)
@@ -460,22 +576,14 @@ def run(
     verify(root, sealed, audit_id)
     commit = _sealed_commit(root, sealed)
     _refuse_startup_hooks(root, commit)
-    try:
-        archive = subprocess.run(
-            ["git", "archive", "--format=tar", "--end-of-options", commit],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-        ).stdout
-    except subprocess.TimeoutExpired as exc:
-        raise _git_timed_out(exc) from exc
+    tree = _archived_tree(root, commit)
+    archive = _archive(root, commit)
     mutants = _load_mutants(audit, tuple(sealed["scope"]))
 
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="mutation-audit-") as tmp:
         work = Path(tmp)
-        copy = _extract(work, archive, sealed)
+        copy = _extract(work, archive, sealed, tree)
         try:
             baseline = _run_suite(work, copy, sealed, [])
         except AuditAborted as exc:
@@ -492,7 +600,7 @@ def run(
     for mutant_id, mutant in mutants.items():
         began = time.monotonic()
         with tempfile.TemporaryDirectory(prefix=f"mutation-audit-{mutant_id}-") as tmp:
-            row = _run_mutant(Path(tmp), archive, sealed, mutant, audit / "mutants" / f"{mutant_id}.patch")
+            row = _run_mutant(Path(tmp), archive, tree, sealed, mutant, audit / "mutants" / f"{mutant_id}.patch")
         row["duration_seconds"] = round(time.monotonic() - began, 2)
         rows.append(row)
         if after_each is not None:
@@ -612,7 +720,9 @@ def render(results: dict, equivalents: dict[str, dict]) -> str:
     return "\n".join(out) + "\n"
 
 
-def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch: Path) -> dict:
+def _run_mutant(
+    work: Path, archive: bytes, tree: dict[str, tuple[str, str]], sealed: dict, mutant: Mutant, patch: Path
+) -> dict:
     row = {
         "id": mutant.mutant_id,
         "file": mutant.target,
@@ -622,7 +732,7 @@ def _run_mutant(work: Path, archive: bytes, sealed: dict, mutant: Mutant, patch:
         "killing_tests": [],
         "detail": "",
     }
-    copy = _extract(work, archive, sealed)
+    copy = _extract(work, archive, sealed, tree)
     target = copy / mutant.target
     if not target.is_file():
         return {**row, "outcome": "invalid", "detail": "the target file is not in the frozen commit"}
@@ -732,7 +842,8 @@ def _applied_where_stated(mutant: Mutant, mutated: str) -> bool:
     return True
 
 
-def _extract(work: Path, archive: bytes, sealed: dict) -> Path:
+def _extract(work: Path, archive: bytes, sealed: dict, tree: dict[str, tuple[str, str]]) -> Path:
+    """Extract the archive and check it is exactly ``tree``, the sealed blobs outside audits/."""
     copy = work / "tree"
     copy.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
@@ -740,6 +851,11 @@ def _extract(work: Path, archive: bytes, sealed: dict) -> Path:
             tar.extractall(copy, filter="data")
         else:
             tar.extractall(copy)
+    materialised = _materialised_drift(copy, tree)
+    if materialised:
+        raise AuditAborted(
+            f"the archive of {sealed['commit'][:7]} is not the sealed tree: {', '.join(materialised)}"
+        )
     drift = _sealed_drift(copy, sealed)
     if drift:
         raise AuditAborted(f"{', '.join(drift)} at {sealed['commit'][:7]} does not match the seal")

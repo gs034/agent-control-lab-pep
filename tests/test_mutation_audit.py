@@ -280,6 +280,7 @@ def test_run_refuses_another_python_minor_version(tmp_path):
 def test_copy_that_differs_from_the_seal_aborts(tmp_path):
     root = _toy(tmp_path)
     archive = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=root, check=True, capture_output=True).stdout
+    tree = ma._archived_tree(root, "HEAD")
     (root / "tests" / "test_calc.py").write_text(TESTS + "\n")
     _git(root, "commit", "-q", "-am", "edit tests")
     _mutant(root, "A9", "M01", CALC, CALC.replace("return a + b", "return a - b"))
@@ -287,7 +288,7 @@ def test_copy_that_differs_from_the_seal_aborts(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     with pytest.raises(ma.AuditAborted, match="tests/test_calc.py .* does not match the seal"):
-        ma._extract(work, archive, sealed)
+        ma._extract(work, archive, sealed, tree)
 
 
 @pytest.mark.parametrize(
@@ -306,11 +307,12 @@ def test_patch_that_touches_another_file_aborts_after_apply(tmp_path, extra):
     mutant = ma.parse_mutant("M01", (root / "audits" / "A10" / "mutants" / "M01.patch").read_text())
     smuggled = tmp_path / "smuggled.patch"
     smuggled.write_text("diff --git a/toy/calc.py b/toy/calc.py\n" + good + extra())
-    archive = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=root, check=True, capture_output=True).stdout
+    archive = ma._archive(root, sealed["commit"])
+    tree = ma._archived_tree(root, sealed["commit"])
     work = tmp_path / "work"
     work.mkdir()
     with pytest.raises(ma.AuditAborted, match="changed files other than toy/calc.py"):
-        ma._run_mutant(work, archive, sealed, mutant, smuggled)
+        ma._run_mutant(work, archive, tree, sealed, mutant, smuggled)
 
 
 def test_an_enclosing_repository_cannot_change_how_a_patch_applies(tmp_path, monkeypatch):
@@ -755,7 +757,9 @@ def test_run_passes_the_seal_commit_after_end_of_options(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ma.subprocess, "run", _spy)
     ma.run("B4", root=root)
-    assert archives == [["git", "archive", "--format=tar", "--end-of-options", sealed["commit"]]]
+    assert archives == [
+        ["git", "archive", "--format=tar", "--end-of-options", sealed["commit"], ".", ":(exclude)audits"]
+    ]
 
 
 def test_run_refuses_a_seal_naming_a_commit_whose_code_was_reverted(tmp_path):
@@ -1001,3 +1005,203 @@ def test_run_refuses_startup_hooks_outside_tests(tmp_path, name):
     _freeze(root, "C6")
     with pytest.raises(ma.FreezeMismatch, match="run before the tests"):
         ma.run("C6", root=root)
+
+
+# Findings P-6 and P-7: the archive must be exactly the sealed blobs a reviewer
+# reads outside audits/. The diff check leaves the audit's own folder out, and
+# git archive applies attributes from the tree it writes.
+
+
+def _plant_in_own_folder(root: Path, audit_id: str, marker: Path, *, link: bool) -> None:
+    """Seal a commit whose payload sits in audits/<id>/, then make it harmless in the freeze commit."""
+    payload = root / "audits" / audit_id / "helper.py"
+    payload.parent.mkdir(parents=True)
+    payload.write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+    if link:
+        os.symlink(f"../audits/{audit_id}/helper.py", root / "toy" / "_audit_helper.py")
+        init = "from toy import calc\nfrom toy import _audit_helper\n"
+    else:
+        init = (
+            "import pathlib\nimport runpy\n\nfrom toy import calc\n\n"
+            f"runpy.run_path(str(pathlib.Path(__file__).parents[1] / 'audits' / {audit_id!r} / 'helper.py'))\n"
+        )
+    (root / "toy" / "__init__.py").write_text(init)
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "helper")
+    _mutant(root, audit_id, "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    payload.write_text("")
+    _freeze(root, audit_id)
+
+
+@pytest.mark.parametrize(
+    ("link", "message"),
+    [(True, "toy/_audit_helper.py \\(mode 120000"), (False, "audits/P6/helper.py \\(inside audits/P6/")],
+    ids=["symlink-into-audit", "read-from-audit"],
+)
+def test_run_refuses_a_payload_in_the_audits_own_folder_at_the_sealed_commit(tmp_path, link, message):
+    """P-6: the sealed audits/<id>/ is outside the diff check, so it must not reach the run."""
+    root = _toy(tmp_path)
+    marker = tmp_path / "p6-ran"
+    _plant_in_own_folder(root, "P6", marker, link=link)
+    with pytest.raises(ma.FreezeMismatch, match=message):
+        ma.run("P6", root=root)
+    assert not marker.exists()
+    assert not (root / "audits" / "P6" / "results.json").exists()
+
+
+@pytest.mark.parametrize("attributes", [".gitattributes", "toy/.gitattributes"])
+def test_run_refuses_gitattributes_in_the_sealed_tree(tmp_path, attributes):
+    """P-7: export-subst writes the commit message body into a file that then runs."""
+    root = _toy(tmp_path)
+    marker = tmp_path / "p7-ran"
+    pattern = "stamp.py" if attributes.startswith("toy/") else "toy/stamp.py"
+    (root / attributes).write_text(f"{pattern} export-subst\n")
+    (root / "toy" / "stamp.py").write_text("$Format:%b$\n")
+    (root / "toy" / "__init__.py").write_text("from toy import calc\nfrom toy import stamp\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", f"stamp\n\nopen({str(marker)!r}, 'w').write('ran')")
+    _mutant(root, "P7", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "P7")
+    with pytest.raises(ma.FreezeMismatch, match=f"{attributes} \\(attributes change what git archive writes"):
+        ma.run("P7", root=root)
+    assert not marker.exists()
+
+
+def test_repository_attributes_that_change_the_archive_abort_the_run(tmp_path):
+    """The extracted copy is checked blob by blob, so any attribute source that rewrites a file shows."""
+    root = _toy(tmp_path)
+    (root / "toy" / "stamp.py").write_text("STAMP = '$Format:%H$'\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "stamp")
+    _mutant(root, "P8", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "P8")
+    (root / ".git" / "info").mkdir(exist_ok=True)
+    (root / ".git" / "info" / "attributes").write_text("toy/stamp.py export-subst\n")
+    with pytest.raises(ma.AuditAborted, match="toy/stamp.py \\(content differs from blob"):
+        ma.run("P8", root=root)
+    assert not (root / "audits" / "P8" / "results.json").exists()
+
+
+def test_a_global_attributes_file_cannot_change_the_archive(tmp_path, monkeypatch):
+    root = _toy(tmp_path)
+    (root / "toy" / "stamp.py").write_text("STAMP = '$Format:%H$'\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "stamp")
+    _mutant(root, "P9", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _freeze(root, "P9")
+    attributes = tmp_path / "global-attributes"
+    attributes.write_text("toy/stamp.py export-subst\n")
+    config = tmp_path / "global-gitconfig"
+    config.write_text(f"[core]\n\tattributesFile = {attributes}\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    ambient = subprocess.run(["git", "archive", "HEAD", "toy/stamp.py"], cwd=root, check=True, capture_output=True)
+    assert b"$Format:%H$" not in ambient.stdout, "the global attributes file does rewrite a plain archive"
+    assert ma.run("P9", root=root)["mutants"][0]["outcome"] == "killed"
+
+
+def _retar(archive: bytes, edit) -> bytes:  # type: ignore[no-untyped-def]
+    import io
+    import tarfile
+
+    members = []
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+        for info in tar.getmembers():
+            data = tar.extractfile(info).read() if info.isfile() else None
+            members.append((info, data))
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:") as tar:
+        for info, data in edit(members):
+            tar.addfile(info, io.BytesIO(data) if data is not None else None)
+    return out.getvalue()
+
+
+def _file(name: str, data: bytes):  # type: ignore[no-untyped-def]
+    import tarfile
+
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = 0o644
+    return info, data
+
+
+def _edit_calc(members):  # type: ignore[no-untyped-def]
+    for info, data in members:
+        if info.name == "toy/calc.py":
+            data = data + b"\nX = 1\n"
+            info.size = len(data)
+        yield info, data
+
+
+def _add_symlink(members):  # type: ignore[no-untyped-def]
+    import tarfile
+
+    yield from members
+    info = tarfile.TarInfo("toy/link.py")
+    info.type = tarfile.SYMTYPE
+    info.linkname = "calc.py"
+    yield info, None
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (_edit_calc, "toy/calc.py \\(content differs"),
+        (lambda m: [*m, _file("toy/extra.py", b"X = 1\n")], "toy/extra.py \\(not in the sealed tree"),
+        (lambda m: [(i, d) for i, d in m if i.name != "toy/__init__.py"], "toy/__init__.py \\(missing"),
+        (_add_symlink, "toy/link.py \\(not a regular file"),
+    ],
+    ids=["changed", "extra", "missing", "symlink"],
+)
+def test_extracted_copy_must_be_exactly_the_sealed_blobs(tmp_path, edit, message):
+    root = _toy(tmp_path)
+    _mutant(root, "P10", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    sealed = _freeze(root, "P10")
+    archive = _retar(ma._archive(root, sealed["commit"]), edit)
+    tree = ma._archived_tree(root, sealed["commit"])
+    work = tmp_path / "work"
+    work.mkdir()
+    with pytest.raises(ma.AuditAborted, match=message):
+        ma._extract(work, archive, sealed, tree)
+
+
+def test_normal_freeze_and_run_archive_nothing_from_audits(tmp_path):
+    """No false refusal: mutants committed before the freeze, and other audit folders, still run."""
+    import io
+    import tarfile
+
+    root = _toy(tmp_path)
+    (root / "audits" / "OLD").mkdir(parents=True)
+    (root / "audits" / "OLD" / "results.md").write_text("# old\n")
+    (root / "toy" / "tool.sh").write_text("#!/bin/sh\n")
+    (root / "toy" / "tool.sh").chmod(0o755)
+    _mutant(root, "P11", "M01", CALC, CALC.replace("return a + b", "return a - b"))
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "mutants first, an older audit, an executable")
+    sealed = _freeze(root, "P11")
+    with tarfile.open(fileobj=io.BytesIO(ma._archive(root, sealed["commit"])), mode="r:") as tar:
+        names = tar.getnames()
+    assert "toy/calc.py" in names
+    assert not [n for n in names if n == "audits" or n.startswith("audits/")]
+    assert ma.run("P11", root=root)["mutants"][0]["outcome"] == "killed"
+
+
+def test_committed_audits_pass_the_sealed_tree_checks(tmp_path):
+    """Every audit already in audits/ still passes the P-6 and P-7 rules, when the history is present."""
+    import json
+
+    audits = sorted(p.parent for p in (ROOT / "audits").glob("*/freeze.json"))
+    assert audits
+    for audit in audits:
+        commit = json.loads((audit / "freeze.json").read_text())["commit"]
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=ROOT, capture_output=True, check=False
+        )
+        if present.returncode != 0:
+            pytest.skip("the audited commits are not in this checkout (shallow or copied)")
+        history = _git(ROOT, "log", "--format=%H", "--", f"audits/{audit.name}/freeze.json").split()
+        assert len(history) == 1
+        ma._refuse_unsafe_tree(ROOT, commit, history[0], audit.name)
+        work = tmp_path / audit.name
+        work.mkdir()
+        tree = ma._archived_tree(ROOT, commit)
+        ma._extract(work, ma._archive(ROOT, commit), {"commit": commit, "files": {}}, tree)
