@@ -265,27 +265,35 @@ class PepRuntime:
     def activate_kill(self) -> None:
         self.kill()
 
-    def suspend(self) -> None:
-        """Reversible halt. No-op when already killed (kill wins)."""
+    def suspend(self, *, expect_halt: HaltMode | None = None) -> None:
+        """Reversible halt. No-op when already killed (kill wins).
+
+        With ``expect_halt`` the halt file is written only if it still reads
+        that mode under the store lock (``HaltStore.write_if``).
+        """
         with self._lock:
             if self._mode is RuntimeMode.KILLED:
                 return
             self._mode = RuntimeMode.SUSPENDED
-            self._persist_halt()
+            self._persist_halt(expect_halt)
 
-    def resume(self) -> None:
-        """Clear suspend only. A killed PEP stays killed."""
+    def resume(self, *, expect_halt: HaltMode | None = None) -> None:
+        """Clear suspend only. A killed PEP stays killed.
+
+        With ``expect_halt`` the halt file is written only if it still reads
+        that mode under the store lock, and a missing file is not recreated.
+        """
         with self._lock:
             if self._mode is RuntimeMode.SUSPENDED:
                 self._mode = RuntimeMode.ACTIVE
-                self._persist_halt()
+                self._persist_halt(expect_halt)
 
     def mark_unavailable(self) -> None:
         with self._lock:
             self.available = False
             self._persist_halt()
 
-    def _persist_halt(self) -> None:
+    def _persist_halt(self, expect_halt: HaltMode | None = None) -> None:
         store = self._halt_store
         if store is None:
             return
@@ -294,7 +302,20 @@ class PepRuntime:
             available=self.available,
         )
         try:
-            written = store.write(requested)
+            if expect_halt is None:
+                written = store.write(requested)
+            else:
+                on_disk, wrote = store.write_if(expect_halt, requested)
+                if not wrote or on_disk is None:
+                    # The file changed after the caller read it. Leave it. A
+                    # kill found there is learned here; any other change is
+                    # read by the caller's next halt check.
+                    if on_disk is not None and on_disk.killed():
+                        self._mode = RuntimeMode.KILLED
+                        self.available = on_disk.available
+                        self._engage_fence_unlocked()
+                    return
+                written = on_disk
         except HaltStoreError:
             # Persist failed. Stay fail-closed in this process (already killed
             # or suspended in memory). Next process may miss the write.

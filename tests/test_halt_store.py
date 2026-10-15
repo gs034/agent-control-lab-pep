@@ -270,3 +270,24 @@ def test_a_held_halt_lock_fails_the_write_after_the_bounded_wait(tmp_path: Path,
     finally:
         os.close(fd)
     assert HaltStore(halt).read().mode is HaltMode.ACTIVE
+
+
+def test_write_if_keeps_a_changed_or_missing_file(tmp_path: Path):
+    """P-8: compare-and-write does not overwrite another mode or recreate a deleted file."""
+    halt = tmp_path / "halt.json"
+    store = HaltStore(halt)
+    active = HaltState(mode=HaltMode.ACTIVE, available=True)
+    on_disk, wrote = store.write_if(HaltMode.ACTIVE, active)
+    assert (on_disk, wrote) == (None, False)
+    assert not halt.exists()
+
+    store.write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+    on_disk, wrote = store.write_if(HaltMode.ACTIVE, active)
+    assert wrote is False
+    assert on_disk is not None and on_disk.mode is HaltMode.SUSPENDED
+    assert store.read().mode is HaltMode.SUSPENDED
+
+    on_disk, wrote = store.write_if(HaltMode.SUSPENDED, active)
+    assert wrote is True
+    assert on_disk is not None and on_disk.mode is HaltMode.ACTIVE
+    assert store.read().mode is HaltMode.ACTIVE
