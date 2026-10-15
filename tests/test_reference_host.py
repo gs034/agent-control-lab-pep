@@ -2413,7 +2413,7 @@ def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
 
 
 def _stopped_worker(proc: subprocess.Popen) -> bool:
-    """True once the worker has exited. Already reaped counts: the killer waitpids."""
+    """True once the worker has exited. This test reaps it. The gate does not."""
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -2442,6 +2442,21 @@ def _process_state(pid: int) -> str | None:
         # which is not a FileNotFoundError.
         return None
     return raw.rsplit(")", 1)[1].split()[0]
+
+
+def _became_dead(pid: int, timeout: float = 2.0) -> bool:
+    """True once ``pid`` is a zombie or gone.
+
+    SIGKILL can leave the task runnable for a moment, and the proc read can
+    raise while the pid disappears. A process that stays alive fails.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if _process_state(pid) in {None, "Z"}:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
 
 
 def _pipe_at_eof(fd: int, timeout: float) -> bool:
@@ -2519,6 +2534,79 @@ def test_a_worker_that_sends_a_second_frame_is_refused_and_discarded():
     assert closed and reaped
 
 
+def test_a_socket_error_is_not_an_empty_frame_check():
+    """A socket error during the extra-frame check is not 'nothing pending'."""
+    from pep.host.executor import _bytes_pending
+
+    class Peek:
+        def __init__(self, sock: socket.socket, error: OSError | None) -> None:
+            self._sock = sock
+            self._error = error
+
+        def fileno(self) -> int:
+            return self._sock.fileno()
+
+        def recv(self, *_args: object, **_kwargs: object) -> bytes:
+            if self._error is not None:
+                raise self._error
+            return b""
+
+    gate, other = socket.socketpair()
+    try:
+        other.sendall(b"x")
+        with pytest.raises(ConnectionResetError):
+            _bytes_pending(Peek(gate, ConnectionResetError(104, "Connection reset by peer")))
+        assert _bytes_pending(Peek(gate, BlockingIOError(11, "Resource temporarily unavailable"))) is False
+    finally:
+        gate.close()
+        other.close()
+
+
+def test_a_socket_error_on_the_frame_check_discards_the_worker(monkeypatch: pytest.MonkeyPatch):
+    """A reset after a valid reply must not be returned as the tool result."""
+    from pep.host import executor as executor_module
+    from pep.host.executor import ToolExecutionError, _Worker
+
+    calls = {"n": 0}
+
+    def checking(_conn):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return False
+
+    monkeypatch.setattr(executor_module, "_bytes_pending", checking)
+    gate, worker_end = socket.socketpair()
+    dummy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+
+    def answer() -> None:
+        try:
+            worker_end.recv(65536)
+            worker_end.sendall(_frame(json.dumps({"status": "ok", "result": {"pong": "hi"}}).encode()))
+        except OSError:
+            return
+
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    worker = _Worker(dummy.pid, gate, call_timeout=5.0)
+    try:
+        with pytest.raises(ToolExecutionError) as raised:
+            worker.call("echo.ping", ARGS)
+        assert raised.value.kind == "error"
+        assert worker.closed
+        assert calls["n"] == 2
+        thread.join(timeout=5)
+        assert _stopped_worker(dummy)
+    finally:
+        worker_end.close()
+        worker.close()
+        thread.join(timeout=2)
+        _reap_quiet(dummy)
+
+
 def test_a_worker_that_speaks_between_calls_is_discarded_before_the_next_call():
     from pep.host.executor import ToolExecutionError, _Worker
 
@@ -2553,10 +2641,11 @@ def test_an_executor_worker_leads_its_own_process_group(tmp_path: Path) -> None:
 
 
 def test_killing_a_worker_kills_a_grandchild_in_its_group() -> None:
-    """SIGKILL goes to the worker's process group, and the worker is reaped.
+    """SIGKILL goes to the worker's process group.
 
     A grandchild that stayed in that group dies too. Killing only the
     worker pid would leave it running, still holding the write end.
+    The gate does not waitpid the worker, so the leader stays for its parent.
     """
     from pep.host.executor import _Worker
 
@@ -2597,8 +2686,8 @@ time.sleep(120)
         assert not _pipe_at_eof(read_fd, 0.2)
         worker.close()
         assert _pipe_at_eof(read_fd, 2.0)
-        assert _process_state(proc.pid) is None
-        assert _process_state(grandchild) in {None, "Z"}
+        assert _became_dead(proc.pid)
+        assert _became_dead(grandchild)
     finally:
         os.close(read_fd)
         worker_end.close()

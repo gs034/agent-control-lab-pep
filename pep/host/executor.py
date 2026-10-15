@@ -21,9 +21,9 @@ An x32-style number (bit 0x40000000) is rejected. ``memfd_create``,
 on the list. The agent does not choose the function.
 The gate sends a tool name and the argument snapshot, and a call that
 exceeds its timeout is denied. Stopping a worker sends SIGKILL to its
-process group and reaps it with waitpid. The worker is put in its own
-process group at fork, so a grandchild that stayed in that group is
-killed with the worker.
+process group. The gate does not waitpid the worker. The nursery reaps
+it on SIGCHLD. The worker is put in its own process group at fork, so
+a grandchild that stayed in that group is killed with the worker.
 
 Linux x86_64 only. If the sandbox cannot be installed, the gate does
 not run the tool.
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+import errno
 import json
 import os
 import resource
@@ -399,14 +400,12 @@ class _Worker:
 
 
 def _kill(pid: int) -> None:
-    """SIGKILL the worker's process group, then reap the worker.
+    """SIGKILL the worker's process group.
 
     The worker leads its own process group, set at fork. Signalling that
     group kills a child and a grandchild that stayed in it. Signalling
-    only the pid would leave them running. ``waitpid`` always runs, so a
-    worker this process forked is not left as a zombie. When this process
-    is not the parent, the call returns at once and the nursery reaps on
-    SIGCHLD.
+    only the pid would leave them running. The gate does not waitpid the
+    worker. The nursery is the parent and reaps on SIGCHLD.
     """
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -417,12 +416,6 @@ def _kill(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        return
-    except OSError:
-        return
 
 
 def _kill_and_reap(pid: int) -> None:
@@ -758,15 +751,21 @@ def _bytes_pending(conn: socket.socket) -> bool:
     """True when the peer has sent bytes nobody asked for yet. Does not block.
 
     A socket with a timeout waits for readability inside ``recv`` whatever
-    the flags, so readiness is polled first with a zero timeout.
+    the flags, so readiness is polled first with a zero timeout. A socket
+    error is not an empty socket: it propagates, and the caller discards
+    the worker instead of trusting the next frame.
     """
     poller = select.poll()
     poller.register(conn.fileno(), select.POLLIN)
+    ready = poller.poll(0)
+    if not ready:
+        return False
+    _fd, event = ready[0]
+    if event & (select.POLLERR | select.POLLNVAL):
+        raise OSError(errno.EIO, "worker socket error")
     try:
-        if not poller.poll(0):
-            return False
         peeked = conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-    except OSError:
+    except BlockingIOError:
         return False
     return bool(peeked)
 

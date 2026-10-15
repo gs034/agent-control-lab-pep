@@ -202,7 +202,9 @@ def _flock_bounded(fd: int) -> None:
             return
         except BlockingIOError:
             if time.monotonic() >= deadline:
-                raise HaltStoreError("halt store lock is held by another writer") from None
+                raise HaltStoreError(
+                    f"halt lock still held after {LOCK_WAIT_SECONDS:g} seconds; the write did not happen"
+                ) from None
             time.sleep(0.01)
 
 

@@ -112,7 +112,10 @@ def write_killed(path: Path) -> HaltState:
         return state
     try:
         written = HaltStore(path).write(HaltState(mode=HaltMode.KILLED, available=True))
-    except HaltStoreError:
+    except HaltStoreError as exc:
+        message = str(exc)
+        if message.startswith("halt lock still held"):
+            raise HaltStoreError(f"kill did not land: {message}") from exc
         raise
     except OSError as exc:
         raise HaltStoreError(f"halt store persist failed: {exc}") from exc
