@@ -1,0 +1,13 @@
+Intent: Widen the private-directory mask from 0o077 to 0o007, so a directory readable, writable or traversable by its group passes as private.
+Property: The halt, log and policy directories must have no group or other bits at all (mode 0700); any group access is a PathGuardError and the host refuses to start.
+--- a/pep/host/fsguard.py
++++ b/pep/host/fsguard.py
+@@ -49,7 +49,7 @@ def require_directory(path: Path, *, allow_group_traverse: bool) -> os.stat_resu
+     if allow_group_traverse:
+         if mode & 0o022:
+             raise PathGuardError(f"directory is writable by group or other: {path}")
+-    elif mode & 0o077:
++    elif mode & 0o007:
+         raise PathGuardError(f"directory is accessible to group or other: {path}")
+     return info
+ 

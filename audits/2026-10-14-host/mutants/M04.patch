@@ -1,0 +1,18 @@
+Intent: A failed ALLOW append after tool entry no longer turns the reply into DENY; the ALLOW and the tool result are returned with nothing logged.
+Property: No ALLOW leaves the host unless the decision log accepted the ALLOW record; an append failure after entry is a fail-closed DENY (kill_active).
+--- a/pep/host/server.py
++++ b/pep/host/server.py
+@@ -766,12 +766,7 @@ class ReferenceHost:
+             now,
+             request_id,
+         ):
+-            return _response(
+-                "DENY",
+-                "kill_active",
+-                "decision log append failed after tool entry; fail-closed deny",
+-                request_id,
+-            )
++            pass
+         response = _response(
+             "ALLOW",
+             str(finished.receipt.reason_code),

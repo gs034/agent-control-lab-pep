@@ -1,0 +1,13 @@
+Intent: Remove the whole-call deadline from the worker read; each recv gets a fresh call_timeout window, so a worker that drips bytes is never cut off.
+Property: A tool call is bounded by one call_timeout deadline for the whole reply, not a per-recv window; a slow-dripping worker is denied with kind timeout.
+--- a/pep/host/executor.py
++++ b/pep/host/executor.py
+@@ -331,7 +331,7 @@ class _Worker:
+             self._conn.settimeout(self._timeout)
+             try:
+                 _write_frame(self._conn, {"tool_name": tool_name, "args": dict(args)})
+-                reply = _read_frame(self._conn, deadline=deadline)
++                reply = _read_frame(self._conn)
+             except TimeoutError as exc:
+                 self.close()
+                 raise ToolExecutionError("timeout") from exc

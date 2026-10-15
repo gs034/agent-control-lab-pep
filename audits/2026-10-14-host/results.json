@@ -1,0 +1,199 @@
+{
+  "audit_id": "2026-10-14-host",
+  "baseline_seconds": 13.06,
+  "commit": "653ee4a819c55bb1fadab2421aa62336352ce2e3",
+  "mutants": [
+    {
+      "activation": [
+        "1151"
+      ],
+      "detail": "",
+      "duration_seconds": 18.83,
+      "file": "pep/host/server.py",
+      "id": "M01",
+      "intent": "Off-by-one on the agent connection cap: _acquire_slot admits one connection more than max_connections.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_connection_cap_denies_the_extra_client",
+        "tests/test_reference_host.py::test_reconnect_needs_a_free_slot_and_is_a_new_session"
+      ],
+      "outcome": "killed",
+      "property": "The host never serves more than max_connections concurrent agent connections; the (max+1)th is answered DENY connection_limit and closed."
+    },
+    {
+      "activation": [
+        "1330"
+      ],
+      "detail": "",
+      "duration_seconds": 14.94,
+      "file": "pep/host/server.py",
+      "id": "M02",
+      "intent": "A policy-file digest mismatch on re-read is reported as policy_ok=True, so the request proceeds on changed policy bytes.",
+      "killing_tests": [],
+      "outcome": "survived-never-activated",
+      "property": "A policy file whose bytes changed after load is a fail-closed DENY (policy_miss) with the host latched halted, never an evaluation against the new bytes."
+    },
+    {
+      "activation": [
+        "691"
+      ],
+      "detail": "",
+      "duration_seconds": 14.47,
+      "file": "pep/host/server.py",
+      "id": "M03",
+      "intent": "Skip the second halt-file read between the PRE_ENTRY log line and tool entry; a kill landing in that gap no longer blocks the tool.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_kill_after_the_first_halt_check_stops_the_tool",
+        "tests/test_reference_host.py::test_admitted_denials_are_logged_during_a_flood"
+      ],
+      "outcome": "killed",
+      "property": "A kill observed after the first halt check but before tool entry denies the admitted call; the tool must not run once the halt file is no longer active."
+    },
+    {
+      "activation": [
+        "769"
+      ],
+      "detail": "",
+      "duration_seconds": 14.2,
+      "file": "pep/host/server.py",
+      "id": "M04",
+      "intent": "A failed ALLOW append after tool entry no longer turns the reply into DENY; the ALLOW and the tool result are returned with nothing logged.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_a_decision_that_outlives_the_drain_is_counted_not_lost"
+      ],
+      "outcome": "killed",
+      "property": "No ALLOW leaves the host unless the decision log accepted the ALLOW record; an append failure after entry is a fail-closed DENY (kill_active)."
+    },
+    {
+      "activation": [
+        "_connect_attested:114"
+      ],
+      "detail": "",
+      "duration_seconds": 14.13,
+      "file": "pep/host/client.py",
+      "id": "M05",
+      "intent": "Drop the SO_PEERCRED uid comparison in _connect_attested; the client trusts any listener on a socket file owned by host_uid.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_client_denies_when_the_host_is_down_or_the_peer_is_wrong"
+      ],
+      "outcome": "killed",
+      "property": "The client attests the accepting process by kernel peer credentials, not only by the socket file's owner; a peer whose uid is not host_uid is DENY host_unattested."
+    },
+    {
+      "activation": [
+        "266"
+      ],
+      "detail": "",
+      "duration_seconds": 13.94,
+      "file": "pep/host/client.py",
+      "id": "M06",
+      "intent": "Request-id monotonicity check accepts a repeated number (<= becomes <), so a replayed reply line is taken as the answer to a new request.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_held_connection_denies_and_closes_on_a_reused_request_id"
+      ],
+      "outcome": "killed",
+      "property": "On a held connection every reply's host request number must strictly rise; a repeated or replayed reply is DENY reply_mismatch and the connection is closed."
+    },
+    {
+      "activation": [
+        "334"
+      ],
+      "detail": "timeout",
+      "duration_seconds": 300.19,
+      "file": "pep/host/executor.py",
+      "id": "M07",
+      "intent": "Remove the whole-call deadline from the worker read; each recv gets a fresh call_timeout window, so a worker that drips bytes is never cut off.",
+      "killing_tests": [],
+      "outcome": "timeout",
+      "property": "A tool call is bounded by one call_timeout deadline for the whole reply, not a per-recv window; a slow-dripping worker is denied with kind timeout."
+    },
+    {
+      "activation": [
+        "477"
+      ],
+      "detail": "",
+      "duration_seconds": 14.23,
+      "file": "pep/host/executor.py",
+      "id": "M08",
+      "intent": "A registry function that raises a non-OSError exception is reported to the gate as status ok with result null instead of error.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_tool_exception_is_not_logged_as_a_policy_miss",
+        "tests/test_reference_host.py::test_admitted_denials_are_logged_during_a_flood"
+      ],
+      "outcome": "killed",
+      "property": "A tool that raises after entry is a DENY tool_failed, never an ALLOW carrying a fabricated result."
+    },
+    {
+      "activation": [
+        "_Worker.call:336"
+      ],
+      "detail": "",
+      "duration_seconds": 13.86,
+      "file": "pep/host/executor.py",
+      "id": "M09",
+      "intent": "A worker whose call timed out is not closed or killed, so the stale worker (and its late reply) stays bound to the session for the next call.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout"
+      ],
+      "outcome": "killed",
+      "property": "A worker that exceeded its call deadline is killed and discarded; a late reply from it can never be returned as the result of a later request."
+    },
+    {
+      "activation": [
+        "DecisionLog.__init__:119"
+      ],
+      "detail": "",
+      "duration_seconds": 13.98,
+      "file": "pep/host/log.py",
+      "id": "M10",
+      "intent": "Open the decision log without O_NOFOLLOW, so a symlink planted at the log path is followed and receives the records.",
+      "killing_tests": [
+        "tests/test_reference_host.py::test_decision_log_refuses_a_symlink_and_does_not_chmod_the_path"
+      ],
+      "outcome": "killed",
+      "property": "The decision log path is opened without following symlinks; a planted link at the log path is refused at host start, not written through."
+    },
+    {
+      "activation": [
+        "52"
+      ],
+      "detail": "",
+      "duration_seconds": 14.26,
+      "file": "pep/host/fsguard.py",
+      "id": "M11",
+      "intent": "Widen the private-directory mask from 0o077 to 0o007, so a directory readable, writable or traversable by its group passes as private.",
+      "killing_tests": [],
+      "outcome": "survived-oracle-masked",
+      "property": "The halt, log and policy directories must have no group or other bits at all (mode 0700); any group access is a PathGuardError and the host refuses to start."
+    },
+    {
+      "activation": [
+        "170"
+      ],
+      "detail": "",
+      "duration_seconds": 14.44,
+      "file": "pep/host/haltfile.py",
+      "id": "M12",
+      "intent": "An empty or whitespace-only halt file is classified as ACTIVE instead of CORRUPT.",
+      "killing_tests": [],
+      "outcome": "survived-never-activated",
+      "property": "Any halt file whose bytes do not parse as an active record is halted (fail-closed); emptiness is corruption, not an active state."
+    }
+  ],
+  "python": "3.13.16",
+  "repair_of": null,
+  "reviewer": "same-family",
+  "summary": {
+    "counts": {
+      "harness-fault": 0,
+      "invalid": 0,
+      "killed": 8,
+      "survived-never-activated": 2,
+      "survived-oracle-masked": 1,
+      "timeout": 1
+    },
+    "kill_rate_timeouts_as_killed": "9 of 12 (75%)",
+    "kill_rate_timeouts_not_killed": "8 of 12 (67%)",
+    "valid": 12
+  },
+  "timeout_seconds": 300.0
+}

@@ -1,0 +1,13 @@
+Intent: A registry function that raises a non-OSError exception is reported to the gate as status ok with result null instead of error.
+Property: A tool that raises after entry is a DENY tool_failed, never an ALLOW carrying a fabricated result.
+--- a/pep/host/executor.py
++++ b/pep/host/executor.py
+@@ -474,7 +474,7 @@ def _run_tool(registry: Mapping[str, Any], message: Mapping[str, Any]) -> dict[s
+             return {"status": "permission"}
+         return {"status": "error"}
+     except Exception:
+-        return {"status": "error"}
++        return {"status": "ok", "result": None}
+     try:
+         encoded = json.dumps(result, ensure_ascii=True)
+         parsed = json.loads(encoded)

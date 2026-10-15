@@ -1,0 +1,13 @@
+Intent: A policy-file digest mismatch on re-read is reported as policy_ok=True, so the request proceeds on changed policy bytes.
+Property: A policy file whose bytes changed after load is a fail-closed DENY (policy_miss) with the host latched halted, never an evaluation against the new bytes.
+--- a/pep/host/server.py
++++ b/pep/host/server.py
+@@ -1327,7 +1327,7 @@ class ReferenceHost:
+         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+         if digest != self._file_digest:
+             return (
+-                False,
++                True,
+                 {"name": "policy_file_reread", "outcome": "mismatch", "digest": digest},
+                 "policy file bytes changed after the host loaded them; fail-closed deny",
+             )

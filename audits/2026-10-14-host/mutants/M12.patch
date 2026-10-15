@@ -1,0 +1,13 @@
+Intent: An empty or whitespace-only halt file is classified as ACTIVE instead of CORRUPT.
+Property: Any halt file whose bytes do not parse as an active record is halted (fail-closed); emptiness is corruption, not an active state.
+--- a/pep/host/haltfile.py
++++ b/pep/host/haltfile.py
+@@ -167,7 +167,7 @@ def _open_error(exc: OSError) -> tuple[HaltState, str]:
+ 
+ def _classify(raw: str) -> tuple[HaltState, str]:
+     if not raw.strip():
+-        return _killed(), CORRUPT
++        return HaltState(mode=HaltMode.ACTIVE, available=True), ACTIVE
+     state = parse_halt_text(raw)
+     if state.mode is HaltMode.KILLED or not state.available:
+         if state.mode is HaltMode.KILLED and not state.available and _looks_corrupt(raw):

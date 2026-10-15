@@ -1,0 +1,13 @@
+Intent: Off-by-one on the agent connection cap: _acquire_slot admits one connection more than max_connections.
+Property: The host never serves more than max_connections concurrent agent connections; the (max+1)th is answered DENY connection_limit and closed.
+--- a/pep/host/server.py
++++ b/pep/host/server.py
+@@ -1148,7 +1148,7 @@ class ReferenceHost:
+ 
+     def _acquire_slot(self) -> bool:
+         with self._lock:
+-            if self._live >= self._max_connections:
++            if self._live > self._max_connections:
+                 return False
+             self._live += 1
+             return True

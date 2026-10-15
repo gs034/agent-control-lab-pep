@@ -1,0 +1,13 @@
+Intent: Skip the second halt-file read between the PRE_ENTRY log line and tool entry; a kill landing in that gap no longer blocks the tool.
+Property: A kill observed after the first halt check but before tool entry denies the admitted call; the tool must not run once the halt file is no longer active.
+--- a/pep/host/server.py
++++ b/pep/host/server.py
+@@ -688,7 +688,7 @@ class ReferenceHost:
+         # log fsync, is read again here. The tool does not run. This denial
+         # is the outcome of an admitted call, so it is appended on its own
+         # and is not part of the denial-log window.
+-        blocked = self._halt_block()
++        blocked = None
+         if blocked is not None:
+             check, reason, detail = blocked
+             return self._record(
