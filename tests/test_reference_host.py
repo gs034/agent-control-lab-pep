@@ -28,6 +28,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import select
+
 import pytest
 
 from pep.evaluate import PepRuntime, evaluate
@@ -2358,7 +2360,10 @@ def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
     from pep.host.executor import ToolExecutionError, _Worker
 
     gate, worker_end = socket.socketpair()
-    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    dummy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
     stop = threading.Event()
 
     def drip() -> None:
@@ -2397,13 +2402,58 @@ def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
         assert isinstance(error, ToolExecutionError)
         assert error.kind == "timeout"
         assert worker.closed
-        assert dummy.wait(timeout=5) is not None
+        assert _stopped_worker(dummy)
     finally:
         stop.set()
         worker_end.close()
         worker.close()
         thread.join(timeout=2)
         caller.join(timeout=2)
+        _reap_quiet(dummy)
+
+
+def _stopped_worker(proc: subprocess.Popen) -> bool:
+    """True once the worker has exited. Already reaped counts: the killer waitpids."""
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return False
+    except ChildProcessError:
+        return True
+    return True
+
+
+def _reap_quiet(proc: subprocess.Popen) -> None:
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, ChildProcessError):
+        pass
+
+
+def _process_state(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    return raw.rsplit(")", 1)[1].split()[0]
+
+
+def _pipe_at_eof(fd: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([fd], [], [], min(0.05, max(0.0, deadline - time.monotonic())))
+        if not ready:
+            continue
+        try:
+            data = os.read(fd, 1)
+        except BlockingIOError:
+            continue
+        return data == b""
+    return False
 
 
 def _fake_worker_call(reply: bytes) -> tuple[Any, bool, bool]:
@@ -2411,7 +2461,10 @@ def _fake_worker_call(reply: bytes) -> tuple[Any, bool, bool]:
     from pep.host.executor import ToolExecutionError, _Worker
 
     gate, worker_end = socket.socketpair()
-    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    dummy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
 
     def answer() -> None:
         try:
@@ -2430,16 +2483,12 @@ def _fake_worker_call(reply: bytes) -> tuple[Any, bool, bool]:
             outcome = exc
         thread.join(timeout=5)
         closed = worker.closed
-        try:
-            reaped = dummy.wait(timeout=5) is not None
-        except subprocess.TimeoutExpired:
-            reaped = False
+        reaped = _stopped_worker(dummy)
         return outcome, closed, reaped
     finally:
         worker_end.close()
         worker.close()
-        dummy.kill()
-        dummy.wait(timeout=5)
+        _reap_quiet(dummy)
 
 
 def _frame(payload: bytes) -> bytes:
@@ -2472,7 +2521,10 @@ def test_a_worker_that_speaks_between_calls_is_discarded_before_the_next_call():
     from pep.host.executor import ToolExecutionError, _Worker
 
     gate, worker_end = socket.socketpair()
-    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    dummy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
     worker = _Worker(dummy.pid, gate, call_timeout=2.0)
     try:
         worker_end.sendall(_frame(json.dumps({"status": "ok", "result": {"pong": "queued"}}).encode()))
@@ -2480,10 +2532,85 @@ def test_a_worker_that_speaks_between_calls_is_discarded_before_the_next_call():
             worker.call("echo.ping", ARGS)
         assert raised.value.kind == "protocol"
         assert worker.closed
-        assert dummy.wait(timeout=5) is not None
+        assert _stopped_worker(dummy)
     finally:
         worker_end.close()
         worker.close()
+        _reap_quiet(dummy)
+
+
+def test_an_executor_worker_leads_its_own_process_group(tmp_path: Path) -> None:
+    """A live worker's process group id is its own pid, so a group signal hits it."""
+    host = _host(tmp_path)
+    try:
+        spare = host._executors._spare
+        assert spare is not None
+        assert os.getpgid(spare._pid) == spare._pid
+    finally:
+        host.close()
+
+
+def test_killing_a_worker_kills_a_grandchild_in_its_group() -> None:
+    """SIGKILL goes to the worker's process group, and the worker is reaped.
+
+    A grandchild that stayed in that group dies too. Killing only the
+    worker pid would leave it running, still holding the write end.
+    """
+    from pep.host.executor import _Worker
+
+    script = """
+import os, sys, time
+write_fd = int(sys.argv[1])
+child = os.fork()
+if child == 0:
+    grand = os.fork()
+    if grand == 0:
+        time.sleep(120)
+        os._exit(0)
+    os.close(write_fd)
+    os.write(1, b"%d\\n" % grand)
+    time.sleep(120)
+    os._exit(0)
+os.close(write_fd)
+time.sleep(120)
+"""
+    read_fd, write_fd = os.pipe()
+    gate, worker_end = socket.socketpair()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, str(write_fd)],
+        stdout=subprocess.PIPE,
+        pass_fds=(write_fd,),
+        start_new_session=True,
+    )
+    os.close(write_fd)
+    worker = _Worker(proc.pid, gate, call_timeout=5.0)
+    grandchild = -1
+    try:
+        assert proc.stdout is not None
+        assert select.select([proc.stdout], [], [], 5)[0], "worker did not report the grandchild"
+        grandchild = int(proc.stdout.readline())
+        assert grandchild != proc.pid
+        assert os.getpgid(grandchild) == proc.pid
+        os.kill(grandchild, 0)
+        assert not _pipe_at_eof(read_fd, 0.2)
+        worker.close()
+        assert _pipe_at_eof(read_fd, 2.0)
+        assert _process_state(proc.pid) is None
+        assert _process_state(grandchild) in {None, "Z"}
+    finally:
+        os.close(read_fd)
+        worker_end.close()
+        worker.close()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        _reap_quiet(proc)
+        if grandchild > 0:
+            try:
+                os.waitpid(grandchild, os.WNOHANG)
+            except ChildProcessError:
+                pass
 
 
 def test_a_deeply_nested_worker_reply_fails_closed_and_discards_the_worker():
