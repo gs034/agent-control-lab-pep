@@ -67,6 +67,29 @@ def _tool_failed(request_id: str, detail: str, tool: str = "echo.ping") -> dict:
     }
 
 
+def _marker(decision: str, session: str, seq: int) -> dict:
+    return {
+        "decision": decision,
+        "reason_code": "session_open" if decision == "SESSION_OPEN" else "session_close",
+        "request_id": f"{session}.{decision}",
+        "session_id": session,
+        "seq": seq,
+        "checks": [],
+    }
+
+
+def _bounded(middle: list[dict], session: str = "u1.c1") -> list[dict]:
+    """One session, seq 1 through N, open at the start and close at the end."""
+    records = [_marker("SESSION_OPEN", session, 1)]
+    for index, record in enumerate(middle, start=2):
+        item = dict(record)
+        item["seq"] = index
+        item["session_id"] = session
+        records.append(item)
+    records.append(_marker("SESSION_CLOSE", session, len(records) + 1))
+    return records
+
+
 def _action(request_id: str = "host.1.2", outcome: str = "allowed", digest: str | None = DIGEST, tool: str = "echo.ping"):
     return parse_claim(
         {
@@ -167,12 +190,40 @@ def test_unverifiable_is_not_consistent():
 
 def test_absence_claim_is_contradicted_by_any_allow_for_that_tool():
     claim = _absence()
-    # A DENY before PRE_ENTRY is a refusal, not a call.
-    assert verify_claim(claim, [_record("host.1.2", "DENY")]).verdict == CONSISTENT
-    assert verify_claim(claim, [_record("host.1.2", "ALLOW", tool_name="file.read")]).verdict == CONSISTENT
     hit = verify_claim(claim, [_record("host.1.2", "DENY"), _record("host.1.3", "ALLOW")])
     assert (hit.verdict, hit.field) == (CONTRADICTED, "tool_name")
     assert "host.1.3" in hit.detail
+
+
+def test_absence_is_consistent_only_inside_a_complete_session():
+    """Another tool's line, or a refusal before entry, proves nothing alone.
+
+    Consistent needs the session open and the session close, and every seq
+    between them. Dropping a line leaves a gap.
+    """
+    claim = _absence()
+    other = _record("host.1.2", "ALLOW", tool_name="file.read")
+    other["seq"] = 1
+    other["session_id"] = "u1.c1"
+    refusal = _record("host.1.2", "DENY")
+    refusal["seq"] = 1
+    refusal["session_id"] = "u1.c1"
+    assert verify_claim(claim, [other]).verdict == UNVERIFIABLE
+    assert verify_claim(claim, [refusal]).verdict == UNVERIFIABLE
+    assert verify_claim(claim, []).verdict == UNVERIFIABLE
+
+    bounded_other = _bounded([_record("host.1.2", "ALLOW", tool_name="file.read")])
+    assert verify_claim(claim, bounded_other).verdict == CONSISTENT
+    # A DENY before PRE_ENTRY is a refusal, not a call, once the session is closed.
+    bounded_refusal = _bounded([_record("host.1.2", "DENY")])
+    assert verify_claim(claim, bounded_refusal).verdict == CONSISTENT
+
+    gapped = [bounded_other[0], bounded_other[-1]]
+    assert verify_claim(claim, gapped).verdict == UNVERIFIABLE
+    opened = bounded_other[:-1]
+    assert verify_claim(claim, opened).verdict == UNVERIFIABLE
+    closed = bounded_other[1:]
+    assert verify_claim(claim, closed).verdict == UNVERIFIABLE
 
 
 def test_absence_entered_then_raised_is_contradicted():

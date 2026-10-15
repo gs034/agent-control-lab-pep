@@ -37,6 +37,12 @@ _DIGEST_HEX = 64
 _FINAL_DECISIONS = frozenset({"ALLOW", "DENY"})
 _CALLED_OUTCOMES = frozenset({"entered", "raised"})
 
+# Written by the host around one served connection. An absence claim is
+# consistent only when a pair of these bounds the given records with no
+# missing seq between them.
+SESSION_OPEN = "SESSION_OPEN"
+SESSION_CLOSE = "SESSION_CLOSE"
+
 
 class ClaimError(ValueError):
     """The claim is not well-formed. Callers must not treat it as consistent."""
@@ -150,7 +156,11 @@ def verify_claim(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVer
     an ``ALLOW`` line, a ``registry_tool`` check of ``entered`` or ``raised``,
     or a ``DENY`` with reason ``tool_failed``. That denial is the line written
     after ``PRE_ENTRY`` when the tool raises, times out, or exceeds the reply
-    frame limit. No records at all is ``unverifiable``, never ``consistent``.
+    frame limit. It is ``consistent`` only when the records include one
+    ``SESSION_OPEN`` and one ``SESSION_CLOSE`` for the same session and every
+    ``seq`` from the open line through the close line is present. A missing
+    ``seq`` is a gap. Anything shorter, including an empty list or another
+    tool's records with no such pair around them, is ``unverifiable``.
 
     Duplicate final records for one ``request_id`` are not settled by the
     last line. Final means ``ALLOW`` or ``DENY``. When those records disagree
@@ -166,8 +176,6 @@ def verify_claim(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVer
 
 
 def _verify_absence(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVerdict:
-    if not records:
-        return ClaimVerdict(UNVERIFIABLE, "tool_name", "no host records were given for this absence claim")
     for record in records:
         if _shows_call(record, claim.tool_name):
             return ClaimVerdict(
@@ -175,7 +183,67 @@ def _verify_absence(claim: Claim, records: Sequence[Mapping[str, Any]]) -> Claim
                 "tool_name",
                 f"host record {record.get('request_id')!s} shows {claim.tool_name} was admitted or entered",
             )
-    return ClaimVerdict(CONSISTENT, None, "no record shows this tool was admitted or entered")
+    if _session_span_is_complete(records):
+        return ClaimVerdict(
+            CONSISTENT,
+            None,
+            "session open and close bound these records, and this tool was not called",
+        )
+    return ClaimVerdict(
+        UNVERIFIABLE,
+        "tool_name",
+        "records are not a complete session, so absence is unverifiable",
+    )
+
+
+def _session_span_is_complete(records: Sequence[Mapping[str, Any]]) -> bool:
+    """True when every given record sits in a gap-free open/close pair.
+
+    A pair is one ``SESSION_OPEN`` and one ``SESSION_CLOSE`` for the same
+    ``session_id``, and every integer ``seq`` from the open line through the
+    close line is present. A record outside every such pair, a missing
+    ``seq``, or a second marker for one session leaves the slice incomplete.
+    """
+    if not records:
+        return False
+    by_seq: dict[int, Mapping[str, Any]] = {}
+    for record in records:
+        seq = record.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1 or seq in by_seq:
+            return False
+        by_seq[seq] = record
+
+    opens: dict[str, int] = {}
+    closes: dict[str, int] = {}
+    for seq, record in by_seq.items():
+        decision = record.get("decision")
+        if decision not in {SESSION_OPEN, SESSION_CLOSE}:
+            continue
+        session_id = record.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        bucket = opens if decision == SESSION_OPEN else closes
+        if session_id in bucket:
+            return False
+        bucket[session_id] = seq
+
+    covered: set[int] = set()
+    sessions = set(opens) & set(closes)
+    if not sessions:
+        return False
+    for session_id in sessions:
+        start = opens[session_id]
+        end = closes[session_id]
+        if start >= end:
+            return False
+        for seq in range(start, end + 1):
+            found = by_seq.get(seq)
+            if found is None:
+                return False
+            covered.add(seq)
+        if by_seq[start].get("session_id") != session_id or by_seq[end].get("session_id") != session_id:
+            return False
+    return set(by_seq) == covered
 
 
 def _verify_action(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVerdict:

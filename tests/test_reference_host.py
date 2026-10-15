@@ -1943,6 +1943,54 @@ def test_host_observes_the_result_and_claims_are_checked_against_its_record(tmp_
         host.close()
 
 
+def test_a_served_session_bounds_a_not_called_claim(tmp_path: Path):
+    """A connection writes session open and session close.
+
+    A not_called claim for a tool that does not appear is consistent only on
+    that whole slice. The denial line by itself is unverifiable, and so is
+    the slice with a seq missing between the markers.
+    """
+    from pep.host.claims import CLAIM_SCHEMA, CONSISTENT, UNVERIFIABLE, parse_claim, verify_claim
+
+    host = _listen(tmp_path)
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        _send(client, {"tool_name": "echo.ping", "args": ARGS})
+        denied = _recv(client)
+        assert denied["decision"] == "DENY"
+        client.close()
+        deadline = time.time() + 2
+        records: list[dict[str, Any]] = []
+        while time.time() < deadline:
+            if host.sessions():
+                time.sleep(0.01)
+                continue
+            records = host.decision_records()
+            decisions = [record["decision"] for record in records]
+            if "SESSION_OPEN" in decisions and "SESSION_CLOSE" in decisions:
+                break
+            time.sleep(0.01)
+        assert host.sessions() == ()
+        assert [record["decision"] for record in records][0] == "SESSION_OPEN"
+        assert records[-1]["decision"] == "SESSION_CLOSE"
+        assert records[0]["session_id"] == records[-1]["session_id"]
+        seqs = [record["seq"] for record in records]
+        assert seqs == list(range(seqs[0], seqs[0] + len(seqs)))
+        other = parse_claim(
+            {"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "file.read", "outcome": "not_called"}
+        )
+        assert verify_claim(other, records).verdict == CONSISTENT
+        denial = [record for record in records if record["decision"] == "DENY"]
+        assert denial and denial[0]["tool_name"] == "echo.ping"
+        assert verify_claim(other, denial).verdict == UNVERIFIABLE
+        gapped = [records[0], records[-1]]
+        assert verify_claim(other, gapped).verdict == UNVERIFIABLE
+    finally:
+        client.close()
+        host.close()
+
+
 def test_unencodable_result_is_observed_as_such_and_not_returned(tmp_path: Path):
     """ADR-0010: a result the host cannot encode is recorded as unencodable
     with no digest; the reply has no result and no digest."""
