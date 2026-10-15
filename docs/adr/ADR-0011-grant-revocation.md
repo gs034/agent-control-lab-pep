@@ -1,10 +1,12 @@
 # ADR-0011: Grant revocation
 
-Status: Proposed. Built on the owner's Go of 15 October 2026 ("L3.1 grant revocation"). Accepted when merged by the owner.
+Status: Proposed. Built on the owner's Go of 15 October 2026. Work item L3.7, first half. Accepted when merged by the owner.
 
-## A note on the work-item code
+## Work item
 
-The owner's Go named this item L3.1. In `docs/threat-model.md` the code L3.1 denotes host-side state binding on the reference host (the `state_observer` and `implementation_observer` the library already supports). Grant revocation has had no code of its own. This ADR builds revocation, as the Go describes it, and leaves the code assignment to the owner: either L3.1 is widened to cover revocation, or revocation takes a new code. The threat-model legend is not edited here.
+This is **L3.7** in the owner's route-to-production plan, assigned by the owner on 15 October 2026. L3.7 has two halves there: an admin `revoke` operation for unconsumed grants, and an admin-socket authorisation stronger than file mode, since same-host-user processes can open that socket today ([ADR-0007](ADR-0007-reference-host-process.md)). This ADR and its two PRs build the first half. The second half, with its acceptance test that an admin peer uid not on an allowlist is refused, is separate work under the same code and is not changed here.
+
+The owner's Go had named this L3.1; in the threat-model legend L3.1 is host-side state binding, which is also unchanged here.
 
 ## Context
 
