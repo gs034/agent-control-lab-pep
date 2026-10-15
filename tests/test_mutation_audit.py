@@ -290,6 +290,17 @@ def test_copy_that_differs_from_the_seal_aborts(tmp_path):
         ma._extract(work, archive, sealed)
 
 
+def test_extract_refuses_when_the_data_filter_is_unavailable(tmp_path, monkeypatch):
+    root = _toy(tmp_path)
+    archive = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=root, check=True, capture_output=True).stdout
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delattr(ma.tarfile, "data_filter")
+    with pytest.raises(ma.AuditAborted, match="data filter is unavailable"):
+        ma._extract(work, archive, {"commit": "abc1234", "files": {}})
+    assert list(work.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     "extra",
     [

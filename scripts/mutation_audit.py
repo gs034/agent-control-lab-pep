@@ -733,13 +733,12 @@ def _applied_where_stated(mutant: Mutant, mutated: str) -> bool:
 
 
 def _extract(work: Path, archive: bytes, sealed: dict) -> Path:
+    if not hasattr(tarfile, "data_filter"):
+        raise AuditAborted("tarfile data filter is unavailable; refusing to extract the sealed tree without it")
     copy = work / "tree"
     copy.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
-        if hasattr(tarfile, "data_filter"):
-            tar.extractall(copy, filter="data")
-        else:
-            tar.extractall(copy)
+        tar.extractall(copy, filter="data")
     drift = _sealed_drift(copy, sealed)
     if drift:
         raise AuditAborted(f"{', '.join(drift)} at {sealed['commit'][:7]} does not match the seal")

@@ -13,7 +13,7 @@ if any claim fails.
 
 ## Run it
 
-Linux, as root, with Python 3.11 or later. It needs `runuser`, `setpriv` and
+Linux, as root, with Python 3.11.4 or later. It needs `runuser`, `setpriv` and
 `install` (util-linux and coreutils). It creates two users if they are missing,
 `acl-pep` (the host) and `acl-agent` (the agent, in group `acl-agent`), and it
 uses test paths `/var/lib/acl-pep-check` and `/run/acl-pep-check`.
