@@ -35,6 +35,7 @@ UNVERIFIABLE = "unverifiable"
 _DIGEST_PREFIX = "sha256:"
 _DIGEST_HEX = 64
 _FINAL_DECISIONS = frozenset({"ALLOW", "DENY"})
+_CALLED_OUTCOMES = frozenset({"entered", "raised"})
 
 
 class ClaimError(ValueError):
@@ -76,14 +77,15 @@ def observe_result(result: Any) -> ResultObservation:
     """Observe a tool result the host is about to return.
 
     A result that is not JSON is recorded as ``unencodable`` with no digest
-    and is not returned. Anything else is round-tripped through JSON and
-    digested in canonical form. The result body itself is never logged.
+    and is not returned. NaN and infinity are not JSON. Anything else is
+    round-tripped through JSON and digested in canonical form. The result
+    body itself is never logged.
     """
     unencodable = ResultObservation({"name": "result", "outcome": "unencodable"}, None, None)
     if isinstance(result, UnencodableResult):
         return unencodable
     try:
-        parsed = json.loads(json.dumps(result, ensure_ascii=True))
+        parsed = json.loads(json.dumps(result, ensure_ascii=True, allow_nan=False))
     except (TypeError, ValueError, RecursionError):
         return unencodable
     digest = result_digest(parsed)
@@ -142,23 +144,77 @@ def verify_claim(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVer
     about (one session, one window). The verdict names the first field the
     record contradicts. A claim the record cannot settle is ``unverifiable``,
     which is not ``consistent``.
+
+    An absence claim (``not_called``) is contradicted by any record for that
+    tool that shows the call was admitted or entered: a ``PRE_ENTRY`` line,
+    an ``ALLOW`` line, a ``registry_tool`` check of ``entered`` or ``raised``,
+    or a ``DENY`` with reason ``tool_failed``. That denial is the line written
+    after ``PRE_ENTRY`` when the tool raises, times out, or exceeds the reply
+    frame limit. No records at all is ``unverifiable``, never ``consistent``.
+
+    Duplicate final records for one ``request_id`` are not settled by the
+    last line. Final means ``ALLOW`` or ``DENY``. When those records disagree
+    on the decision, the verdict is ``unverifiable``: the log does not settle
+    the outcome, and that disagreement is not itself a contradiction. If any
+    of them contradicts the claim on ``tool_name`` or ``result_digest``, the
+    verdict is ``contradicted`` instead. When the duplicate finals agree on
+    the decision, each record is checked, and the first contradiction stands.
     """
     if claim.kind == "absence":
-        for record in records:
-            if record.get("decision") == "ALLOW" and record.get("tool_name") == claim.tool_name:
-                return ClaimVerdict(
-                    CONTRADICTED,
-                    "tool_name",
-                    f"host record {record.get('request_id')!s} shows {claim.tool_name} entered",
-                )
-        return ClaimVerdict(CONSISTENT, None, "no ALLOW record for this tool in the given records")
+        return _verify_absence(claim, records)
+    return _verify_action(claim, records)
 
-    final: Mapping[str, Any] | None = None
+
+def _verify_absence(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVerdict:
+    if not records:
+        return ClaimVerdict(UNVERIFIABLE, "tool_name", "no host records were given for this absence claim")
     for record in records:
-        if record.get("request_id") == claim.request_id and record.get("decision") in _FINAL_DECISIONS:
-            final = record
-    if final is None:
+        if _shows_call(record, claim.tool_name):
+            return ClaimVerdict(
+                CONTRADICTED,
+                "tool_name",
+                f"host record {record.get('request_id')!s} shows {claim.tool_name} was admitted or entered",
+            )
+    return ClaimVerdict(CONSISTENT, None, "no record shows this tool was admitted or entered")
+
+
+def _verify_action(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVerdict:
+    finals = [
+        record
+        for record in records
+        if record.get("request_id") == claim.request_id and record.get("decision") in _FINAL_DECISIONS
+    ]
+    if not finals:
         return ClaimVerdict(UNVERIFIABLE, "request_id", "no final host record for this request_id")
+    if len(finals) == 1:
+        return _judge_final(claim, finals[0])
+    decisions = {record.get("decision") for record in finals}
+    if len(decisions) > 1:
+        for record in finals:
+            if record.get("tool_name") != claim.tool_name:
+                return ClaimVerdict(CONTRADICTED, "tool_name", f"host record names {record.get('tool_name')!s}")
+        if claim.result_digest is not None:
+            for record in finals:
+                contradicted = _digest_contradiction(claim, record)
+                if contradicted is not None:
+                    return contradicted
+        return ClaimVerdict(
+            UNVERIFIABLE,
+            "request_id",
+            "final records for this request_id disagree on the outcome",
+        )
+    verdicts = [_judge_final(claim, record) for record in finals]
+    for field in ("tool_name", "outcome", "result_digest"):
+        for verdict in verdicts:
+            if verdict.verdict == CONTRADICTED and verdict.field == field:
+                return verdict
+    for verdict in verdicts:
+        if verdict.verdict == UNVERIFIABLE:
+            return verdict
+    return verdicts[0]
+
+
+def _judge_final(claim: Claim, final: Mapping[str, Any]) -> ClaimVerdict:
     if final.get("tool_name") != claim.tool_name:
         return ClaimVerdict(CONTRADICTED, "tool_name", f"host record names {final.get('tool_name')!s}")
     recorded = "allowed" if final.get("decision") == "ALLOW" else "denied"
@@ -177,6 +233,53 @@ def verify_claim(claim: Claim, records: Sequence[Mapping[str, Any]]) -> ClaimVer
     if digest != claim.result_digest:
         return ClaimVerdict(CONTRADICTED, "result_digest", "host observed a different result")
     return ClaimVerdict(CONSISTENT, None, "tool, outcome and result digest match the host record")
+
+
+def _digest_contradiction(claim: Claim, record: Mapping[str, Any]) -> ClaimVerdict | None:
+    """A digest the claim states and this ALLOW record does not show.
+
+    A DENY has no result, and a shortened ALLOW that kept no digest does not
+    contradict the digest. Both leave an outcome disagreement unverifiable.
+    """
+    if claim.result_digest is None or record.get("decision") != "ALLOW":
+        return None
+    observed = _result_check(record)
+    if observed is None:
+        return None
+    if observed.get("outcome") == "unencodable":
+        return ClaimVerdict(CONTRADICTED, "result_digest", "host returned no result for this call")
+    digest = observed.get("digest")
+    if observed.get("outcome") == "returned" and isinstance(digest, str) and digest != claim.result_digest:
+        return ClaimVerdict(CONTRADICTED, "result_digest", "host observed a different result")
+    return None
+
+
+def _shows_call(record: Mapping[str, Any], tool_name: str) -> bool:
+    """True when ``record`` shows ``tool_name`` was admitted or entered.
+
+    ``PRE_ENTRY`` is written before the tool runs. ``ALLOW`` is written after
+    it returns and carries ``registry_tool`` ``entered``. ``raised``, and a
+    ``DENY`` of ``tool_failed``, are written after that ``PRE_ENTRY`` when the
+    tool raises, times out, or exceeds the reply frame limit.
+    """
+    if record.get("tool_name") != tool_name:
+        return False
+    decision = record.get("decision")
+    if decision in {"PRE_ENTRY", "ALLOW"}:
+        return True
+    if decision == "DENY" and record.get("reason_code") == "tool_failed":
+        return True
+    checks = record.get("checks")
+    if not isinstance(checks, list):
+        return False
+    for item in checks:
+        if (
+            isinstance(item, Mapping)
+            and item.get("name") == "registry_tool"
+            and item.get("outcome") in _CALLED_OUTCOMES
+        ):
+            return True
+    return False
 
 
 def _result_check(record: Mapping[str, Any]) -> Mapping[str, Any] | None:

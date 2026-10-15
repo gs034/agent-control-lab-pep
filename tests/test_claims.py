@@ -27,13 +27,44 @@ DIGEST = result_digest(RESULT)
 
 
 def _record(request_id: str, decision: str, tool_name: str = "echo.ping", digest: str | None = DIGEST) -> dict:
-    checks = [{"name": "registry_tool", "outcome": "entered"}]
+    checks: list[dict[str, str]] = []
     if decision == "ALLOW":
+        checks.append({"name": "registry_tool", "outcome": "entered"})
         if digest is None:
             checks.append({"name": "result", "outcome": "unencodable"})
         else:
             checks.append({"name": "result", "outcome": "returned", "digest": digest})
+    elif decision == "DENY":
+        # A refusal before PRE_ENTRY. It does not show that the tool was called.
+        checks.append({"name": "evaluate", "outcome": "deny"})
     return {"decision": decision, "request_id": request_id, "tool_name": tool_name, "checks": checks}
+
+
+def _absence(tool: str = "echo.ping"):
+    return parse_claim({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": tool, "outcome": "not_called"})
+
+
+def _pre_entry(request_id: str, tool: str = "echo.ping") -> dict:
+    return {
+        "decision": "PRE_ENTRY",
+        "reason_code": "ok",
+        "reason_detail": "checks recorded; tool not entered yet",
+        "request_id": request_id,
+        "tool_name": tool,
+        "checks": [{"name": "evaluate", "outcome": "allow"}],
+    }
+
+
+def _tool_failed(request_id: str, detail: str, tool: str = "echo.ping") -> dict:
+    """The DENY written after PRE_ENTRY when the tool does not return a result."""
+    return {
+        "decision": "DENY",
+        "reason_code": "tool_failed",
+        "reason_detail": detail,
+        "request_id": request_id,
+        "tool_name": tool,
+        "checks": [{"name": "registry_tool", "outcome": "raised"}],
+    }
 
 
 def _action(request_id: str = "host.1.2", outcome: str = "allowed", digest: str | None = DIGEST, tool: str = "echo.ping"):
@@ -62,6 +93,15 @@ def test_observe_result_digests_json_and_marks_the_rest_unencodable():
     assert seen.check == {"name": "result", "outcome": "returned", "digest": DIGEST}
     assert seen.parsed == RESULT
     for bad in (UnencodableResult(), {"x": object()}, {1: {2: {3: object()}}}):
+        unseen = observe_result(bad)
+        assert unseen.check == {"name": "result", "outcome": "unencodable"}
+        assert unseen.digest is None
+        assert unseen.parsed is None
+
+
+def test_nan_result_is_unencodable():
+    """NaN is not JSON. allow_nan false makes the round-trip fail closed."""
+    for bad in (float("nan"), {"value": float("nan")}, [float("inf")], {"value": float("-inf")}):
         unseen = observe_result(bad)
         assert unseen.check == {"name": "result", "outcome": "unencodable"}
         assert unseen.digest is None
@@ -126,9 +166,91 @@ def test_unverifiable_is_not_consistent():
 
 
 def test_absence_claim_is_contradicted_by_any_allow_for_that_tool():
-    claim = parse_claim({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"})
+    claim = _absence()
+    # A DENY before PRE_ENTRY is a refusal, not a call.
     assert verify_claim(claim, [_record("host.1.2", "DENY")]).verdict == CONSISTENT
     assert verify_claim(claim, [_record("host.1.2", "ALLOW", tool_name="file.read")]).verdict == CONSISTENT
     hit = verify_claim(claim, [_record("host.1.2", "DENY"), _record("host.1.3", "ALLOW")])
     assert (hit.verdict, hit.field) == (CONTRADICTED, "tool_name")
     assert "host.1.3" in hit.detail
+
+
+def test_absence_entered_then_raised_is_contradicted():
+    """PRE_ENTRY admits the call. A later DENY tool_failed with raised means it did not return."""
+    claim = _absence()
+    records = [_pre_entry("host.4.1"), _tool_failed("host.4.1", "host tool raised after entry")]
+    verdict = verify_claim(claim, records)
+    assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
+    assert "host.4.1" in verdict.detail
+    # The admission line alone is enough. The tool may not have returned.
+    assert verify_claim(claim, [_pre_entry("host.4.2")]).verdict == CONTRADICTED
+    # entered on its own is a call, including when the checks survived without the decision.
+    entered = {
+        "decision": "DENY",
+        "reason_code": "kill_active",
+        "request_id": "host.4.3",
+        "tool_name": "echo.ping",
+        "checks": [{"name": "registry_tool", "outcome": "entered"}],
+    }
+    assert verify_claim(claim, [entered]).verdict == CONTRADICTED
+
+
+def test_absence_timeout_is_contradicted():
+    claim = _absence()
+    records = [_pre_entry("host.5.1"), _tool_failed("host.5.1", "host tool timed out")]
+    assert verify_claim(claim, records).verdict == CONTRADICTED
+    # Clipping can drop the raised check and still keep reason_code tool_failed.
+    clipped = {
+        "decision": "DENY",
+        "reason_code": "tool_failed",
+        "reason_detail": "host tool timed out",
+        "request_id": "host.5.2",
+        "tool_name": "echo.ping",
+    }
+    assert verify_claim(claim, [clipped]).verdict == CONTRADICTED
+
+
+def test_absence_frame_cap_is_contradicted():
+    claim = _absence()
+    records = [
+        _pre_entry("host.6.1"),
+        _tool_failed("host.6.1", "host tool reply exceeded the executor frame limit"),
+    ]
+    assert verify_claim(claim, records).verdict == CONTRADICTED
+    # A raise recorded only as the check, with no tool_failed reason, is still a call.
+    raised = {
+        "decision": "DENY",
+        "reason_code": "kill_active",
+        "request_id": "host.6.2",
+        "tool_name": "echo.ping",
+        "checks": [{"name": "registry_tool", "outcome": "raised"}],
+    }
+    assert verify_claim(claim, [raised]).verdict == CONTRADICTED
+
+
+def test_absence_with_no_records_is_unverifiable():
+    verdict = verify_claim(_absence(), [])
+    assert (verdict.verdict, verdict.field) == (UNVERIFIABLE, "tool_name")
+    assert verdict.verdict != CONSISTENT
+
+
+def test_duplicate_final_records_do_not_let_the_last_win():
+    """ALLOW then DENY for one request_id disagree. The later line does not win.
+
+    The disagreement on the decision is unverifiable. A record that names a
+    different tool, or an ALLOW whose digest differs, contradicts the claim.
+    """
+    allowed = _record("r1", "ALLOW")
+    denied = _record("r1", "DENY")
+    for outcome, digest in (("allowed", DIGEST), ("denied", None)):
+        verdict = verify_claim(_action(request_id="r1", outcome=outcome, digest=digest), [allowed, denied])
+        assert (verdict.verdict, verdict.field) == (UNVERIFIABLE, "request_id")
+        assert verdict.verdict != CONSISTENT
+    other_tool = _record("r1", "ALLOW", tool_name="file.write")
+    wrong_tool = verify_claim(_action(request_id="r1", outcome="denied", digest=None), [other_tool, denied])
+    assert (wrong_tool.verdict, wrong_tool.field) == (CONTRADICTED, "tool_name")
+    forged = _record("r1", "ALLOW", digest=result_digest({"pong": "forged"}))
+    wrong_digest = verify_claim(_action(request_id="r1"), [forged, denied])
+    assert (wrong_digest.verdict, wrong_digest.field) == (CONTRADICTED, "result_digest")
+    # Agreeing finals still match. The last line is not a special case.
+    assert verify_claim(_action(request_id="r1"), [allowed, _record("r1", "ALLOW")]).verdict == CONSISTENT
