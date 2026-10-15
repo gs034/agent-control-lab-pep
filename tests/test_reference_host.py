@@ -2437,7 +2437,9 @@ def _reap_quiet(proc: subprocess.Popen) -> None:
 def _process_state(pid: int) -> str | None:
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except OSError:
+        # The pid can vanish between open and read. That is ProcessLookupError,
+        # which is not a FileNotFoundError.
         return None
     return raw.rsplit(")", 1)[1].split()[0]
 
