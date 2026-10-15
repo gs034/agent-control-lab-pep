@@ -61,7 +61,7 @@ Running the README procedure by hand exposed one gap. The shipped client, `pep.h
 
 - **The connection limits make a held session short.** A held connection is closed after 5 seconds with no bytes, and 30 seconds after it was accepted. An agent must send at least every 5 seconds, and the operator must grant again after each reconnect. ADR-0007 sets these limits so that a slow drip or an idle client cannot hold a slot. Changing them, or making them flags, is a choice for the owner. This ADR does not change them.
 - **Timeouts after a send are ambiguous.** If `AgentConnection.call` times out after the request was sent, it returns DENY `host_unreachable`, but the host may have admitted the call and run the tool. The docstring says so. A caller that retries an effect on DENY must check the decision log first.
-- **Replies are not matched to requests by id.** The client takes the next line from the connection. The host writes one reply per request and I found no path that writes two, so no change is made. A future change to the host that wrote two lines would break this.
+- **Replies are matched to requests by id since #40.** `AgentConnection` checks that each reply's `request_id` belongs to this connection and rises; a reply that fails that check is DENY `reply_mismatch` (`pep/host/client.py`, `_check_request_id`). At the time this ADR was written the client took the next line from the connection without a check; that paragraph is superseded.
 - **The client's socket-owner check and its peer-credential check overlap.** Either one refuses a host owned by another user. The tests show a refusal, not which check made it, so removing one of them is not caught. Adding a test for each would need a separate socket owner that the peer check would not catch, which I did not build.
 - **The in-process library still treats a missing halt file as active.** ADR-0007 keeps that default for `HaltStore` only. The host does not use it.
 - **`pep/host` has no mutation audit yet.** ADR-0006's default scope covers the gate, approval and implementation files. The live check and the unit tests cover the host, but no frozen-suite mutant run has been made against `pep/host`.
@@ -69,7 +69,7 @@ Running the README procedure by hand exposed one gap. The shipped client, `pep.h
 ## What this does not claim
 
 - Everything ADR-0007 does not claim still holds.
-- The check runs one configuration: the built-in stub policy, the echo tool, the default limits, and one Linux machine. The CI job has not run on GitHub at the time of writing.
+- The check runs one configuration: the built-in stub policy, the echo tool, the default limits, and one Linux machine. The `reference-host-live` workflow has since run green on GitHub on every main push since `50be0ca` (#38, 12 October 2026); a green run is evidence for the claims the check prints, on that runner only.
 - The check does not test the rest of the README. Behaviour the README describes but the table does not list, such as the accept loop waking about every 0.2 seconds, is untested.
 - The check does not prove production readiness. No outside review of this host has been done.
 - The check does not test an agent running as the host user, or with write access to its directories. ADR-0007 says those break the separation.
