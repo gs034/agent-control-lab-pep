@@ -80,6 +80,16 @@ def main(argv: list[str] | None = None) -> int:
     grant_parser.add_argument("--args", required=True, help="JSON object of tool arguments.")
     grant_parser.add_argument("--ttl", required=True, type=int)
 
+    revoke_parser = sub.add_parser("revoke", help="Revoke one outstanding grant before it is spent (ADR-0011).")
+    revoke_parser.add_argument("--admin", required=True, type=Path)
+    revoke_parser.add_argument("--approval", required=True, help="The approval_id the grant command printed.")
+
+    revoke_all_parser = sub.add_parser(
+        "revoke-all", help="Revoke every outstanding grant, or every grant of one connection (ADR-0011)."
+    )
+    revoke_all_parser.add_argument("--admin", required=True, type=Path)
+    revoke_all_parser.add_argument("--connection", type=int, default=None)
+
     args = parser.parse_args(argv)
     try:
         if running_as_root():
@@ -92,6 +102,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "sessions":
             return _print_admin(args.admin, {"op": "sessions"})
+        if args.command == "revoke":
+            return _print_admin(args.admin, {"op": "revoke", "approval_id": args.approval})
+        if args.command == "revoke-all":
+            body: dict[str, object] = {"op": "revoke_all"}
+            if args.connection is not None:
+                body["connection_id"] = args.connection
+            return _print_admin(args.admin, body)
         if args.command == "grant":
             try:
                 tool_args = json.loads(args.args)
