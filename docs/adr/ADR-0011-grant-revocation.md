@@ -17,14 +17,15 @@ The detection half of this project (ADR-0010 and the console's ledger-versus-pro
 ## Decision
 
 1. `ApprovalRecord` gains `revoked_at`. `revoked()` and `outstanding()` (neither consumed nor revoked) read it.
-2. `ApprovalStore.revoke(approval_id)` revokes one outstanding grant and returns whether it did. An unknown id, a spent grant and an already revoked grant return False and change nothing. `ApprovalStore.revoke_all(principal=None)` revokes every outstanding grant, or only those bound to one principal, and returns the count.
-3. `consume` checks `revoked()` straight after the principal check and before the consumed, expiry, binding, implementation and state checks. The result is `APPROVAL_REVOKED`, a new reason code, with the detail "grant revoked before it was spent". The grant is not consumed. A caller who is not the grant's principal still sees `APPROVAL_PRINCIPAL_MISMATCH` first and learns nothing about revocation.
-4. `PepRuntime.kill()` calls `revoke_all()` after engaging the fence and setting the mode, and before persisting the halt, so a failed halt write still leaves every grant revoked in memory.
+2. `ApprovalStore.revoke(approval_id)` revokes one outstanding grant and returns whether it did. An unknown id, a spent grant and an already revoked grant return False and change nothing. `ApprovalStore.revoke_all` revokes outstanding grants and returns the count. The caller names the scope: `principal` revokes only the grants bound to that principal, and `all=True` revokes every outstanding grant. A call that passes neither, or that passes both, raises `ApprovalError` and changes nothing.
+3. `consume` checks `revoked()` straight after the principal check and before the consumed, expiry, binding, implementation and state checks. The result is `APPROVAL_REVOKED`, a new reason code, with the detail "grant revoked before it was spent". The grant is not consumed. A caller who is not the grant's principal still sees `APPROVAL_PRINCIPAL_MISMATCH` first and learns nothing about revocation. The same check runs again after a state or implementation observer returns, so a revocation that landed during the observer is not overwritten by consuming the grant.
+4. `PepRuntime.kill()` calls `revoke_all(all=True)` after engaging the fence and setting the mode, and before persisting the halt, so a failed halt write still leaves every grant revoked in memory. The halt write runs even if `revoke_all` raises. When kill runs on the same thread as a state or implementation observer, that thread already holds the store lock. `revoke_all` then revokes without taking the lock a second time, the call returns, and the halt is still written. The grant under observation is revoked and is not consumed.
 5. Revocation is not cleared by `resume`. Suspend does not revoke: it is reversible, and its grants deny as `suspend_active` while it holds.
 
 ## Consequences
 
 - An operator can end a grant before it is spent, and a kill now ends every grant. Both are visible on the record (`revoked_at`) and in the receipt (`approval_revoked`).
+- `revoke_all()` with no scope revokes nothing. It raises. The global form is `all=True`, which is what kill uses.
 - The reference host does not yet expose revocation. The admin socket gains `revoke` and `revoke_all` operations, and the host's grant selection learns to report a revoked match, in the next PR, so that this one stays within the five-file rule.
 - Reason codes are additive; `approval_revoked` is new and no string is reused.
 

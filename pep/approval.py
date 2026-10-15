@@ -138,9 +138,9 @@ class ApprovalStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: dict[str, ApprovalRecord] = {}
-        # Set on the thread that is running a state observer inside consume().
-        # The lock is not reentrant; a callback into the store would wedge, so
-        # it is refused with a receipt instead.
+        # Set on the thread that is running an observer inside consume(), which
+        # already holds _lock. The lock is not reentrant. A callback into the
+        # store is refused, except revoke_all, which edits the table in place.
         self._observing = threading.local()
 
     def _refuse_reentry(self) -> None:
@@ -269,11 +269,15 @@ class ApprovalStore:
         a missing or different digest, is ``APPROVAL_STATE_MISMATCH`` and does
         not consume. Grants without a frozen digest never call ``observe``.
 
-        ``observe`` runs with the store lock held, so it must be quick and must
-        not call back into this store or into the runtime; a callback into the
-        store from this thread is refused as a mismatch (``state observer
-        re-entered store``) rather than deadlocking. A callback from another
-        thread the observer spawns is not detected and would block.
+        ``observe`` runs with the store lock held, so it must be quick. A
+        callback into the store from this thread is refused as a mismatch
+        (``state observer re-entered store``) rather than deadlocking.
+        ``revoke_all`` is the exception: this thread already holds the lock, so
+        it revokes in place and returns. ``PepRuntime.kill`` uses that so a
+        kill from the observer still revokes and still persists the halt.
+        After the observer returns, a grant revoked during the call is not
+        consumed. A callback from another thread the observer spawns is not
+        detected and would block.
 
         ``principal`` is the host-attested caller (ADR-0002), never an envelope
         field. It is checked straight after the lookup, before the consumed, expiry, binding and state checks, so a
@@ -310,31 +314,51 @@ class ApprovalStore:
                 return ConsumeResult(ReasonCode.APPROVAL_INVALID)
             if record.implementation_digest is not None:
                 failed = self._implementation_failure(record.implementation_digest, observe_implementation)
+                # A kill inside the observer has already revoked. Do not spend
+                # the grant, and do not run a later observer.
+                revoked_now = self._revoked_result(approval_id)
+                if revoked_now is not None:
+                    return revoked_now
                 if failed is not None:
                     return ConsumeResult(ReasonCode.APPROVAL_IMPLEMENTATION_MISMATCH, failed)
             if record.state_digest is not None:
                 observed: object = state_digest
                 source = "envelope state digest"
+                observer_failure: ConsumeResult | None = None
                 if observe is not None:
                     source = "state observer"
                     self._observing.active = True
                     try:
                         observed = observe()
                     except ObserverReentry:
-                        return ConsumeResult(
+                        observer_failure = ConsumeResult(
                             ReasonCode.APPROVAL_STATE_MISMATCH, "state observer re-entered store"
                         )
                     except Exception:
-                        return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, "state observer failed")
+                        observer_failure = ConsumeResult(
+                            ReasonCode.APPROVAL_STATE_MISMATCH, "state observer failed"
+                        )
                     finally:
                         self._observing.active = False
+                revoked_now = self._revoked_result(approval_id)
+                if revoked_now is not None:
+                    return revoked_now
+                if observer_failure is not None:
+                    return observer_failure
                 if not record.matches_state(observed):
                     return ConsumeResult(ReasonCode.APPROVAL_STATE_MISMATCH, f"{source} mismatch")
-            self._records[approval_id] = replace(record, consumed_at=clock)
+            # Re-read. The observer may have revoked this grant, and the
+            # ``record`` captured above would overwrite that mark if consumed.
+            current = self._records.get(approval_id)
+            if current is None:
+                return ConsumeResult(ReasonCode.APPROVAL_INVALID)
+            if current.revoked():
+                return ConsumeResult(ReasonCode.APPROVAL_REVOKED, "grant revoked before it was spent")
+            self._records[approval_id] = replace(current, consumed_at=clock)
             return ConsumeResult(
                 None,
-                frozen_state_digest=record.state_digest,
-                frozen_implementation_digest=record.implementation_digest,
+                frozen_state_digest=current.state_digest,
+                frozen_implementation_digest=current.implementation_digest,
             )
 
     def revoke(self, approval_id: str, now: datetime | None = None) -> bool:
@@ -353,25 +377,58 @@ class ApprovalStore:
             self._records[approval_id] = replace(record, revoked_at=clock)
             return True
 
-    def revoke_all(self, *, principal: str | None = None, now: datetime | None = None) -> int:
-        """Revoke every outstanding grant, or only those bound to ``principal``.
+    def revoke_all(
+        self,
+        *,
+        principal: str | None = None,
+        all: bool = False,
+        now: datetime | None = None,
+    ) -> int:
+        """Revoke outstanding grants and return how many this call revoked.
 
-        Returns how many grants this call revoked. Spent and already revoked
-        grants are left as they are. ``PepRuntime.kill`` calls this with no
-        principal, so a kill leaves no spendable grant behind it.
+        Pass ``principal`` to revoke only that principal's grants, or
+        ``all=True`` to revoke every outstanding grant. A call with neither,
+        or with both, raises ``ApprovalError`` and changes nothing. Spent and
+        already revoked grants are left as they are.
+
+        ``PepRuntime.kill`` calls this with ``all=True``. When this thread is
+        inside an observer, ``consume`` already holds the lock, so the edit
+        is done in place and this returns. It does not raise, and it does not
+        take the lock again.
         """
-        self._refuse_reentry()
+        every = all
+        if not isinstance(every, bool):
+            raise ApprovalError("revoke_all all= must be true or false")
+        if every and principal is not None:
+            raise ApprovalError("revoke_all accepts all=True or a principal, not both")
+        if not every and principal is None:
+            raise ApprovalError("revoke_all requires all=True or a principal")
         clock = _aware(now)
-        count = 0
+        if getattr(self._observing, "active", False):
+            return self._revoke_outstanding_unlocked(every=every, principal=principal, clock=clock)
         with self._lock:
-            for approval_id, record in list(self._records.items()):
-                if not record.outstanding():
-                    continue
-                if principal is not None and record.principal != principal:
-                    continue
-                self._records[approval_id] = replace(record, revoked_at=clock)
-                count += 1
+            return self._revoke_outstanding_unlocked(every=every, principal=principal, clock=clock)
+
+    def _revoke_outstanding_unlocked(
+        self, *, every: bool, principal: str | None, clock: datetime
+    ) -> int:
+        """Revoke matching outstanding grants. Caller holds ``_lock``."""
+        count = 0
+        for approval_id, record in list(self._records.items()):
+            if not record.outstanding():
+                continue
+            if not every and record.principal != principal:
+                continue
+            self._records[approval_id] = replace(record, revoked_at=clock)
+            count += 1
         return count
+
+    def _revoked_result(self, approval_id: str) -> ConsumeResult | None:
+        """A revoked-grant result, or None. Caller holds ``_lock``."""
+        current = self._records.get(approval_id)
+        if current is not None and current.revoked():
+            return ConsumeResult(ReasonCode.APPROVAL_REVOKED, "grant revoked before it was spent")
+        return None
 
     def _implementation_failure(
         self, frozen: str, observe: Callable[[], object] | None

@@ -160,15 +160,23 @@ class PepRuntime:
 
         New evaluates deny as ``kill_active``. An admission that completes
         after this cut denies as ``late_effect_fence`` and does not enter
-        the tool. ``resume`` cannot clear either.
+        the tool. ``resume`` cannot clear either. Outstanding grants are
+        revoked before the halt is written, including when this is called
+        from a state observer on the same thread.
         """
         with self._lock:
             self._engage_fence_unlocked()
             self._mode = RuntimeMode.KILLED
             # ADR-0011: a kill leaves no spendable grant behind it. Revoke
             # before persisting, so a failed write still finds them revoked.
-            self._approvals.revoke_all()
-            self._persist_halt()
+            # The halt write is in finally so it still runs when revoke_all
+            # raises. A state observer on this thread already holds the store
+            # lock; revoke_all edits in place on that path and returns, and
+            # the write below still happens.
+            try:
+                self._approvals.revoke_all(all=True)
+            finally:
+                self._persist_halt()
 
     def _engage_fence_unlocked(self) -> None:
         if self._fence_engaged:
