@@ -1753,6 +1753,44 @@ def test_group_readable_policy_is_refused(tmp_path: Path):
         )
 
 
+def test_private_directory_refuses_any_group_or_other_bit(tmp_path: Path):
+    """Mutation audit 2026-10-14-host, M11: the halt, log and policy directories
+    must carry no group or other bits at all. Group-only modes are the ones a
+    widened mask (0o007) would let through, so each is checked on its own."""
+    from pep.host.fsguard import PathGuardError, require_directory
+
+    private = tmp_path / "private"
+    private.mkdir()
+    os.chmod(private, 0o700)
+    require_directory(private, allow_group_traverse=False)
+    for mode in (0o710, 0o720, 0o740, 0o750, 0o770, 0o701, 0o704, 0o707):
+        os.chmod(private, mode)
+        with pytest.raises(PathGuardError, match="group or other"):
+            require_directory(private, allow_group_traverse=False)
+    os.chmod(private, 0o700)
+    require_directory(private, allow_group_traverse=False)
+
+
+def test_policy_in_a_group_traversable_directory_is_refused(tmp_path: Path):
+    """Mutation audit 2026-10-14-host, M11: a policy directory readable and
+    traversable by its group (0750) is not private; the host refuses to start."""
+    os.chmod(tmp_path, 0o700)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    path = shared / "policy.json"
+    path.write_text(json.dumps(STUB_POLICY_DOCUMENT), encoding="utf-8")
+    os.chmod(path, 0o600)
+    os.chmod(shared, 0o750)
+    halt = tmp_path / "halt.json"
+    init_active(halt)
+    with pytest.raises(HostError, match="directory"):
+        ReferenceHost(
+            halt_path=halt,
+            log_path=tmp_path / "decisions.log",
+            policy_path=path,
+        )
+
+
 def test_policy_in_a_loose_directory_is_refused(tmp_path: Path):
     os.chmod(tmp_path, 0o700)
     loose = tmp_path / "loose"
@@ -1800,6 +1838,34 @@ def test_private_policy_loads_and_a_later_loose_file_halts(tmp_path: Path):
         assert second["reason_code"] == "policy_miss"
         assert "unreadable" in second["reason_detail"]
         assert host.halted() is True
+    finally:
+        host.close()
+
+
+def test_policy_bytes_changed_after_load_halts(tmp_path: Path):
+    """Mutation audit 2026-10-14-host, M02: a digest mismatch on re-read is a
+    fail-closed DENY (policy_miss) that latches the host, never an evaluation
+    against the new bytes. The file stays mode 0600 and stays valid JSON, so
+    only the digest comparison can notice the change."""
+    os.chmod(tmp_path, 0o700)
+    path = _policy_file(tmp_path)
+    host = _host(tmp_path, policy_path=path)
+    try:
+        session = host.open_session(_peer(uid=_agent_uid()))
+        first = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        assert first["reason_code"] != "policy_miss"
+        assert host.halted() is False
+        with open(path, "ab") as handle:
+            handle.write(b"\n")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert json.loads(path.read_text(encoding="utf-8")) == STUB_POLICY_DOCUMENT
+        second = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        assert second["decision"] == "DENY"
+        assert second["reason_code"] == "policy_miss"
+        assert "changed" in second["reason_detail"]
+        assert host.halted() is True
+        third = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        assert third["decision"] == "DENY"
     finally:
         host.close()
 
@@ -2308,11 +2374,28 @@ def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
     thread = threading.Thread(target=drip, daemon=True)
     thread.start()
     worker = _Worker(dummy.pid, gate, call_timeout=0.5)
+    outcome: dict[str, Any] = {}
+
+    def bounded_call() -> None:
+        # Mutation audit 2026-10-14-host, M07: a per-recv window instead of one
+        # whole-call deadline keeps this call alive for as long as the worker
+        # drips. The call runs on its own thread so that case fails the join
+        # below instead of hanging the suite.
+        try:
+            outcome["result"] = worker.call("echo.ping", ARGS)
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertions below
+            outcome["error"] = exc
+
     started = time.monotonic()
+    caller = threading.Thread(target=bounded_call, daemon=True)
+    caller.start()
+    caller.join(timeout=3)
     try:
-        with pytest.raises(ToolExecutionError, match="timeout"):
-            worker.call("echo.ping", ARGS)
+        assert not caller.is_alive(), "worker.call outlived a 0.5 s call timeout by 3 s"
         assert time.monotonic() - started < 2
+        error = outcome.get("error")
+        assert isinstance(error, ToolExecutionError)
+        assert error.kind == "timeout"
         assert worker.closed
         assert dummy.wait(timeout=5) is not None
     finally:
@@ -2320,6 +2403,7 @@ def test_a_worker_that_drips_bytes_is_cut_off_at_the_call_timeout():
         worker_end.close()
         worker.close()
         thread.join(timeout=2)
+        caller.join(timeout=2)
 
 
 def _fake_worker_call(reply: bytes) -> tuple[Any, bool, bool]:
