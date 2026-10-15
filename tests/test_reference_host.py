@@ -1991,6 +1991,55 @@ def test_a_served_session_bounds_a_not_called_claim(tmp_path: Path):
         host.close()
 
 
+def test_a_raised_tool_contradicts_not_called_on_the_host_log(tmp_path: Path):
+    """A tool that raises is on the host log, so not_called is contradicted."""
+    from pep.host.claims import CLAIM_SCHEMA, CONTRADICTED, parse_claim, verify_claim
+
+    def registered(_args: dict) -> dict:
+        raise RuntimeError("boom")
+
+    host = _host(tmp_path, registry={"echo.ping": registered})
+    try:
+        session = host.open_session(_peer())
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+        denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "tool_failed"
+        assert "raised after entry" in denied["reason_detail"]
+        absent = parse_claim(
+            {"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"}
+        )
+        verdict = verify_claim(absent, host.decision_records())
+        assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
+    finally:
+        host.close()
+
+
+def test_a_frame_limit_denial_contradicts_not_called_on_the_host_log(tmp_path: Path):
+    """A reply over the frame limit is a call, so not_called is contradicted."""
+    from pep.host.claims import CLAIM_SCHEMA, CONTRADICTED, parse_claim, verify_claim
+
+    def registered(args: dict) -> dict:
+        return {"pong": "x" * (300 * 1024)}
+
+    host = _host(tmp_path, registry={"echo.ping": registered})
+    try:
+        session = host.open_session(_peer())
+        big = {"message": "big"}
+        host.issue_session_approval(session, tool_name="echo.ping", args=big, ttl_seconds=60)
+        denied = host.handle_request({"tool_name": "echo.ping", "args": big}, session)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "tool_failed"
+        assert "frame limit" in denied["reason_detail"]
+        absent = parse_claim(
+            {"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"}
+        )
+        verdict = verify_claim(absent, host.decision_records())
+        assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
+    finally:
+        host.close()
+
+
 def test_unencodable_result_is_observed_as_such_and_not_returned(tmp_path: Path):
     """ADR-0010: a result the host cannot encode is recorded as unencodable
     with no digest; the reply has no result and no digest."""
