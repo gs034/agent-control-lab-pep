@@ -532,6 +532,25 @@ def _wait_sessions(host: ReferenceHost, count: int) -> None:
     raise AssertionError(f"expected {count} sessions, saw {len(host.sessions())}")
 
 
+def _records_after_session_closes(host: ReferenceHost) -> list[dict[str, Any]]:
+    """Log lines once the served connection has written open and close."""
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        if host.sessions():
+            time.sleep(0.01)
+            continue
+        try:
+            records = host.decision_records()
+        except (json.JSONDecodeError, DecisionLogError, OSError, UnicodeError):
+            time.sleep(0.01)
+            continue
+        decisions = [record.get("decision") for record in records]
+        if "SESSION_OPEN" in decisions and "SESSION_CLOSE" in decisions:
+            return records
+        time.sleep(0.01)
+    raise AssertionError("session did not close with open and close lines")
+
+
 def _send(client: socket.socket, payload: dict) -> None:
     client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
 
@@ -1561,6 +1580,95 @@ def test_gate_resume_rewrite_does_not_lose_a_concurrent_kill(tmp_path: Path, mon
     assert after["reason_code"] == "kill_active"
 
 
+def _operator_acts_before_gate_lock(
+    monkeypatch: pytest.MonkeyPatch, halt: Path, action: str
+) -> dict[str, Any]:
+    """P-8: run an operator change after the gate read the halt file, before its write locks.
+
+    The hook runs once, in the gate's thread, at the start of the gate's
+    locked write. The operator's own write takes the file lock itself, so the
+    order is fixed: gate read, operator change, gate locked write.
+    """
+    import pep.halt as halt_module
+
+    real_lock = halt_module.HaltStore._acquire_file_lock
+    box: dict[str, Any] = {"armed": True}
+
+    def operator_then_lock(self):  # type: ignore[no-untyped-def]
+        if box.pop("armed", False):
+            if action == "suspend":
+                HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+            elif action == "resume":
+                HaltStore(halt).write(HaltState(mode=HaltMode.ACTIVE, available=True))
+            else:
+                halt.unlink()
+            box["operator_left"] = read_fail_closed(halt)[1]
+        return real_lock(self)
+
+    monkeypatch.setattr(halt_module.HaltStore, "_acquire_file_lock", operator_then_lock)
+    return box
+
+
+@pytest.mark.parametrize(("action", "expected"), [("suspend", "suspended"), ("delete", "missing")])
+def test_gate_resume_rewrite_does_not_overwrite_an_operator_halt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str, expected: str
+):
+    """P-8: a suspend or a delete between the gate's read and its resume write stays."""
+    halt = tmp_path / "halt.json"
+    HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+    host = ReferenceHost(
+        halt_path=halt,
+        log_path=tmp_path / "decisions.log",
+        registry={"echo.ping": lambda _args: {"pong": "ok"}},
+    )
+    session = host.open_session(_peer())
+    for _ in range(3):
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert denied["reason_code"] == "suspend_active"
+    HaltStore(halt).write(HaltState(mode=HaltMode.ACTIVE, available=True))
+
+    box = _operator_acts_before_gate_lock(monkeypatch, halt, action)
+    host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert "armed" not in box, "the gate did not reach a locked halt write on resume"
+    assert box["operator_left"] == expected
+    assert read_fail_closed(halt)[1] == expected
+    after = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert after["decision"] == "DENY"
+    assert after["reason_code"] == ("suspend_active" if action == "suspend" else "kill_active")
+    assert read_fail_closed(halt)[1] != ACTIVE
+
+
+@pytest.mark.parametrize(("action", "expected"), [("resume", "active"), ("delete", "missing")])
+def test_gate_suspend_rewrite_does_not_overwrite_an_operator_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str, expected: str
+):
+    """P-8: the suspend mirror does not undo a resume or recreate a deleted file as suspended."""
+    halt = tmp_path / "halt.json"
+    init_active(halt)
+    host = ReferenceHost(
+        halt_path=halt,
+        log_path=tmp_path / "decisions.log",
+        registry={"echo.ping": lambda _args: {"pong": "ok"}},
+    )
+    session = host.open_session(_peer())
+    host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+
+    box = _operator_acts_before_gate_lock(monkeypatch, halt, action)
+    denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert denied["reason_code"] == "suspend_active"
+    assert "armed" not in box, "the gate did not reach a locked halt write on suspend"
+    assert box["operator_left"] == expected
+    assert read_fail_closed(halt)[1] == expected
+    after = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    if action == "resume":
+        assert after["decision"] == "ALLOW", after
+    else:
+        assert after["decision"] == "DENY"
+        assert after["reason_code"] == "kill_active"
+
+
 def test_halt_file_vanishing_at_startup_is_not_left_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_path / "halt.json"
     init_active(path)
@@ -2023,9 +2131,195 @@ def test_host_observes_the_result_and_claims_are_checked_against_its_record(tmp_
         assert (hidden.verdict, hidden.field) == (CONTRADICTED, "outcome")
         unknown = verify_claim(claim(request_id="host.9.9"), records)
         assert unknown.verdict == UNVERIFIABLE
-        absent = parse_claim({"schema": CLAIM_SCHEMA, "kind": "absence", "tool_name": "echo.ping", "outcome": "not_called"})
-        assert verify_claim(absent, records).verdict == CONTRADICTED
+        # This path does not serve a socket, so the log has no session span.
+        absent = parse_claim(
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "echo.ping",
+                "outcome": "not_called",
+                "session_id": session.principal,
+            }
+        )
+        assert verify_claim(absent, records).verdict == UNVERIFIABLE
     finally:
+        host.close()
+
+
+def test_a_served_session_bounds_a_not_called_claim(tmp_path: Path):
+    """A connection writes session open and session close.
+
+    A not_called claim for a tool that does not appear is consistent only on
+    that whole slice. The denial line by itself is unverifiable, and so is
+    the slice with a seq missing between the markers.
+    """
+    from pep.host.claims import CLAIM_SCHEMA, CONSISTENT, UNVERIFIABLE, parse_claim, verify_claim
+
+    host = _listen(tmp_path)
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        _send(client, {"tool_name": "echo.ping", "args": ARGS})
+        denied = _recv(client)
+        assert denied["decision"] == "DENY"
+        client.close()
+        records = _records_after_session_closes(host)
+        assert [record["decision"] for record in records][0] == "SESSION_OPEN"
+        assert records[-1]["decision"] == "SESSION_CLOSE"
+        session_id = records[0]["session_id"]
+        assert records[-1]["session_id"] == session_id
+        seqs = [record["seq"] for record in records]
+        assert seqs == list(range(seqs[0], seqs[0] + len(seqs)))
+        other = parse_claim(
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "file.read",
+                "outcome": "not_called",
+                "session_id": session_id,
+            }
+        )
+        assert verify_claim(other, records).verdict == CONSISTENT
+        denial = [record for record in records if record["decision"] == "DENY"]
+        assert denial and denial[0]["tool_name"] == "echo.ping"
+        assert verify_claim(other, denial).verdict == UNVERIFIABLE
+        gapped = [records[0], records[-1]]
+        assert verify_claim(other, gapped).verdict == UNVERIFIABLE
+        different = parse_claim(
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "file.read",
+                "outcome": "not_called",
+                "session_id": "u9.c9",
+            }
+        )
+        assert verify_claim(different, records).verdict == UNVERIFIABLE
+    finally:
+        client.close()
+        host.close()
+
+
+def test_a_raised_tool_contradicts_not_called_on_the_host_log(tmp_path: Path):
+    """A tool that raises is on the host log, so not_called for that session is contradicted."""
+    from pep.host.claims import CLAIM_SCHEMA, CONTRADICTED, parse_claim, verify_claim
+
+    def registered(_args: dict) -> dict:
+        raise RuntimeError("boom")
+
+    host = _listen(tmp_path, registry={"echo.ping": registered})
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        session = host.sessions()[0]
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+        _send(client, {"tool_name": "echo.ping", "args": ARGS})
+        denied = _recv(client)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "tool_failed"
+        assert "raised after entry" in denied["reason_detail"]
+        client.close()
+        absent = parse_claim(
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "echo.ping",
+                "outcome": "not_called",
+                "session_id": session.principal,
+            }
+        )
+        verdict = verify_claim(absent, _records_after_session_closes(host))
+        assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
+    finally:
+        client.close()
+        host.close()
+
+
+def test_a_frame_limit_denial_contradicts_not_called_on_the_host_log(tmp_path: Path):
+    """A reply over the frame limit is a call, so not_called for that session is contradicted."""
+    from pep.host.claims import CLAIM_SCHEMA, CONTRADICTED, parse_claim, verify_claim
+
+    def registered(args: dict) -> dict:
+        return {"pong": "x" * (300 * 1024)}
+
+    host = _listen(tmp_path, registry={"echo.ping": registered})
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        session = host.sessions()[0]
+        big = {"message": "big"}
+        host.issue_session_approval(session, tool_name="echo.ping", args=big, ttl_seconds=60)
+        _send(client, {"tool_name": "echo.ping", "args": big})
+        denied = _recv(client)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "tool_failed"
+        assert "frame limit" in denied["reason_detail"]
+        client.close()
+        absent = parse_claim(
+            {
+                "schema": CLAIM_SCHEMA,
+                "kind": "absence",
+                "tool_name": "echo.ping",
+                "outcome": "not_called",
+                "session_id": session.principal,
+            }
+        )
+        verdict = verify_claim(absent, _records_after_session_closes(host))
+        assert (verdict.verdict, verdict.field) == (CONTRADICTED, "tool_name")
+    finally:
+        client.close()
+        host.close()
+
+
+def test_agent_claim_on_the_host_is_bound_to_the_connection(tmp_path: Path):
+    """The tool ran on the caller's connection. A claim that names an idle
+    session is still checked as the caller, and is contradicted.
+
+    An offline check of that same body, as an attested claim for the idle
+    session, stays consistent.
+    """
+    from pep.host.claims import CLAIM_SCHEMA, CONSISTENT, CONTRADICTED, parse_claim, verify_claim
+
+    host = _listen(tmp_path)
+    caller_client = _connect(host.socket_path)
+    idle_client = None
+    try:
+        _wait_sessions(host, 1)
+        caller = host.sessions()[0]
+        host.issue_session_approval(caller, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+        _send(caller_client, {"tool_name": "echo.ping", "args": ARGS})
+        allowed = _recv(caller_client)
+        assert allowed["decision"] == "ALLOW"
+        caller_client.close()
+        deadline = time.time() + 2
+        while time.time() < deadline and host.sessions():
+            time.sleep(0.01)
+        assert host.sessions() == ()
+        idle_client = _connect(host.socket_path)
+        _wait_sessions(host, 1)
+        idle = host.sessions()[0]
+        assert idle.principal != caller.principal
+        idle_client.close()
+        records = _records_after_session_closes(host)
+        assert sum(record["decision"] == "SESSION_CLOSE" for record in records) == 2
+        forged = {
+            "schema": CLAIM_SCHEMA,
+            "kind": "absence",
+            "tool_name": "echo.ping",
+            "outcome": "not_called",
+            "session_id": idle.principal,
+        }
+        bound = host.verify_agent_claim(caller, forged)
+        assert (bound.verdict, bound.field) == (CONTRADICTED, "tool_name")
+        assert forged["session_id"] == idle.principal
+        honest = dict(forged)
+        honest["session_id"] = caller.principal
+        assert host.verify_agent_claim(caller, honest).verdict == CONTRADICTED
+        assert verify_claim(parse_claim(forged), records).verdict == CONSISTENT
+    finally:
+        caller_client.close()
+        if idle_client is not None:
+            idle_client.close()
         host.close()
 
 

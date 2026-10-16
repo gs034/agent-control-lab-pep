@@ -15,6 +15,11 @@ read to the rename, so a kill that lands first is read by the next writer
 and merged as sticky. Without that lock a gate that read "active" before
 the kill landed could rename "active" over it.
 
+``write_if`` is the compare-and-write form. It re-reads the file under the
+lock and writes only if the file still holds the mode the caller's decision
+was based on. The reference gate mirrors suspend and resume with it, so an
+operator's suspend or delete that lands after the gate's read is kept.
+
 The late-effect fence (cut epoch for queued or in-flight admissions) lives
 on ``PepRuntime``, not in this file. Reloading a killed store denies new
 evaluates as ``kill_active``. It does not reconstruct another process's
@@ -106,6 +111,31 @@ class HaltStore:
             finally:
                 _release_file_lock(lock_fd)
 
+    def write_if(self, expected: HaltMode, state: HaltState) -> tuple[HaltState | None, bool]:
+        """Compare and write: persist ``state`` only if the file still reads ``expected``.
+
+        The comparison runs under the same thread lock and ``flock`` as
+        ``write``, after the lock is taken. Returns the state on disk after
+        the call (``None`` when the file is missing) and whether this call
+        wrote it. A missing file is never recreated, and a file that is
+        killed, unavailable, unreadable, or in another mode is left as it is.
+        A caller that mirrors a mode it read earlier uses this, so a change
+        that lands between that read and this write is not overwritten.
+        """
+        with self._lock:
+            lock_fd = self._acquire_file_lock()
+            try:
+                current = self._read_existing_unlocked()
+                if current is None:
+                    return None, False
+                if current.mode is not expected or not current.available:
+                    return current, False
+                next_state = _merge_sticky_kill(current, state)
+                self._write_unlocked(next_state)
+                return next_state, True
+            finally:
+                _release_file_lock(lock_fd)
+
     @property
     def lock_path(self) -> Path:
         return self.path.parent / f".{self.path.name}.lock"
@@ -153,6 +183,16 @@ class HaltStore:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             return HaltState(mode=HaltMode.KILLED, available=False)
         return _parse_halt_document(data)
+
+    def _read_existing_unlocked(self) -> HaltState | None:
+        """One read of the file. ``None`` only when it does not exist."""
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError):
+            return HaltState(mode=HaltMode.KILLED, available=False)
+        return parse_halt_text(raw)
 
     def _write_unlocked(self, state: HaltState) -> None:
         stamp = state.updated_at or _utc_zulu()
