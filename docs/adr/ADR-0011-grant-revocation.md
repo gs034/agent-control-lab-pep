@@ -26,7 +26,7 @@ The detection half of this project (ADR-0010 and the console's ledger-versus-pro
 
 - An operator can end a grant before it is spent, and a kill now ends every grant. Both are visible on the record (`revoked_at`) and in the receipt (`approval_revoked`).
 - `revoke_all()` with no scope revokes nothing. It raises. The global form is `all=True`, which is what kill uses.
-- The reference host does not yet expose revocation. The admin socket gains `revoke` and `revoke_all` operations, and the host's grant selection learns to report a revoked match, in the next PR, so that this one stays within the five-file rule.
+- The reference host exposes revocation on the admin socket only: `revoke` (one `approval_id`) and `revoke_all` (every outstanding grant, or every grant of one connection, which the host maps to `revoke_all(all=True)` or `revoke_all(principal=...)`). The agent socket cannot revoke; an op body there stays `envelope_invalid`. Grant selection reports a revoked match instead of selecting it, and the held connection's call is `DENY approval_revoked` with the grant unspent and an `approval_match` check of `revoked`. The CLI mirrors this as `revoke` and `revoke-all`.
 - Reason codes are additive; `approval_revoked` is new and no string is reused.
 
 ## What this is not

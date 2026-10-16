@@ -1082,7 +1082,10 @@ class ReferenceHost:
                 return {"ok": False, "error": "no such connection"}
             principal = session.principal
         try:
-            count = self._runtime.approvals.revoke_all(principal=principal)
+            if principal is None:
+                count = self._runtime.approvals.revoke_all(all=True)
+            else:
+                count = self._runtime.approvals.revoke_all(principal=principal)
         except (ValueError, HostError) as exc:
             return {"ok": False, "error": str(exc)}
         reply: dict[str, Any] = {"ok": True, "revoked": count}

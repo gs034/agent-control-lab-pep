@@ -1474,11 +1474,20 @@ def test_admin_revoke_ends_a_grant_before_it_is_spent(tmp_path: Path):
         _send(client, {"op": "revoke", "approval_id": third["approval_id"]})
         assert _recv(client)["reason_code"] == "envelope_invalid"
         assert not host._runtime.approvals.lookup(third["approval_id"]).revoked()
+        # revoke-all with no connection is the global form (revoke_all(all=True)).
+        everything = admin_call(["revoke-all", "--admin", str(admin)])
+        assert everything == {"ok": True, "revoked": 1}
+        assert host._runtime.approvals.lookup(third["approval_id"]).revoked()
+        fourth = admin_call(
+            ["grant", "--admin", str(admin), "--connection", str(connection_id), "--tool", "echo.ping",
+             "--args", json.dumps(ARGS), "--ttl", "60"]
+        )
+        assert not host._runtime.approvals.lookup(fourth["approval_id"]).revoked()
         # A kill revokes what is left, on the host as in the library.
         write_killed(host.halt_path)
         _send(client, {"tool_name": "echo.ping", "args": ARGS})
         assert _recv(client)["reason_code"] == "kill_active"
-        assert host._runtime.approvals.lookup(third["approval_id"]).revoked()
+        assert host._runtime.approvals.lookup(fourth["approval_id"]).revoked()
         assert calls == []
     finally:
         client.close()
