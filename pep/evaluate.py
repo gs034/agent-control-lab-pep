@@ -280,36 +280,55 @@ class PepRuntime:
         """Reversible halt. No-op when already killed (kill wins).
 
         With ``expect_halt`` the halt file is written only if it still reads
-        that mode under the store lock (``HaltStore.write_if``).
+        that mode under the store lock (``HaltStore.write_if``). In-memory
+        mode becomes suspended only after that write lands, or when the
+        write is declined because the file is missing or already a halt.
+        A file that stayed active is left active in memory too.
         """
         with self._lock:
             if self._mode is RuntimeMode.KILLED:
                 return
-            self._mode = RuntimeMode.SUSPENDED
-            self._persist_halt(expect_halt)
+            if expect_halt is None:
+                self._mode = RuntimeMode.SUSPENDED
+                self._persist_halt()
+                return
+            self._persist_halt(expect_halt, pending=RuntimeMode.SUSPENDED)
 
     def resume(self, *, expect_halt: HaltMode | None = None) -> None:
         """Clear suspend only. A killed PEP stays killed.
 
         With ``expect_halt`` the halt file is written only if it still reads
         that mode under the store lock, and a missing file is not recreated.
+        In-memory mode becomes active only after that write lands. A declined
+        write leaves the suspend in place. A kill found on disk is learned.
         """
         with self._lock:
             if self._mode is RuntimeMode.SUSPENDED:
-                self._mode = RuntimeMode.ACTIVE
-                self._persist_halt(expect_halt)
+                if expect_halt is None:
+                    self._mode = RuntimeMode.ACTIVE
+                    self._persist_halt()
+                    return
+                self._persist_halt(expect_halt, pending=RuntimeMode.ACTIVE)
 
     def mark_unavailable(self) -> None:
         with self._lock:
             self.available = False
             self._persist_halt()
 
-    def _persist_halt(self, expect_halt: HaltMode | None = None) -> None:
+    def _persist_halt(
+        self,
+        expect_halt: HaltMode | None = None,
+        *,
+        pending: RuntimeMode | None = None,
+    ) -> None:
         store = self._halt_store
         if store is None:
+            if pending is not None:
+                self._mode = pending
             return
+        requested_mode = pending if pending is not None else self._mode
         requested = HaltState(
-            mode=_mode_to_halt(self._mode),
+            mode=_mode_to_halt(requested_mode),
             available=self.available,
         )
         try:
@@ -318,18 +337,19 @@ class PepRuntime:
             else:
                 on_disk, wrote = store.write_if(expect_halt, requested)
                 if not wrote or on_disk is None:
-                    # The file changed after the caller read it. Leave it. A
-                    # kill found there is learned here; any other change is
-                    # read by the caller's next halt check.
-                    if on_disk is not None and on_disk.killed():
-                        self._mode = RuntimeMode.KILLED
-                        self.available = on_disk.available
-                        self._engage_fence_unlocked()
+                    # The conditional write did not land. Do not keep a mode
+                    # that is less halted than this process already was.
+                    self._halt_after_declined_write(on_disk, pending)
                     return
                 written = on_disk
         except HaltStoreError:
-            # Persist failed. Stay fail-closed in this process (already killed
-            # or suspended in memory). Next process may miss the write.
+            # Persist failed. An unconditional caller already set a halt mode
+            # and it stays. A conditional suspend still enters that halt so a
+            # failed write cannot leave this process active. A conditional
+            # resume does not clear the suspend it failed to write. The next
+            # process may miss the write.
+            if pending is RuntimeMode.SUSPENDED and self._mode is not RuntimeMode.KILLED:
+                self._mode = RuntimeMode.SUSPENDED
             return
         self._mode = _halt_to_mode(written.mode)
         self.available = written.available
@@ -337,6 +357,34 @@ class PepRuntime:
             # Sticky kill learned from the store is the same cut: fence
             # admissions already taken in this process.
             self._engage_fence_unlocked()
+
+    def _halt_after_declined_write(
+        self,
+        on_disk: HaltState | None,
+        pending: RuntimeMode | None,
+    ) -> None:
+        """``write_if`` declined. A halt already in memory or on disk stays.
+
+        A kill on disk is learned. A suspended file is learned. A missing
+        file keeps an in-memory suspend, and a suspend that did not land
+        still suspends this process. A less-halted mode is applied only
+        when the conditional write succeeds.
+        """
+        if on_disk is not None and on_disk.killed():
+            self._mode = RuntimeMode.KILLED
+            self.available = on_disk.available
+            self._engage_fence_unlocked()
+            return
+        if on_disk is not None and on_disk.mode is HaltMode.SUSPENDED:
+            if self._mode is not RuntimeMode.KILLED:
+                self._mode = RuntimeMode.SUSPENDED
+            return
+        if (
+            on_disk is None
+            and pending is RuntimeMode.SUSPENDED
+            and self._mode is not RuntimeMode.KILLED
+        ):
+            self._mode = RuntimeMode.SUSPENDED
 
     def issue_approval(
         self,

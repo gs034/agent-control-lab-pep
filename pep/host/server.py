@@ -1344,6 +1344,7 @@ class ReferenceHost:
                 # file clears it. Kill and a missing file do not. The mirror
                 # write is compare-and-write: a suspend or delete that lands
                 # after the read above is kept, not overwritten (P-8).
+                # In-memory mode stays suspended until that write lands.
                 self._runtime.resume(expect_halt=HaltMode.ACTIVE)
             return None
         if observed == SUSPENDED:

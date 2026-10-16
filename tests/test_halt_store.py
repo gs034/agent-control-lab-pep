@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
-from pep.evaluate import PepRuntime, evaluate
+from pep.evaluate import PepRuntime, RuntimeMode, evaluate
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import DEMO_POLICY
 from pep.reasons import ReasonCode
@@ -291,3 +292,111 @@ def test_write_if_keeps_a_changed_or_missing_file(tmp_path: Path):
     assert wrote is True
     assert on_disk is not None and on_disk.mode is HaltMode.ACTIVE
     assert store.read().mode is HaltMode.ACTIVE
+
+
+def _suspended_runtime(path: Path) -> tuple[HaltStore, PepRuntime]:
+    store = HaltStore(path)
+    store.write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+    runtime = PepRuntime(policy=DEMO_POLICY, halt_store=store, persist_on_load=False)
+    assert runtime.mode is RuntimeMode.SUSPENDED
+    return store, runtime
+
+
+def test_declined_resume_write_if_keeps_the_suspend_until_a_write_lands(tmp_path: Path):
+    """A resume compare-and-write that does not land must not look active.
+
+    Mode used to flip to active before ``write_if`` returned. A decline left
+    it there, so evaluate allowed and spent a grant before the next halt
+    check. The file is left as it was. A later resume whose expected mode
+    matches the file clears the suspend.
+    """
+    path = tmp_path / "halt.json"
+    store, runtime = _suspended_runtime(path)
+    now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+    grant = runtime.issue_approval(
+        tool_name="echo.ping",
+        args={"message": "hello"},
+        ttl_seconds=60,
+        principal=HOST,
+        now=now,
+    )
+    runtime.resume(expect_halt=HaltMode.ACTIVE)
+    assert runtime.mode is RuntimeMode.SUSPENDED
+    assert store.read().mode is HaltMode.SUSPENDED
+
+    envelope = {**_allowable(), "capability_token": None, "approval_id": grant.approval_id}
+    decision = evaluate(envelope, runtime=runtime, principal=HOST, now=now)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.SUSPEND_ACTIVE
+    assert runtime.approvals.lookup(grant.approval_id).consumed() is False
+
+    path.unlink()
+    runtime.resume(expect_halt=HaltMode.ACTIVE)
+    assert runtime.mode is RuntimeMode.SUSPENDED
+    assert not path.exists()
+
+    store.write(HaltState(mode=HaltMode.KILLED, available=True))
+    runtime.resume(expect_halt=HaltMode.ACTIVE)
+    assert runtime.kill_active is True
+    assert runtime.fence_engaged is True
+    assert store.read().mode is HaltMode.KILLED
+
+    store, runtime = _suspended_runtime(tmp_path / "later.json")
+    store.write(HaltState(mode=HaltMode.ACTIVE, available=True))
+    runtime.resume(expect_halt=HaltMode.ACTIVE)
+    assert runtime.mode is RuntimeMode.ACTIVE
+    assert store.read().mode is HaltMode.ACTIVE
+
+
+def test_declined_suspend_write_if_follows_the_file(tmp_path: Path):
+    """A suspend compare-and-write that does not land does not invent a halt.
+
+    An active file stays active in memory. A missing file is still a halt,
+    so this process suspends and does not recreate the file. When the file
+    is suspended, the next conditional suspend mirrors it.
+    """
+    path = tmp_path / "halt.json"
+    store = HaltStore(path)
+    store.write(HaltState(mode=HaltMode.ACTIVE, available=True))
+    runtime = PepRuntime(policy=DEMO_POLICY, halt_store=store, persist_on_load=False)
+    assert runtime.mode is RuntimeMode.ACTIVE
+
+    runtime.suspend(expect_halt=HaltMode.SUSPENDED)
+    assert runtime.mode is RuntimeMode.ACTIVE
+    assert store.read().mode is HaltMode.ACTIVE
+
+    path.unlink()
+    runtime.suspend(expect_halt=HaltMode.SUSPENDED)
+    assert runtime.mode is RuntimeMode.SUSPENDED
+    assert not path.exists()
+
+    mirror = tmp_path / "mirror.json"
+    mirrored = HaltStore(mirror)
+    mirrored.write(HaltState(mode=HaltMode.ACTIVE, available=True))
+    fresh = PepRuntime(policy=DEMO_POLICY, halt_store=mirrored, persist_on_load=False)
+    assert fresh.mode is RuntimeMode.ACTIVE
+    mirrored.write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+    fresh.suspend(expect_halt=HaltMode.SUSPENDED)
+    assert fresh.mode is RuntimeMode.SUSPENDED
+    assert mirrored.read().mode is HaltMode.SUSPENDED
+
+
+def test_conditional_halt_write_error_stays_fail_closed(tmp_path: Path, monkeypatch):
+    """A store error on the conditional path must not clear a suspend."""
+    path = tmp_path / "halt.json"
+    store, runtime = _suspended_runtime(path)
+
+    def boom(self, expected, state):  # type: ignore[no-untyped-def]
+        raise HaltStoreError("halt store persist failed")
+
+    monkeypatch.setattr(HaltStore, "write_if", boom)
+    runtime.resume(expect_halt=HaltMode.ACTIVE)
+    assert runtime.mode is RuntimeMode.SUSPENDED
+    assert store.read().mode is HaltMode.SUSPENDED
+
+    active = HaltStore(tmp_path / "active.json")
+    active.write(HaltState(mode=HaltMode.ACTIVE, available=True))
+    other = PepRuntime(policy=DEMO_POLICY, halt_store=active, persist_on_load=False)
+    other.suspend(expect_halt=HaltMode.SUSPENDED)
+    assert other.mode is RuntimeMode.SUSPENDED
+    assert active.read().mode is HaltMode.ACTIVE
