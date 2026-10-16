@@ -165,6 +165,9 @@ class PepRuntime:
         with self._lock:
             self._engage_fence_unlocked()
             self._mode = RuntimeMode.KILLED
+            # ADR-0011: a kill leaves no spendable grant behind it. Revoke
+            # before persisting, so a failed write still finds them revoked.
+            self._approvals.revoke_all()
             self._persist_halt()
 
     def _engage_fence_unlocked(self) -> None:
@@ -719,6 +722,7 @@ _IMPLEMENTATION_REOBSERVE_DETAIL = (
     "fail-closed deny, no tool entry (grant already spent)"
 )
 _SUSPEND_DETAIL = "PEP suspend active; fail-closed deny, no invoke"
+_REVOKED_DETAIL = "single-use TTL approval revoked before it was spent; fail-closed deny, no invoke"
 
 
 def _reason_detail(reason: ReasonCode) -> str:
@@ -732,6 +736,8 @@ def _reason_detail(reason: ReasonCode) -> str:
         return ADMISSION_CONSUMED_DETAIL
     if reason is ReasonCode.SUSPEND_ACTIVE:
         return _SUSPEND_DETAIL
+    if reason is ReasonCode.APPROVAL_REVOKED:
+        return _REVOKED_DETAIL
     return _KILL_DETAIL
 
 

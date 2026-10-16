@@ -692,3 +692,103 @@ def test_state_observer_is_not_consulted_without_a_frozen_digest():
     )
     assert decision.verdict == "ALLOW"
     assert calls["observer"] == 0
+
+
+# ADR-0011: grant revocation. A revoked grant is never spent, by the operator's
+# hand or by kill, and resume does not bring it back.
+
+
+def test_revoked_grant_is_deny_approval_revoked_and_stays_unspent():
+    runtime = _runtime()
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    assert runtime.approvals.revoke(grant.approval_id, now=now) is True
+    stored = runtime.approvals.lookup(grant.approval_id)
+    assert stored is not None and stored.revoked() and not stored.consumed()
+    called = {"n": 0}
+
+    def echo():
+        called["n"] += 1
+        return "ok"
+
+    decision, result = gated_invoke(
+        _base(approval_id=grant.approval_id), echo, runtime=runtime, principal=HOST, now=now
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_REVOKED
+    assert "revoked" in decision.receipt.reason_detail
+    assert result is None
+    assert called["n"] == 0
+    after = runtime.approvals.lookup(grant.approval_id)
+    assert after is not None and after.revoked() and not after.consumed()
+
+
+def test_revoke_is_idempotent_and_refuses_unknown_or_spent_grants():
+    runtime = _runtime()
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    assert runtime.approvals.revoke("lab.appr." + "0" * 32, now=now) is False
+    assert runtime.approvals.revoke(grant.approval_id, now=now) is True
+    assert runtime.approvals.revoke(grant.approval_id, now=now) is False
+    spent = _issue(runtime, now=now)
+    decision = evaluate(_base(approval_id=spent.approval_id), runtime=runtime, principal=HOST, now=now)
+    assert decision.verdict == "ALLOW"
+    assert runtime.approvals.revoke(spent.approval_id, now=now) is False
+    stored = runtime.approvals.lookup(spent.approval_id)
+    assert stored is not None and stored.consumed() and not stored.revoked()
+
+
+def test_revoke_all_counts_outstanding_grants_and_can_be_scoped_to_a_principal():
+    runtime = _runtime()
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    first = _issue(runtime, now=now)
+    second = _issue(runtime, now=now, args={"message": "second"})
+    other = _issue(runtime, now=now, principal="lab.other.agent")
+    spent = _issue(runtime, now=now, args={"message": "spent"})
+    assert evaluate(
+        _base(approval_id=spent.approval_id, args={"message": "spent"}), runtime=runtime, principal=HOST, now=now
+    ).verdict == "ALLOW"
+    assert runtime.approvals.revoke_all(principal=HOST, now=now) == 2
+    assert runtime.approvals.lookup(first.approval_id).revoked()
+    assert runtime.approvals.lookup(second.approval_id).revoked()
+    assert not runtime.approvals.lookup(other.approval_id).revoked()
+    assert not runtime.approvals.lookup(spent.approval_id).revoked()
+    assert runtime.approvals.revoke_all(now=now) == 1
+    assert runtime.approvals.lookup(other.approval_id).revoked()
+    assert runtime.approvals.revoke_all(now=now) == 0
+
+
+def test_kill_revokes_every_outstanding_grant_before_persisting():
+    runtime = _runtime()
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    other = _issue(runtime, now=now, principal="lab.other.agent")
+    runtime.kill()
+    assert runtime.kill_active is True
+    for issued in (grant, other):
+        stored = runtime.approvals.lookup(issued.approval_id)
+        assert stored is not None and stored.revoked() and not stored.consumed()
+    # Kill is irreversible here, and the grant's own mark does not depend on
+    # the runtime mode: a fresh runtime sharing the store still refuses it.
+    fresh = PepRuntime(policy=DEMO_POLICY, approvals=runtime.approvals)
+    decision = evaluate(_base(approval_id=grant.approval_id), runtime=fresh, principal=HOST, now=now)
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_REVOKED
+
+
+def test_revoke_takes_precedence_over_consumed_expired_and_binding_checks():
+    runtime = _runtime()
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    runtime.approvals.revoke(grant.approval_id, now=now)
+    later = now + timedelta(seconds=3600)
+    mutated = evaluate(
+        _base(approval_id=grant.approval_id, args=dict(MUTATED_ARGS)), runtime=runtime, principal=HOST, now=later
+    )
+    assert mutated.receipt.reason_code == ReasonCode.APPROVAL_REVOKED
+    wrong_principal = evaluate(
+        _base(approval_id=grant.approval_id), runtime=runtime, principal="lab.other.agent", now=now
+    )
+    # The principal check still comes first: a stranger learns only that the id exists.
+    assert wrong_principal.receipt.reason_code == ReasonCode.APPROVAL_PRINCIPAL_MISMATCH
+
