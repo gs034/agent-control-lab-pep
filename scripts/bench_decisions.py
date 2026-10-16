@@ -21,6 +21,9 @@ The gap between an agent's successive tool calls is not measured here:
 this tree holds no agent traces. Any trace supplied to ``--gaps`` must be
 a JSON list of monotonic seconds at which calls were issued; the script
 then reports the gap distribution next to the decision times.
+
+Every JSON report includes ``cpu_count`` and ``load`` (the one, five, and
+fifteen minute load averages) for the machine that ran it.
 """
 
 from __future__ import annotations
@@ -64,6 +67,27 @@ def _agent_uid() -> int:
     return 2 if candidate == 0 else candidate
 
 
+def _cpu_and_load() -> dict[str, object]:
+    """CPU count and load averages for the JSON report. Not a latency sample."""
+    cpu_count = os.cpu_count()
+    absent: dict[str, float | None] = {"load_1m": None, "load_5m": None, "load_15m": None}
+    getloadavg = getattr(os, "getloadavg", None)
+    if getloadavg is None:
+        return {"cpu_count": cpu_count, "load": absent}
+    try:
+        load1, load5, load15 = getloadavg()
+    except OSError:
+        return {"cpu_count": cpu_count, "load": absent}
+    return {
+        "cpu_count": cpu_count,
+        "load": {
+            "load_1m": round(float(load1), 3),
+            "load_5m": round(float(load5), 3),
+            "load_15m": round(float(load15), 3),
+        },
+    }
+
+
 def run(iterations: int, gaps: list[float] | None) -> dict:
     if os.getuid() == 0:
         raise SystemExit("the reference host refuses to run as root; run this as an ordinary user")
@@ -101,17 +125,22 @@ def run(iterations: int, gaps: list[float] | None) -> dict:
                 assert reply["decision"] == "ALLOW", reply
         finally:
             host.close()
+    cpu_and_load = _cpu_and_load()
     report = {
         "measured_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "machine": platform.machine(),
+        "cpu_count": cpu_and_load["cpu_count"],
+        "load": cpu_and_load["load"],
         "iterations": iterations,
         "series": {name: _percentiles(values) for name, values in series.items()},
         "note": (
             "In-process handle_request timings on one machine. deny_* are rules-only decisions "
             "with the log append; allow_echo includes the executor worker round trip. Not a socket "
-            "round trip and not an attack-success measurement."
+            "round trip and not an attack-success measurement. cpu_count and load (1, 5, and 15 "
+            "minute averages) describe the machine at the end of the run. The allow_echo max on "
+            "the 14 October run (8 ms) was noisy and not reproducible: a reviewer re-run gave 22 to 147 ms."
         ),
     }
     if gaps is not None:
