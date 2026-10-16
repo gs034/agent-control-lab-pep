@@ -12,6 +12,7 @@ import pytest
 from pep.approval import ApprovalError, ApprovalStore, invoke_binding_digest
 from pep.evaluate import PepRuntime, evaluate
 from pep.gate import gated_invoke
+from pep.halt import HaltMode, HaltStore, HaltStoreError
 from pep.policy import DEMO_POLICY
 from pep.reasons import ReasonCode
 
@@ -753,9 +754,9 @@ def test_revoke_all_counts_outstanding_grants_and_can_be_scoped_to_a_principal()
     assert runtime.approvals.lookup(second.approval_id).revoked()
     assert not runtime.approvals.lookup(other.approval_id).revoked()
     assert not runtime.approvals.lookup(spent.approval_id).revoked()
-    assert runtime.approvals.revoke_all(now=now) == 1
+    assert runtime.approvals.revoke_all(all=True, now=now) == 1
     assert runtime.approvals.lookup(other.approval_id).revoked()
-    assert runtime.approvals.revoke_all(now=now) == 0
+    assert runtime.approvals.revoke_all(all=True, now=now) == 0
 
 
 def test_kill_revokes_every_outstanding_grant_before_persisting():
@@ -791,4 +792,150 @@ def test_revoke_takes_precedence_over_consumed_expired_and_binding_checks():
     )
     # The principal check still comes first: a stranger learns only that the id exists.
     assert wrong_principal.receipt.reason_code == ReasonCode.APPROVAL_PRINCIPAL_MISMATCH
+
+
+def test_revoke_all_requires_an_explicit_scope():
+    runtime = _runtime()
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    grant = _issue(runtime, now=now)
+    other = _issue(runtime, now=now, principal="lab.other.agent", args={"message": "other"})
+    for call in (
+        lambda: runtime.approvals.revoke_all(),
+        lambda: runtime.approvals.revoke_all(now=now),
+        lambda: runtime.approvals.revoke_all(all=False, now=now),
+        lambda: runtime.approvals.revoke_all(principal=None, now=now),
+    ):
+        with pytest.raises(ApprovalError, match="requires all=True or a principal"):
+            call()
+    with pytest.raises(ApprovalError, match="not both"):
+        runtime.approvals.revoke_all(all=True, principal=HOST, now=now)
+    with pytest.raises(ApprovalError, match="all= must be true or false"):
+        runtime.approvals.revoke_all(all=1, now=now)  # type: ignore[arg-type]
+    for issued in (grant, other):
+        stored = runtime.approvals.lookup(issued.approval_id)
+        assert stored is not None and not stored.revoked() and not stored.consumed()
+    assert runtime.approvals.revoke_all(all=True, now=now) == 2
+    for issued in (grant, other):
+        stored = runtime.approvals.lookup(issued.approval_id)
+        assert stored is not None and stored.revoked() and not stored.consumed()
+
+
+def test_kill_from_a_state_observer_persists_the_halt_and_revokes(tmp_path, monkeypatch):
+    store = HaltStore(tmp_path / "halt.json")
+    runtime = PepRuntime(policy=DEMO_POLICY, halt_store=store)
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    watched = _issue(runtime, now=now, state_digest=STATE_A)
+    other = _issue(runtime, now=now, principal="lab.other.agent", args={"message": "other"})
+    box = {"revoked_before_write": False, "writes": 0}
+    original = HaltStore.write
+
+    def spy(self, state):
+        box["writes"] += 1
+        # lookup() would refuse reentry while the observer flag is still set.
+        watched_row = runtime.approvals._records[watched.approval_id]
+        other_row = runtime.approvals._records[other.approval_id]
+        box["revoked_before_write"] = watched_row.revoked() and other_row.revoked()
+        box["mode"] = state.mode
+        return original(self, state)
+
+    monkeypatch.setattr(HaltStore, "write", spy)
+
+    def observer() -> str:
+        runtime.kill()
+        return STATE_A
+
+    decision = evaluate(
+        _base(approval_id=watched.approval_id),
+        runtime=runtime,
+        principal=HOST,
+        now=now,
+        state_observer=observer,
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_REVOKED
+    assert runtime.kill_active is True
+    assert box["writes"] == 1
+    assert box["mode"] is HaltMode.KILLED
+    assert box["revoked_before_write"] is True
+    for issued in (watched, other):
+        stored = runtime.approvals.lookup(issued.approval_id)
+        assert stored is not None and stored.revoked() and not stored.consumed()
+    assert store.read().mode is HaltMode.KILLED
+    restarted = PepRuntime(policy=DEMO_POLICY, halt_store=HaltStore(tmp_path / "halt.json"))
+    assert restarted.kill_active is True
+    fresh = PepRuntime(policy=DEMO_POLICY, approvals=runtime.approvals)
+    again = evaluate(_base(approval_id=watched.approval_id), runtime=fresh, principal=HOST, now=now)
+    assert again.verdict == "DENY"
+    assert again.receipt.reason_code == ReasonCode.APPROVAL_REVOKED
+    # The store lock was released and the observer flag cleared: a new grant still spends.
+    later = _issue(fresh, now=now, args={"message": "later"})
+    allowed = evaluate(
+        _base(approval_id=later.approval_id, args={"message": "later"}),
+        runtime=fresh,
+        principal=HOST,
+        now=now,
+    )
+    assert allowed.verdict == "ALLOW"
+
+
+def test_kill_from_a_state_observer_revokes_when_the_halt_write_fails(tmp_path, monkeypatch):
+    store = HaltStore(tmp_path / "halt.json")
+    runtime = PepRuntime(policy=DEMO_POLICY, halt_store=store)
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    watched = _issue(runtime, now=now, state_digest=STATE_A)
+    other = _issue(runtime, now=now, principal="lab.other.agent", args={"message": "other"})
+    assert store.read().mode is HaltMode.ACTIVE
+
+    def fail_write(self, state):
+        raise HaltStoreError("halt write failed")
+
+    monkeypatch.setattr(HaltStore, "write", fail_write)
+
+    def observer() -> str:
+        runtime.kill()
+        return STATE_A
+
+    decision = evaluate(
+        _base(approval_id=watched.approval_id),
+        runtime=runtime,
+        principal=HOST,
+        now=now,
+        state_observer=observer,
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_REVOKED
+    assert runtime.kill_active is True
+    assert store.read().mode is HaltMode.ACTIVE
+    for issued in (watched, other):
+        stored = runtime.approvals.lookup(issued.approval_id)
+        assert stored is not None and stored.revoked() and not stored.consumed()
+
+
+def test_kill_from_an_implementation_observer_persists_the_halt_and_revokes(tmp_path):
+    store = HaltStore(tmp_path / "halt.json")
+    runtime = PepRuntime(policy=DEMO_POLICY, halt_store=store)
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    watched = _issue(runtime, now=now, implementation_digest=STATE_A)
+    other = _issue(runtime, now=now, principal="lab.other.agent", args={"message": "other"})
+
+    def observer() -> str:
+        runtime.kill()
+        return STATE_A
+
+    decision = evaluate(
+        _base(approval_id=watched.approval_id),
+        runtime=runtime,
+        principal=HOST,
+        now=now,
+        implementation_observer=observer,
+    )
+    assert decision.verdict == "DENY"
+    assert decision.receipt.reason_code == ReasonCode.APPROVAL_REVOKED
+    assert runtime.kill_active is True
+    assert store.read().mode is HaltMode.KILLED
+    for issued in (watched, other):
+        stored = runtime.approvals.lookup(issued.approval_id)
+        assert stored is not None and stored.revoked() and not stored.consumed()
+    restarted = PepRuntime(policy=DEMO_POLICY, halt_store=HaltStore(tmp_path / "halt.json"))
+    assert restarted.kill_active is True
 
