@@ -34,12 +34,12 @@ from pep.evaluate import PepRuntime, evaluate
 from pep.halt import HaltMode, HaltState, HaltStore, HaltStoreError
 from pep.policy import STUB_POLICY_DOCUMENT
 from pep.host.__main__ import main
-from pep.host.client import AgentConnection, invoke
-from pep.host.haltfile import ACTIVE, init_active, read_fail_closed
+from pep.host.client import AgentConnection, admin_call as operator_call, invoke
+from pep.host.haltfile import ACTIVE, init_active, read_fail_closed, write_killed
 from pep.host.log import FORBIDDEN_KEYS, MAX_LOG_STARTUP_BYTES, DecisionLog, DecisionLogError
 from pep.host.protocol import ProtocolError, parse_host_request
 from pep.host.fsguard import file_owner
-from pep.host.server import SOCKET_MODE, HostError, PeerCred, ReferenceHost, peer_credentials
+from pep.host.server import SOCKET_MODE, HostError, PeerCred, ReferenceHost, Session, peer_credentials
 
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
 ARGS = {"message": "hi"}
@@ -1424,6 +1424,197 @@ def test_admin_grant_allows_the_held_connection(tmp_path: Path):
         assert calls == []
     finally:
         client.close()
+        host.close()
+
+
+def test_admin_revoke_ends_a_grant_before_it_is_spent(tmp_path: Path):
+    """ADR-0011 on the reference host: an operator revokes a grant on the admin
+    socket; the held connection's matching call is DENY approval_revoked with
+    the grant unspent; a second revoke changes nothing; revoke-all by
+    connection counts what it ended; a kill revokes what is left."""
+    calls: list[str] = []
+
+    def registered(_args: dict) -> dict:
+        calls.append("registry")
+        return {"pong": "ok"}
+
+    admin = tmp_path / "admin.sock"
+    host = _listen(tmp_path, registry={"echo.ping": registered}, admin_path=admin)
+    client = _connect(host.socket_path)
+    try:
+        _wait_sessions(host, 1)
+        connection_id = host.sessions()[0].connection_id
+
+        def admin_call(argv: list[str]) -> dict[str, Any]:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                assert main(argv) == 0
+            return json.loads(out.getvalue())
+
+        granted = admin_call(
+            ["grant", "--admin", str(admin), "--connection", str(connection_id), "--tool", "echo.ping",
+             "--args", json.dumps(ARGS), "--ttl", "60"]
+        )
+        approval_id = granted["approval_id"]
+        revoked = admin_call(["revoke", "--admin", str(admin), "--approval", approval_id])
+        assert revoked == {"ok": True, "approval_id": approval_id, "revoked": True}
+        _send(client, {"tool_name": "echo.ping", "args": ARGS})
+        denied = _recv(client)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "approval_revoked"
+        assert "revoked" in denied["reason_detail"]
+        assert calls == []
+        record = host.decision_records()[-1]
+        assert record["reason_code"] == "approval_revoked"
+        assert {"name": "approval_match", "outcome": "revoked"} in record["checks"]
+        stored = host._runtime.approvals.lookup(approval_id)
+        assert stored is not None and stored.revoked() and not stored.consumed()
+        again = admin_call(["revoke", "--admin", str(admin), "--approval", approval_id])
+        assert again["revoked"] is False
+        unknown = admin_call(["revoke", "--admin", str(admin), "--approval", "lab.appr." + "0" * 32])
+        assert unknown["revoked"] is False
+
+        second = admin_call(
+            ["grant", "--admin", str(admin), "--connection", str(connection_id), "--tool", "echo.ping",
+             "--args", json.dumps(ARGS), "--ttl", "60"]
+        )
+        swept = admin_call(["revoke-all", "--admin", str(admin), "--connection", str(connection_id)])
+        assert swept == {"ok": True, "revoked": 1, "connection_id": connection_id}
+        assert host._runtime.approvals.lookup(second["approval_id"]).revoked()
+        _send(client, {"tool_name": "echo.ping", "args": ARGS})
+        assert _recv(client)["reason_code"] == "approval_revoked"
+
+        third = admin_call(
+            ["grant", "--admin", str(admin), "--connection", str(connection_id), "--tool", "echo.ping",
+             "--args", json.dumps(ARGS), "--ttl", "60"]
+        )
+        assert not host._runtime.approvals.lookup(third["approval_id"]).revoked()
+        # The agent socket cannot revoke: an op body there is an invalid envelope.
+        _send(client, {"op": "revoke", "approval_id": third["approval_id"]})
+        assert _recv(client)["reason_code"] == "envelope_invalid"
+        assert not host._runtime.approvals.lookup(third["approval_id"]).revoked()
+        # revoke-all with no connection is the global form (revoke_all(all=True)).
+        everything = admin_call(["revoke-all", "--admin", str(admin)])
+        assert everything == {"ok": True, "revoked": 1}
+        assert host._runtime.approvals.lookup(third["approval_id"]).revoked()
+        fourth = admin_call(
+            ["grant", "--admin", str(admin), "--connection", str(connection_id), "--tool", "echo.ping",
+             "--args", json.dumps(ARGS), "--ttl", "60"]
+        )
+        assert not host._runtime.approvals.lookup(fourth["approval_id"]).revoked()
+        # A kill revokes what is left, on the host as in the library.
+        write_killed(host.halt_path)
+        _send(client, {"tool_name": "echo.ping", "args": ARGS})
+        assert _recv(client)["reason_code"] == "kill_active"
+        assert host._runtime.approvals.lookup(fourth["approval_id"]).revoked()
+        assert calls == []
+    finally:
+        client.close()
+        host.close()
+
+
+def test_revoke_all_by_connection_spares_a_grant_on_the_same_principal(tmp_path: Path):
+    """revoke-all --connection ends only the grants minted on that connection.
+
+    Two connections share a principal. Each holds a grant frozen to its own
+    args. Revoking the first leaves the second spendable. The first
+    connection's call matches only the revoked grant and is DENY
+    approval_revoked. A bool, a non-integer, or an unknown connection_id
+    changes nothing.
+    """
+
+    def registered(args: dict) -> dict:
+        return {"pong": args.get("message", "")}
+
+    admin = tmp_path / "admin.sock"
+    host = _listen(tmp_path, registry={"echo.ping": registered}, admin_path=admin)
+    try:
+        first = host.open_session(_peer(pid=10, uid=1000))
+        other = host.open_session(_peer(pid=11, uid=1000))
+        second = Session(principal=first.principal, peer=other.peer, connection_id=other.connection_id)
+        with host._lock:
+            host._sessions = [first, second]
+        assert first.principal == second.principal
+        assert first.connection_id != second.connection_id
+
+        def grant(connection_id: int, args: dict[str, str]) -> str:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                assert (
+                    main(
+                        [
+                            "grant",
+                            "--admin",
+                            str(admin),
+                            "--connection",
+                            str(connection_id),
+                            "--tool",
+                            "echo.ping",
+                            "--args",
+                            json.dumps(args),
+                            "--ttl",
+                            "60",
+                        ]
+                    )
+                    == 0
+                )
+            return json.loads(out.getvalue())["approval_id"]
+
+        first_args = {"message": "one"}
+        second_args = {"message": "two"}
+        first_approval = grant(first.connection_id, first_args)
+        second_approval = grant(second.connection_id, second_args)
+        assert host._minted_on[first_approval] == first.connection_id
+        assert host._minted_on[second_approval] == second.connection_id
+
+        for connection_id in (True, "1", 1.5, 0):
+            reply = operator_call(
+                admin,
+                {"op": "revoke_all", "connection_id": connection_id},
+                host_uid=os.getuid(),
+            )
+            assert reply["ok"] is False
+        assert host._runtime.approvals.lookup(first_approval).outstanding()
+        assert host._runtime.approvals.lookup(second_approval).outstanding()
+
+        swept = io.StringIO()
+        with redirect_stdout(swept):
+            assert (
+                main(
+                    [
+                        "revoke-all",
+                        "--admin",
+                        str(admin),
+                        "--connection",
+                        str(first.connection_id),
+                    ]
+                )
+                == 0
+            )
+        assert json.loads(swept.getvalue()) == {
+            "connection_id": first.connection_id,
+            "ok": True,
+            "revoked": 1,
+        }
+        stored_first = host._runtime.approvals.lookup(first_approval)
+        stored_second = host._runtime.approvals.lookup(second_approval)
+        assert stored_first is not None and stored_first.revoked() and not stored_first.consumed()
+        assert stored_second is not None and stored_second.outstanding()
+
+        denied = host.handle_request({"tool_name": "echo.ping", "args": first_args}, first)
+        assert denied["decision"] == "DENY"
+        assert denied["reason_code"] == "approval_revoked"
+        record = host.decision_records()[-1]
+        assert record["reason_code"] == "approval_revoked"
+        assert {"name": "approval_match", "outcome": "revoked"} in record["checks"]
+        assert host._runtime.approvals.lookup(first_approval).revoked()
+        assert not host._runtime.approvals.lookup(first_approval).consumed()
+
+        allowed = host.handle_request({"tool_name": "echo.ping", "args": second_args}, second)
+        assert allowed["decision"] == "ALLOW"
+        assert allowed["result"] == {"pong": "two"}
+        assert host._runtime.approvals.lookup(second_approval).consumed()
+    finally:
         host.close()
 
 

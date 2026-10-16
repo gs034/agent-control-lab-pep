@@ -188,6 +188,8 @@ class ReferenceHost:
         self._sessions: list[Session] = []
         self._known: set[str] = set()
         self._grants: dict[str, list[str]] = {}
+        # approval_id of each admin grant, and the connection that minted it.
+        self._minted_on: dict[str, int] = {}
         self._sticky_halt = False
         self._live = 0
         self._admin_live = 0
@@ -644,6 +646,18 @@ class ReferenceHost:
                 now=now,
                 request_id=request_id,
             )
+        if status == "revoked":
+            checks.append({"name": "approval_match", "outcome": "revoked"})
+            return self._logged(
+                session,
+                "DENY",
+                "approval_revoked",
+                "the matching grant was revoked before it was spent; fail-closed deny",
+                checks,
+                tool_name=tool_name,
+                now=now,
+                request_id=request_id,
+            )
         checks.append({"name": "approval_match", "outcome": status})
 
         envelope = self._internal_envelope(session, tool_name, args, approval_id, request_id)
@@ -1031,6 +1045,10 @@ class ReferenceHost:
             return {"ok": True, "sessions": [self._session_view(item) for item in self.sessions()]}
         if op == "grant":
             return self._admin_grant(body)
+        if op == "revoke":
+            return self._admin_revoke(body)
+        if op == "revoke_all":
+            return self._admin_revoke_all(body)
         return {"ok": False, "error": "unknown admin op"}
 
     def _admin_grant(self, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -1058,12 +1076,62 @@ class ReferenceHost:
             )
         except (HostError, ValueError, HaltStoreError) as exc:
             return {"ok": False, "error": str(exc)}
+        with self._lock:
+            self._minted_on[record.approval_id] = connection_id
         return {
             "ok": True,
             "approval_id": record.approval_id,
             "principal": session.principal,
             "connection_id": connection_id,
         }
+
+    def _admin_revoke(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Revoke one outstanding grant (ADR-0011). Not available on the agent socket."""
+        approval_id = body.get("approval_id")
+        if not isinstance(approval_id, str) or not approval_id:
+            return {"ok": False, "error": "approval_id must be a non-empty string"}
+        try:
+            revoked = self._runtime.approvals.revoke(approval_id)
+        except (ValueError, HostError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "approval_id": approval_id, "revoked": revoked}
+
+    def _admin_revoke_all(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Revoke every outstanding grant, or only grants minted on one connection.
+
+        No ``connection_id`` is ``revoke_all(all=True)``. A connection revokes
+        each of its own outstanding grants with ``revoke`` and does not touch
+        a grant minted on another connection, even one that shares the principal.
+        """
+        connection_id = body.get("connection_id")
+        if connection_id is not None:
+            if isinstance(connection_id, bool) or not isinstance(connection_id, int):
+                return {"ok": False, "error": "connection_id must be an integer"}
+            session = next((item for item in self.sessions() if item.connection_id == connection_id), None)
+            if session is None:
+                return {"ok": False, "error": "no such connection"}
+            with self._lock:
+                approval_ids = [
+                    approval_id
+                    for approval_id, minted_on in self._minted_on.items()
+                    if minted_on == connection_id
+                ]
+            count = 0
+            try:
+                for approval_id in approval_ids:
+                    record = self._runtime.approvals.lookup(approval_id)
+                    if record is None or not record.outstanding():
+                        continue
+                    if self._runtime.approvals.revoke(approval_id):
+                        count += 1
+            except (ValueError, HostError) as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "revoked": count, "connection_id": connection_id}
+        try:
+            count = self._runtime.approvals.revoke_all(all=True)
+        except (ValueError, HostError) as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "revoked": count}
 
     def _session_view(self, session: Session) -> dict[str, int | str]:
         return {
@@ -1411,14 +1479,20 @@ class ReferenceHost:
         with self._lock:
             ids = list(self._grants.get(session.principal, ()))
         matched: list[ApprovalRecord] = []
+        revoked: list[ApprovalRecord] = []
         for approval_id in ids:
             record = self._runtime.approvals.lookup(approval_id)
             if record is None or record.consumed():
                 continue
             if record.principal != session.principal:
                 continue
-            if record.matches_binding(tool_name, args):
-                matched.append(record)
+            if not record.matches_binding(tool_name, args):
+                continue
+            if record.revoked():
+                # ADR-0011: a revoked grant is reported, never selected.
+                revoked.append(record)
+                continue
+            matched.append(record)
         usable = [record for record in matched if not record.expired(now)]
         if len(usable) > 1:
             return "ambiguous", None
@@ -1426,6 +1500,8 @@ class ReferenceHost:
             return "one", usable[0].approval_id
         if matched:
             return "expired", matched[0].approval_id
+        if revoked:
+            return "revoked", revoked[0].approval_id
         return "none", None
 
     def _internal_envelope(
