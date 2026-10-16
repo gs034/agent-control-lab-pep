@@ -1341,12 +1341,14 @@ class ReferenceHost:
         if observed == ACTIVE:
             if self._runtime.suspend_active:
                 # A suspend observed at startup is not latched. An active
-                # file clears it. Kill and a missing file do not.
-                self._runtime.resume()
+                # file clears it. Kill and a missing file do not. The mirror
+                # write is compare-and-write: a suspend or delete that lands
+                # after the read above is kept, not overwritten (P-8).
+                self._runtime.resume(expect_halt=HaltMode.ACTIVE)
             return None
         if observed == SUSPENDED:
             if not self._runtime.suspend_active:
-                self._runtime.suspend()
+                self._runtime.suspend(expect_halt=HaltMode.SUSPENDED)
             return (
                 {"name": "halt_file", "outcome": "deny", "observed": observed},
                 "suspend_active",

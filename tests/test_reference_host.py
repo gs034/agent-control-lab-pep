@@ -1494,6 +1494,95 @@ def test_gate_resume_rewrite_does_not_lose_a_concurrent_kill(tmp_path: Path, mon
     assert after["reason_code"] == "kill_active"
 
 
+def _operator_acts_before_gate_lock(
+    monkeypatch: pytest.MonkeyPatch, halt: Path, action: str
+) -> dict[str, Any]:
+    """P-8: run an operator change after the gate read the halt file, before its write locks.
+
+    The hook runs once, in the gate's thread, at the start of the gate's
+    locked write. The operator's own write takes the file lock itself, so the
+    order is fixed: gate read, operator change, gate locked write.
+    """
+    import pep.halt as halt_module
+
+    real_lock = halt_module.HaltStore._acquire_file_lock
+    box: dict[str, Any] = {"armed": True}
+
+    def operator_then_lock(self):  # type: ignore[no-untyped-def]
+        if box.pop("armed", False):
+            if action == "suspend":
+                HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+            elif action == "resume":
+                HaltStore(halt).write(HaltState(mode=HaltMode.ACTIVE, available=True))
+            else:
+                halt.unlink()
+            box["operator_left"] = read_fail_closed(halt)[1]
+        return real_lock(self)
+
+    monkeypatch.setattr(halt_module.HaltStore, "_acquire_file_lock", operator_then_lock)
+    return box
+
+
+@pytest.mark.parametrize(("action", "expected"), [("suspend", "suspended"), ("delete", "missing")])
+def test_gate_resume_rewrite_does_not_overwrite_an_operator_halt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str, expected: str
+):
+    """P-8: a suspend or a delete between the gate's read and its resume write stays."""
+    halt = tmp_path / "halt.json"
+    HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+    host = ReferenceHost(
+        halt_path=halt,
+        log_path=tmp_path / "decisions.log",
+        registry={"echo.ping": lambda _args: {"pong": "ok"}},
+    )
+    session = host.open_session(_peer())
+    for _ in range(3):
+        host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert denied["reason_code"] == "suspend_active"
+    HaltStore(halt).write(HaltState(mode=HaltMode.ACTIVE, available=True))
+
+    box = _operator_acts_before_gate_lock(monkeypatch, halt, action)
+    host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert "armed" not in box, "the gate did not reach a locked halt write on resume"
+    assert box["operator_left"] == expected
+    assert read_fail_closed(halt)[1] == expected
+    after = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert after["decision"] == "DENY"
+    assert after["reason_code"] == ("suspend_active" if action == "suspend" else "kill_active")
+    assert read_fail_closed(halt)[1] != ACTIVE
+
+
+@pytest.mark.parametrize(("action", "expected"), [("resume", "active"), ("delete", "missing")])
+def test_gate_suspend_rewrite_does_not_overwrite_an_operator_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str, expected: str
+):
+    """P-8: the suspend mirror does not undo a resume or recreate a deleted file as suspended."""
+    halt = tmp_path / "halt.json"
+    init_active(halt)
+    host = ReferenceHost(
+        halt_path=halt,
+        log_path=tmp_path / "decisions.log",
+        registry={"echo.ping": lambda _args: {"pong": "ok"}},
+    )
+    session = host.open_session(_peer())
+    host.issue_session_approval(session, tool_name="echo.ping", args=ARGS, ttl_seconds=60)
+    HaltStore(halt).write(HaltState(mode=HaltMode.SUSPENDED, available=True))
+
+    box = _operator_acts_before_gate_lock(monkeypatch, halt, action)
+    denied = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    assert denied["reason_code"] == "suspend_active"
+    assert "armed" not in box, "the gate did not reach a locked halt write on suspend"
+    assert box["operator_left"] == expected
+    assert read_fail_closed(halt)[1] == expected
+    after = host.handle_request({"tool_name": "echo.ping", "args": ARGS}, session)
+    if action == "resume":
+        assert after["decision"] == "ALLOW", after
+    else:
+        assert after["decision"] == "DENY"
+        assert after["reason_code"] == "kill_active"
+
+
 def test_halt_file_vanishing_at_startup_is_not_left_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_path / "halt.json"
     init_active(path)
