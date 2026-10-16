@@ -43,7 +43,7 @@ from pep.host.executor import (
     ExecutorStartError,
     ToolExecutionError,
 )
-from pep.host.claims import observe_result
+from pep.host.claims import SESSION_CLOSE, SESSION_OPEN, ClaimVerdict, observe_result, verify_connected_claim
 from pep.host.fsguard import PathGuardError, read_private_file, require_directory
 from pep.host.haltfile import (
     ACTIVE,
@@ -257,6 +257,14 @@ class ReferenceHost:
     def decision_records(self) -> list[dict[str, Any]]:
         """Records this process appended. The agent socket cannot call this."""
         return self._decisions.read_records()
+
+    def verify_agent_claim(self, session: Session, raw: Mapping[str, Any]) -> ClaimVerdict:
+        """Check a claim from the agent on this connection.
+
+        The ``session_id`` in the claim body is ignored. The claim is checked
+        as this connection's principal.
+        """
+        return verify_connected_claim(raw, session.principal, self.decision_records())
 
     def halted(self) -> bool:
         if self._sticky_halt or self._runtime.kill_active:
@@ -797,6 +805,7 @@ class ReferenceHost:
 
     def _serve_connection(self, conn: socket.socket) -> None:
         session: Session | None = None
+        bounded = False
         try:
             try:
                 peer = self._peer_of(conn)
@@ -814,6 +823,17 @@ class ReferenceHost:
                 )
                 return
             session = self.open_session(peer)
+            bounded = self._mark_session(session, SESSION_OPEN)
+            if not bounded:
+                _send_line(
+                    conn,
+                    _response(
+                        "DENY",
+                        "kill_active",
+                        "session open was not recorded; fail-closed deny",
+                    ),
+                )
+                return
             opened = self._monotonic()
             buf = b""
             while not self._stop.is_set():
@@ -911,6 +931,8 @@ class ReferenceHost:
                     break
         finally:
             if session is not None:
+                if bounded:
+                    self._mark_session(session, SESSION_CLOSE)
                 self._drop_session(session)
             self._release_slot()
             try:
@@ -1173,6 +1195,28 @@ class ReferenceHost:
         with self._lock:
             if self._admin_live > 0:
                 self._admin_live -= 1
+
+    def _mark_session(self, session: Session, decision: str) -> bool:
+        """Append the open or close line that bounds one served session.
+
+        False when the line could not be written. A later absence claim then
+        stays unverifiable. A closed log is not a halt: shutdown may already
+        have finished the file.
+        """
+        if decision == SESSION_OPEN:
+            reason = "session_open"
+            detail = "session opened"
+            request_id = f"host.{session.connection_id}.session-open"
+        else:
+            reason = "session_close"
+            detail = "session closed"
+            request_id = f"host.{session.connection_id}.session-close"
+        if not self._begin_log_call():
+            return False
+        try:
+            return self._append(session, decision, reason, detail, [], None, None, request_id)
+        finally:
+            self._end_log_call()
 
     def _drop_session(self, session: Session) -> None:
         """Forget a closed connection so the session list cannot grow without bound."""
